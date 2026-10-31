@@ -25,14 +25,16 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  useEffect(()=>{if(scope.current!==scopeKey){scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;pending.current=false;lastTickKey.current='';setHistory([]);setScores([]);setLockedDigit(null);setCount(0);setPnl(0);setLossBlock(0);setMode('IDLE');setLastOutcome(null);setErr('')}},[scopeKey]);
  const execute=useCallback(async(predicted:number,stake:number)=>{
   if(!ws||!accountId||pending.current||halt.current)return;
-  pending.current=true;setMode('BUYING');let contractId:number|undefined;
+  pending.current=true;setMode('BUYING');let contractId:number|undefined;let purchaseAttempted=false;
   try{
    // Proposal is for the *locked scoring digit*, never the manually selected digit.
-   const quote=await ws.send<any>({proposal:1,amount:stake,basis:'stake',contract_type:'DIGITMATCH',currency:'USD',duration:1,duration_unit:'t',symbol,barrier:String(predicted)});
+   if(!/^[A-Za-z0-9_]{2,30}$/.test(symbol))throw new Error('No valid trading symbol selected');
+   const quote=await ws.send<any>({proposal:1,amount:stake,basis:'stake',contract_type:'DIGITMATCH',currency:'USD',duration:1,duration_unit:'t',underlying_symbol:symbol,barrier:String(predicted)});
    const proposalId=quote?.proposal?.id;const ask=Number(quote?.proposal?.ask_price);
    if(!proposalId||!Number.isFinite(ask)||ask<=0||ask>stake*1.05)throw new Error('Quote invalid or stale');
    if(halt.current)return;
    // Send exactly one buy. Any unknown outcome is a hard stop; never retry blindly.
+   purchaseAttempted=true;
    const bought=await ws.send<any>({buy:String(proposalId),price:ask});
    contractId=Number(bought?.buy?.contract_id);
    if(!Number.isSafeInteger(contractId)||contractId<=0)throw new Error('Purchase acknowledged without verifiable contract ID');
@@ -57,7 +59,10 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     else if(-pnlRef.current>=Number(maxLoss)){halt.current=true;active.current=false;setMode('MAX_LOSS')}
     else setMode('RUNNING');
    }
-  }catch(e){halt.current=true;active.current=false;setMode('UNCERTAIN');setErr(`${String(e)}${contractId?` — contract ${contractId}`:''}`)}finally{pending.current=false}
+  }catch(e){halt.current=true;active.current=false;
+   if(purchaseAttempted){setMode('UNCERTAIN');setErr(`${String(e)}${contractId?` — contract ${contractId}`:''}`)}
+   else{setMode('STOPPED');setErr(`No trade was purchased: ${String(e)}`)}
+  }finally{pending.current=false}
  },[ws,accountId,symbol,limit,maxLoss,play]);
  const execRef=useRef(execute);useEffect(()=>{execRef.current=execute},[execute]);
  useEffect(()=>{
@@ -91,7 +96,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-300"><span>Locked: {lockedDigit??'—'}</span><span>Block losses: {lossBlock}/3</span><span>Next stake: ${next.toFixed(2)}</span><span>Sample: {history.length} ticks</span></div>
   <div className="mt-3 flex flex-wrap gap-2"><button disabled={!valid||!accountId||!isConnected||active.current||pending.current||mode==='UNCERTAIN'} onClick={start} className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-bold text-white disabled:opacity-30">▶ START CYCLE</button><button onClick={stop} className="rounded-lg border border-rose-500 px-4 py-2 text-sm text-rose-300">■ STOP</button><button onClick={()=>{setSound(v=>!v);if(!sound)tone('buy')}} className="rounded-lg border border-slate-600 px-3 py-2 text-sm">{sound?'🔊 Sound ON':'🔇 Sound OFF'}</button></div>
   {lastOutcome&&<div className={`mt-3 rounded-lg border p-3 ${lastOutcome.outcome==='WIN'?'border-emerald-500 bg-emerald-500/10 text-emerald-300':'border-rose-500 bg-rose-500/10 text-rose-300'}`}><strong>{lastOutcome.outcome==='WIN'?'🟢 WIN':'🔴 LOSS'} {lastOutcome.profit>=0?'+':''}${lastOutcome.profit.toFixed(2)}</strong><span className="ml-3 text-xs">Verified contract #{lastOutcome.id}</span></div>}
-  {err&&<div role="alert" className="mt-3 rounded-lg border border-amber-500 p-2 text-xs text-amber-300">{err} — Trading halted. Reconcile this contract in Deriv before restarting or reloading.</div>}
+  {err&&<div role="alert" className="mt-3 rounded-lg border border-amber-500 p-2 text-xs text-amber-300">{err}{mode==='UNCERTAIN'?' — Purchase outcome requires verification in Deriv before restarting.':''}</div>}
   <p className="mt-2 text-[11px] text-slate-400">Uses the Python execution scorer formula. Trading results require Deriv contract settlement confirmation. Browser tab must remain open. A stopped browser cannot guarantee an outstanding order is settled. Scores are relative, not win probabilities.</p>
  </div></section>
 }
