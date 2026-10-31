@@ -11,6 +11,7 @@ import { useDigitsTrading } from '../hooks/use-digits-trading';
 import { useDerivWSContext } from '@/components/custom/deriv-ws-provider';
 import { useLogoSrc } from '@/components/custom/logo-src-provider';
 import { DigitsView } from './digits-view';
+import { IntelligencePanel } from './intelligence-panel';
 import type { DigitsAppConfig } from '../lib/app-config';
 
 export function LiveDigits({
@@ -49,6 +50,7 @@ export function LiveDigits({
   });
 
   return (
+    <>
     <DigitsView
       authState={authState}
       accounts={accounts}
@@ -95,5 +97,18 @@ export function LiveDigits({
       rearrangeMode={rearrangeMode}
       onReorder={onReorder}
     />
+    {!editMode && (
+      <IntelligencePanel
+        currentTick={trading.currentTick}
+        pipSize={trading.pipSize}
+        selectedDigit={trading.selectedDigit}
+        symbol={trading.activeSymbol?.underlying_symbol ?? ''}
+        digitStats={trading.digitStats}
+        proposal={trading.proposal}
+        closedPositions={trading.closedPositions}
+        accountKey={activeAccount?.account_id ?? 'guest'}
+      />
+    )}
+    </>
   );
 }
