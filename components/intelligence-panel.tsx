@@ -42,7 +42,11 @@ export function IntelligencePanel({
   const scope = `${accountKey}:${symbol}:${pipSize}`;
 
   useEffect(() => {
-    setTrials([]);
+    try {
+      const saved = window.localStorage.getItem(`dms-research:${scope}`);
+      const data = saved ? JSON.parse(saved) : [];
+      setTrials(Array.isArray(data) ? data.filter((t: Trial) => Number.isInteger(t.candidate) && Number.isInteger(t.baseline) && Number.isInteger(t.observed)).slice(-MAX_TRIALS) : []);
+    } catch { setTrials([]); }
     lastTick.current = '';
     previousPrediction.current = null;
     tickCount.current = 0;
@@ -65,6 +69,11 @@ export function IntelligencePanel({
     tickCount.current++;
   }, [currentTick, pipSize, selectedDigit, symbol]);
 
+  useEffect(() => {
+    if (!symbol) return;
+    try { window.localStorage.setItem(`dms-research:${scope}`, JSON.stringify(trials)); } catch { /* Browsers can disable storage. */ }
+  }, [scope, trials, symbol]);
+
   const matches = useMemo(() => trials.filter(t => t.candidate === t.observed).length, [trials]);
   const baselineMatches = useMemo(() => trials.filter(t => t.baseline === t.observed).length, [trials]);
   const n = trials.length;
@@ -86,14 +95,14 @@ export function IntelligencePanel({
           <div className="flex items-start justify-between gap-3">
             <div>
               <CardTitle className="text-lg">DigitMatchStars Intelligence</CardTitle>
-              <p className="mt-1 text-xs text-muted-foreground">Live, observational analytics. No automatic buys or stake progression.</p>
+              <p className="mt-1 text-xs text-muted-foreground">Live research measurements. Demo trade controls appear above; no unattended trading.</p>
             </div>
-            <Button variant="outline" size="sm" onClick={() => { setTrials([]); previousPrediction.current = null; lastTick.current = ''; tickCount.current = 0; }}>Reset sample</Button>
+            <Button variant="outline" size="sm" onClick={() => { setTrials([]); try { window.localStorage.removeItem(`dms-research:${scope}`); } catch {} previousPrediction.current = null; lastTick.current = ''; tickCount.current = 0; }}>Reset sample</Button>
           </div>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-            <Metric label="Next-tick predictions tested" value={n.toLocaleString()} sub="Since page opened / sample reset" />
+            <Metric label="Next-tick predictions tested" value={n.toLocaleString()} sub="Saved in this browser for the current account and symbol" />
             <Metric label="Selected digit hit rate" value={rate === null ? '—' : percent(rate)} sub={`${matches} matching subsequent ticks`} />
             <Metric label="Control baseline hit rate" value={baselineRate === null ? '—' : percent(baselineRate)} sub="Fixed rotating digit baseline" />
             <Metric label="Quoted match break-even" value={breakEven === null ? '—' : percent(breakEven)} sub="Quote price ÷ quote payout" />
@@ -128,7 +137,7 @@ export function IntelligencePanel({
               <p className="text-xs text-muted-foreground">Based on the Deriv profit_table response. Up to 50 recent closed records are retrieved, possibly across symbols and sessions. This is NOT an all-time or Martingale-cycle profit calculation. Use full Deriv statement reconciliation for that.</p>
             </div>
           </div>
-          <p className="border-t pt-3 text-xs text-muted-foreground">Research-only analytics do not predict future results. The proprietary scoring algorithm was not available in this app ZIP; integrating the existing Render model requires its algorithm/API. The display does not trigger any trades.</p>
+          <p className="border-t pt-3 text-xs text-muted-foreground">Research analytics do not predict future results. Samples persist in this browser; clearing browser storage removes them. The proprietary scoring algorithm was not available in this app ZIP; integrating the existing Render model requires its algorithm/API. The display does not trigger any trades.</p>
         </CardContent>
       </Card>
     </div>

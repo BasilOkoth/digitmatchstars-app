@@ -12,6 +12,7 @@ import { useDerivWSContext } from '@/components/custom/deriv-ws-provider';
 import { useLogoSrc } from '@/components/custom/logo-src-provider';
 import { DigitsView } from './digits-view';
 import { IntelligencePanel } from './intelligence-panel';
+import { DemoTradeAssistant } from './demo-trade-assistant';
 import type { DigitsAppConfig } from '../lib/app-config';
 
 export function LiveDigits({
@@ -97,6 +98,22 @@ export function LiveDigits({
       rearrangeMode={rearrangeMode}
       onReorder={onReorder}
     />
+    {!editMode && (
+      <DemoTradeAssistant
+        accountType={activeAccount?.account_type}
+        accountId={activeAccount?.account_id}
+        symbol={trading.activeSymbol?.underlying_symbol ?? ''}
+        proposalPrice={trading.proposal?.askPrice ?? null}
+        isConnected={trading.isConnected}
+        isBuying={trading.isBuying}
+        buyContract={trading.buyContract}
+        buyError={trading.buyError}
+        closedPositions={trading.closedPositions}
+        contractMode={trading.contractMode}
+        stake={trading.stake}
+        duration={trading.duration}
+      />
+    )}
     {!editMode && (
       <IntelligencePanel
         currentTick={trading.currentTick}
