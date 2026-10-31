@@ -1,9 +1,37 @@
 'use client';
 
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import type { Tick } from '@deriv/core';
+import { getLastDigit } from '@/lib/digit-stats';
+import { scoreDigits } from '@/lib/digitmatch-score';
 import { Localize } from '@deriv-com/translations';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import type { DigitStats } from '../lib/types';
+
+type ScoreMap = Record<number, number>;
+const ScoreContext = createContext<ScoreMap>({});
+/** Uses the SAME scoreDigits routine as the automated engine; values are
+ * relative scores, NOT probabilities. The 100-tick sample resets on symbol change. */
+export function DigitScoreProvider({children, tick, pipSize, symbol}: {
+ children: React.ReactNode; tick: Tick | null; pipSize: number; symbol: string;
+}) {
+ const [scores, setScores] = useState<ScoreMap>({});
+ const history = useRef<number[]>([]);
+ const lastKey = useRef('');
+ useEffect(() => {history.current=[];lastKey.current='';setScores({});},[symbol,pipSize]);
+ useEffect(() => {
+   if (!tick || !symbol || !Number.isFinite(tick.quote)) return;
+   const key = `${tick.epoch}:${tick.quote}`;
+   if (key === lastKey.current) return;
+   lastKey.current = key;
+   history.current = [...history.current.slice(-99),getLastDigit(tick.quote,pipSize)];
+   const next: ScoreMap = {};
+   for(const item of scoreDigits(history.current)) next[item.digit] = item.score;
+   setScores(next);
+ }, [tick,symbol,pipSize]);
+ return <ScoreContext.Provider value={scores}>{children}</ScoreContext.Provider>;
+}
 
 interface DigitStatsBarProps {
   digitStats: DigitStats;
@@ -16,6 +44,7 @@ export function DigitStatsBar({
   selectedDigit,
   onDigitSelect,
 }: DigitStatsBarProps) {
+  const scoreByDigit = useContext(ScoreContext);
   const maxPct = Math.max(...digitStats.percentages);
   const minPct = Math.min(...digitStats.percentages);
 
@@ -52,6 +81,9 @@ export function DigitStatsBar({
                 )}
               >
                 {pct.toFixed(1)}%
+              </span>
+              <span className="text-[10px] font-semibold tabular-nums text-cyan-400" title="Relative execution score, not probability">
+                {Number.isFinite(scoreByDigit[digit]) ? `Score ${scoreByDigit[digit].toFixed(2)}` : 'Score —'}
               </span>
             </div>
           );

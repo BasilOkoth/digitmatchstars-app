@@ -11,6 +11,7 @@ import { useDigitsTrading } from '../hooks/use-digits-trading';
 import { useDerivWSContext } from '@/components/custom/deriv-ws-provider';
 import { useLogoSrc } from '@/components/custom/logo-src-provider';
 import { DigitsView } from './digits-view';
+import { DigitScoreProvider } from './digit-stats-bar';
 import { IntegratedBot } from './integrated-bot';
 import { IntelligencePanel } from './intelligence-panel';
 import type { DigitsAppConfig } from '../lib/app-config';
@@ -51,7 +52,7 @@ export function LiveDigits({
   });
 
   return (
-    <>
+    <DigitScoreProvider tick={trading.currentTick} pipSize={trading.pipSize} symbol={trading.activeSymbol?.underlying_symbol ?? ''}>
     <DigitsView
       authState={authState}
       accounts={accounts}
@@ -111,6 +112,6 @@ export function LiveDigits({
         accountKey={activeAccount?.account_id ?? 'guest'}
       />
     )}
-    </>
+    </DigitScoreProvider>
   );
 }
