@@ -87,7 +87,6 @@ export function IntelligencePanel({
   const paid = relevant.reduce((sum, p) => sum + Number(p.buy_price || 0), 0);
   const received = relevant.reduce((sum, p) => sum + Number(p.sell_price || 0), 0);
   const net = received - paid;
-  const assessment = n < 200 ? 'Insufficient observations' : breakEven === null ? 'Waiting for a valid payout quote' : (rate ?? 0) > breakEven ? 'Above quoted break-even in sample — not proof of edge' : 'Not above quoted break-even in sample';
 
   return (
     <div className="mx-auto w-full max-w-7xl px-3 pb-8 pt-2 sm:px-4" data-testid="intelligence-panel">
@@ -95,8 +94,7 @@ export function IntelligencePanel({
         <CardHeader className="space-y-1 pb-2 pt-3">
           <div className="flex items-start justify-between gap-3">
             <div>
-              <CardTitle className="text-base text-cyan-300">◈ Intelligence</CardTitle>
-              <p className="mt-1 text-xs text-muted-foreground">Live research · selected-digit observations</p>
+              <CardTitle className="text-base text-cyan-300">Analytics</CardTitle>
             </div>
             <Button variant="outline" size="sm" onClick={() => { setTrials([]); try { window.localStorage.removeItem(`dms-research:${scope}`); } catch {} previousPrediction.current = null; lastTick.current = ''; tickCount.current = 0; }}>Reset sample</Button>
           </div>
@@ -112,11 +110,7 @@ export function IntelligencePanel({
             {expanded && <Metric label="Recent closed contracts" value={String(relevant.length)} sub="For current symbol; API history limited to 50" />}
             <Metric label="Recent net closed P/L" value={relevant.length ? money(net) : '—'} sub="Sell credits minus buy prices, not cycle P/L" />
           </div>
-          <div className="rounded-md border border-slate-700 bg-slate-900/70 px-3 py-2 text-xs">
-            <span className="font-medium">Statistical assessment: </span>{assessment}
-            {expanded && <p className="mt-1 text-xs text-muted-foreground">Selected-digit accuracy is checked against the NEXT tick; changing the selected digit between ticks changes the next test. The control baseline is deterministic, not a predictive model. Samples are not independent proof of profitability. This is not the Python bot's proprietary score.</p>}
-          </div>
-          <button type="button" onClick={() => setExpanded(!expanded)} className="w-full rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-3 py-2 text-left text-xs font-semibold text-cyan-300 hover:bg-cyan-500/20">{expanded ? "▴ Hide detailed analysis" : "▾ Show digit frequencies, baselines and reconciliation"}</button>
+          <button type="button" onClick={() => setExpanded(!expanded)} className="w-full rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-3 py-2 text-left text-xs font-semibold text-cyan-300 hover:bg-cyan-500/20">{expanded ? "▴ Less" : "▾ More"}</button>
           {expanded && <div className="grid gap-4 lg:grid-cols-2">
             <div className="space-y-2">
               <h3 className="text-sm font-semibold">Observed digit frequencies</h3>

@@ -85,7 +85,7 @@ export function DemoTradeAssistant({
           <p className="text-xs text-muted-foreground">Stake ${Number(p.buy_price).toFixed(2)} · Payout ${Number(p.sell_price).toFixed(2)}</p>
         </div>;
       })}</div>}
-      <p className="mt-2 text-[11px] text-muted-foreground">Results are from Deriv's recent closed-contract feed, not tick guesses. This feed is limited to 50 recent entries and may not refresh automatically. A zero-profit contract is treated as a loss of the stake when its payout is zero.</p></>}
+</>}
     </div>
   </section>;
 }
