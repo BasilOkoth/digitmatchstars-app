@@ -11,8 +11,8 @@ import { useDigitsTrading } from '../hooks/use-digits-trading';
 import { useDerivWSContext } from '@/components/custom/deriv-ws-provider';
 import { useLogoSrc } from '@/components/custom/logo-src-provider';
 import { DigitsView } from './digits-view';
+import { IntegratedBot } from './integrated-bot';
 import { IntelligencePanel } from './intelligence-panel';
-import { DemoTradeAssistant } from './demo-trade-assistant';
 import type { DigitsAppConfig } from '../lib/app-config';
 
 export function LiveDigits({
@@ -51,7 +51,7 @@ export function LiveDigits({
   });
 
   return (
-    <div className="dark min-h-screen bg-[#090e1b] text-slate-100">
+    <>
     <DigitsView
       authState={authState}
       accounts={accounts}
@@ -98,23 +98,7 @@ export function LiveDigits({
       rearrangeMode={rearrangeMode}
       onReorder={onReorder}
     />
-    {!editMode && (
-      <DemoTradeAssistant
-        accountType={activeAccount?.account_type}
-        accountId={activeAccount?.account_id}
-        symbol={trading.activeSymbol?.underlying_symbol ?? ''}
-        proposalPrice={trading.proposal?.askPrice ?? null}
-        isConnected={trading.isConnected}
-        isBuying={trading.isBuying}
-        buyContract={trading.buyContract}
-        buyError={trading.buyError}
-        closedPositions={trading.closedPositions}
-        contractMode={trading.contractMode}
-        stake={trading.stake}
-        setStake={trading.setStake}
-        duration={trading.duration}
-      />
-    )}
+    {!editMode && <IntegratedBot ws={ws} accountId={activeAccount?.account_id ?? null} accountType={activeAccount?.account_type ?? null} isConnected={trading.isConnected} currentTick={trading.currentTick} pipSize={trading.pipSize} symbol={trading.activeSymbol?.underlying_symbol ?? ''} />}
     {!editMode && (
       <IntelligencePanel
         currentTick={trading.currentTick}
@@ -127,6 +111,6 @@ export function LiveDigits({
         accountKey={activeAccount?.account_id ?? 'guest'}
       />
     )}
-    </div>
+    </>
   );
 }
