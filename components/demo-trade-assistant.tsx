@@ -26,13 +26,14 @@ export function DemoTradeAssistant({
 }) {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
+  const [showHistory, setShowHistory] = useState(false);
   const [placedAt, setPlacedAt] = useState<number | null>(null);
   const [startingIds, setStartingIds] = useState<number[]>([]);
   const isDemo = /demo|virtual/i.test(accountType ?? '') || /^VRT/i.test(accountId ?? '');
   const pending = placedAt !== null && !closedPositions.some(p => p.underlying_symbol === symbol && p.purchase_time * 1000 >= placedAt - 5000 && !startingIds.includes(p.contract_id));
   const latest = useMemo(() => closedPositions
     .filter(p => p.underlying_symbol === symbol)
-    .sort((a,b)=>b.sell_time-a.sell_time).slice(0,8), [closedPositions,symbol]);
+    .sort((a,b)=>b.sell_time-a.sell_time).slice(0,4), [closedPositions,symbol]);
   const lastAccount = useRef(accountId);
   useEffect(() => {
     if (lastAccount.current !== accountId) {
@@ -58,20 +59,21 @@ export function DemoTradeAssistant({
       setPlacedAt(submittedAt); // fail closed on uncertain outcome
     } finally { setBusy(false); }
   }
-  return <section className="mx-auto w-full max-w-5xl px-3 pb-4 sm:px-4" aria-label="Demo trading and trade outcomes">
-    <div className="rounded-xl border border-sky-500/40 bg-gradient-to-br from-sky-500/10 via-background to-violet-500/10 p-4 shadow-sm">
+  return <section className="mx-auto w-full max-w-7xl px-3 pb-2 sm:px-4" aria-label="Demo trading and trade outcomes">
+    <div className="rounded-xl border border-cyan-400/25 bg-[#101a2e] p-3 shadow-sm">
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-lg font-bold">⚡ DigitMatchStars Trade Center</h2>
+        <h2 className="text-base font-bold text-cyan-300">⚡ Trade Center</h2>
         <span className={`rounded-full px-3 py-1 text-xs font-bold ${isDemo?'bg-sky-500/20 text-sky-700 dark:text-sky-300':'bg-amber-500/15 text-amber-700 dark:text-amber-300'}`}>{isDemo?'DEMO ACCOUNT':'DEMO TRADING ONLY'}</span>
       </div>
-      <p className="mb-3 text-xs text-muted-foreground">One confirmed user action = one order. No unattended Martingale or live-account automation. The contract uses the selected symbol, digit, stake and duration above.</p>
+
       <div className="flex flex-wrap items-center gap-3">
         <Button onClick={placeDemoOrder} disabled={!canTrade} className="bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50">{busy || isBuying ? 'Submitting…' : pending ? 'Waiting for settlement' : '⚡ Place ONE Demo Trade'}</Button>
         <span className="text-xs text-muted-foreground">{!accountId?'Log in and select a Demo account':!isDemo?'Switch to Demo account to enable':!isConnected?'Waiting for Deriv connection':!proposalPrice?'Waiting for live proposal':pending?'Do not submit a duplicate purchase':'Ready for a single Demo order'}</span>
       </div>
       {(notice || buyError) && <p className="mt-3 rounded-lg border p-2 text-xs" role="status">{buyError ?? notice}</p>}
       {pending && <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">The closed-contract history may not refresh immediately. For an uncertain result, verify it in Deriv before making another trade.</p>}
-      <h3 className="mb-2 mt-5 text-sm font-semibold">Verified closed contracts — WIN / LOSS</h3>
+      <div className="mt-3 flex items-center justify-between gap-2"><h3 className="text-sm font-semibold text-slate-200">Recent results</h3><button type="button" onClick={() => setShowHistory(!showHistory)} className="rounded-md border border-slate-600 px-3 py-1 text-xs text-cyan-300 hover:bg-slate-800">{showHistory ? "Hide history" : `Show last ${latest.length} trades`}</button></div>
+      {showHistory && <>
       {latest.length === 0 ? <p className="rounded-lg border p-3 text-sm text-muted-foreground">No closed contracts for this symbol in the currently loaded Deriv history. Sign in to see results.</p> :
       <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">{latest.map(p => {
         const profit = Number(p.sell_price || 0) - Number(p.buy_price || 0);
@@ -83,7 +85,7 @@ export function DemoTradeAssistant({
           <p className="text-xs text-muted-foreground">Stake ${Number(p.buy_price).toFixed(2)} · Payout ${Number(p.sell_price).toFixed(2)}</p>
         </div>;
       })}</div>}
-      <p className="mt-3 text-xs text-muted-foreground">Results are from Deriv's recent closed-contract feed, not tick guesses. This feed is limited to 50 recent entries and may not refresh automatically. A zero-profit contract is treated as a loss of the stake when its payout is zero.</p>
+      <p className="mt-2 text-[11px] text-muted-foreground">Results are from Deriv's recent closed-contract feed, not tick guesses. This feed is limited to 50 recent entries and may not refresh automatically. A zero-profit contract is treated as a loss of the stake when its payout is zero.</p></>}
     </div>
   </section>;
 }

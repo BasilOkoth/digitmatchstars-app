@@ -51,7 +51,7 @@ export function LiveDigits({
   });
 
   return (
-    <>
+    <div className="dark min-h-screen bg-[#090e1b] text-slate-100">
     <DigitsView
       authState={authState}
       accounts={accounts}
@@ -126,6 +126,6 @@ export function LiveDigits({
         accountKey={activeAccount?.account_id ?? 'guest'}
       />
     )}
-    </>
+    </div>
   );
 }

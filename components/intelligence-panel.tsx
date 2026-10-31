@@ -36,6 +36,7 @@ export function IntelligencePanel({
   accountKey: string;
 }) {
   const [trials, setTrials] = useState<Trial[]>([]);
+  const [expanded, setExpanded] = useState(false);
   const lastTick = useRef<string>('');
   const previousPrediction = useRef<{ selected: number; baseline: number } | null>(null);
   const tickCount = useRef(0);
@@ -89,33 +90,34 @@ export function IntelligencePanel({
   const assessment = n < 200 ? 'Insufficient observations' : breakEven === null ? 'Waiting for a valid payout quote' : (rate ?? 0) > breakEven ? 'Above quoted break-even in sample — not proof of edge' : 'Not above quoted break-even in sample';
 
   return (
-    <div className="mx-auto w-full max-w-5xl px-3 pb-24 pt-3 sm:px-4" data-testid="intelligence-panel">
-      <Card className="border-blue-500/30">
-        <CardHeader className="space-y-1 pb-3">
+    <div className="mx-auto w-full max-w-7xl px-3 pb-8 pt-2 sm:px-4" data-testid="intelligence-panel">
+      <Card className="border-cyan-400/25 bg-[#101a2e] text-slate-100">
+        <CardHeader className="space-y-1 pb-2 pt-3">
           <div className="flex items-start justify-between gap-3">
             <div>
-              <CardTitle className="text-lg">DigitMatchStars Intelligence</CardTitle>
-              <p className="mt-1 text-xs text-muted-foreground">Live research measurements. Demo trade controls appear above; no unattended trading.</p>
+              <CardTitle className="text-base text-cyan-300">◈ Intelligence</CardTitle>
+              <p className="mt-1 text-xs text-muted-foreground">Live research · selected-digit observations</p>
             </div>
             <Button variant="outline" size="sm" onClick={() => { setTrials([]); try { window.localStorage.removeItem(`dms-research:${scope}`); } catch {} previousPrediction.current = null; lastTick.current = ''; tickCount.current = 0; }}>Reset sample</Button>
           </div>
         </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <CardContent className="space-y-3 pb-3">
+          <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
             <Metric label="Next-tick predictions tested" value={n.toLocaleString()} sub="Saved in this browser for the current account and symbol" />
             <Metric label="Selected digit hit rate" value={rate === null ? '—' : percent(rate)} sub={`${matches} matching subsequent ticks`} />
-            <Metric label="Control baseline hit rate" value={baselineRate === null ? '—' : percent(baselineRate)} sub="Fixed rotating digit baseline" />
+            {expanded && <Metric label="Control baseline hit rate" value={baselineRate === null ? '—' : percent(baselineRate)} sub="Fixed rotating digit baseline" />}
             <Metric label="Quoted match break-even" value={breakEven === null ? '—' : percent(breakEven)} sub="Quote price ÷ quote payout" />
-            <Metric label="Digit entropy" value={entropy === null ? '—' : `${entropy.toFixed(3)} bits`} sub="Max is 3.322 bits for uniform digits" />
-            <Metric label="Frequency sample" value={digitStats.totalTicks.toLocaleString()} sub="Ticks in the app's statistics window" />
-            <Metric label="Recent closed contracts" value={String(relevant.length)} sub="For current symbol; API history limited to 50" />
+            {expanded && <Metric label="Digit entropy" value={entropy === null ? '—' : `${entropy.toFixed(3)} bits`} sub="Max is 3.322 bits for uniform digits" />}
+            {expanded && <Metric label="Frequency sample" value={digitStats.totalTicks.toLocaleString()} sub="Ticks in the app's statistics window" />}
+            {expanded && <Metric label="Recent closed contracts" value={String(relevant.length)} sub="For current symbol; API history limited to 50" />}
             <Metric label="Recent net closed P/L" value={relevant.length ? money(net) : '—'} sub="Sell credits minus buy prices, not cycle P/L" />
           </div>
-          <div className="rounded-md border bg-muted/40 p-3 text-sm">
+          <div className="rounded-md border border-slate-700 bg-slate-900/70 px-3 py-2 text-xs">
             <span className="font-medium">Statistical assessment: </span>{assessment}
-            <p className="mt-1 text-xs text-muted-foreground">Selected-digit accuracy is checked against the NEXT tick; changing the selected digit between ticks changes the next test. The control baseline is deterministic, not a predictive model. Samples are not independent proof of profitability. This is not the Python bot's proprietary score.</p>
+            {expanded && <p className="mt-1 text-xs text-muted-foreground">Selected-digit accuracy is checked against the NEXT tick; changing the selected digit between ticks changes the next test. The control baseline is deterministic, not a predictive model. Samples are not independent proof of profitability. This is not the Python bot's proprietary score.</p>}
           </div>
-          <div className="grid gap-4 lg:grid-cols-2">
+          <button type="button" onClick={() => setExpanded(!expanded)} className="w-full rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-3 py-2 text-left text-xs font-semibold text-cyan-300 hover:bg-cyan-500/20">{expanded ? "▴ Hide detailed analysis" : "▾ Show digit frequencies, baselines and reconciliation"}</button>
+          {expanded && <div className="grid gap-4 lg:grid-cols-2">
             <div className="space-y-2">
               <h3 className="text-sm font-semibold">Observed digit frequencies</h3>
               {digitStats.counts.map((count, digit) => (
@@ -136,8 +138,8 @@ export function IntelligencePanel({
               <div className="flex justify-between border-t pt-2 font-semibold"><span>Net P/L, recent closed</span><span>{relevant.length ? money(net) : '—'}</span></div>
               <p className="text-xs text-muted-foreground">Based on the Deriv profit_table response. Up to 50 recent closed records are retrieved, possibly across symbols and sessions. This is NOT an all-time or Martingale-cycle profit calculation. Use full Deriv statement reconciliation for that.</p>
             </div>
-          </div>
-          <p className="border-t pt-3 text-xs text-muted-foreground">Research analytics do not predict future results. Samples persist in this browser; clearing browser storage removes them. The proprietary scoring algorithm was not available in this app ZIP; integrating the existing Render model requires its algorithm/API. The display does not trigger any trades.</p>
+          </div>}
+          {expanded && <p className="border-t pt-3 text-xs text-muted-foreground">Research analytics do not predict future results. Samples persist in this browser; clearing browser storage removes them. The proprietary scoring algorithm was not available in this app ZIP; integrating the existing Render model requires its algorithm/API. The display does not trigger any trades.</p>}
         </CardContent>
       </Card>
     </div>
@@ -145,5 +147,5 @@ export function IntelligencePanel({
 }
 
 function Metric({ label, value, sub }: {label: string; value: string; sub: string}) {
-  return <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">{label}</p><p className="mt-1 text-xl font-semibold tabular-nums">{value}</p><p className="mt-1 text-[11px] text-muted-foreground">{sub}</p></div>;
+  return <div className="rounded-lg border border-slate-700/80 bg-[#0b1425] p-2.5"><p className="text-[11px] text-slate-400">{label}</p><p className="mt-1 text-lg font-bold tabular-nums text-white">{value}</p><p className="mt-1 text-[11px] text-muted-foreground">{sub}</p></div>;
 }
