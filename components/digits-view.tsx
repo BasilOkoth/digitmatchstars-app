@@ -356,7 +356,7 @@ export function DigitsView({
           /* No-code mobile layout: a single, reorderable column of blocks. */
           <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
             <div className="mx-auto flex w-full max-w-md flex-col gap-3 px-3 py-3">
-              {isLoading ? <Skeleton className="h-[420px] w-full rounded-xl" /> : renderConfigurable()}
+              {isLoading ? <Skeleton className="h-[420px] w-full rounded-xl" /> : renderConfigurable(editMode ? undefined : MARKET_COLUMN_KEYS)}
             </div>
           </div>
         ) : (
@@ -383,20 +383,20 @@ export function DigitsView({
              a no-op because each instance tracks its own drag). Full reordering
              lives in the builder's phone viewport, which renders the single
              mobile column. */
-          <div className="flex w-full max-w-5xl mx-auto flex-col px-4 py-4 pb-24">
+          <div className="flex w-full max-w-7xl mx-auto flex-col px-3 py-2 pb-2 sm:px-4">
             {isLoading ? (
-              <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_440px]">
+              <div className={`grid grid-cols-1 gap-2 ${editMode ? "lg:grid-cols-[minmax(0,1fr)_440px]" : ""}`}>
                 <Skeleton className="h-[420px] w-full rounded-xl" />
                 <Skeleton className="h-[420px] w-full rounded-xl" />
               </div>
             ) : (
-              <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_440px]">
+              <div className={`grid grid-cols-1 gap-2 ${editMode ? "lg:grid-cols-[minmax(0,1fr)_440px]" : ""}`}>
                 <Card data-testid="market-column">
                   <CardContent className="pt-4">
                     {renderConfigurable(MARKET_COLUMN_KEYS, false)}
                   </CardContent>
                 </Card>
-                <Card data-testid="controls-column">
+                <Card data-testid="controls-column" className={editMode ? undefined : "hidden"}>
                   <CardContent className="pt-4">
                     {renderConfigurable(CONTROLS_COLUMN_KEYS)}
                   </CardContent>
@@ -421,14 +421,15 @@ export function DigitsView({
             </>
           ) : (
             <>
-              <TradeTypeChips
+              <div className={editMode ? undefined : "hidden"}><TradeTypeChips
                 className="shrink-0"
                 value={tradeType}
                 options={digitTradeTypeOptions}
                 onValueChange={setTradeType}
               />
 
-              <Card className="shrink-0 border shadow-sm mb-12">
+              </div>
+              <Card className="shrink-0 border shadow-sm mb-2">
                 <CardContent className="flex flex-col p-3 pt-3 sm:p-6 sm:pt-4 pb-2 sm:pb-6">
                   {/* Symbol selector + tick display */}
                   <div className="flex flex-col pb-4 pt-1 sm:pb-6 sm:pt-2">
@@ -460,7 +461,7 @@ export function DigitsView({
                     )}
 
                     {/* Trade controls */}
-                    <div className="pt-4 sm:pt-6">
+                    <div className={editMode ? "pt-4 sm:pt-6" : "hidden"}>
                       <TradeControls
                         tradeType={tradeType}
                         contractMode={contractMode}
@@ -495,14 +496,14 @@ export function DigitsView({
            controls (trade type chips + trade controls) right — so both paths
            look identical. The `lg:` guard plays the same first-paint role as
            in the no-code grid (useIsMobile initialises to false). */
-        <div className="flex w-full max-w-5xl mx-auto flex-col px-4 py-4 pb-24">
+        <div className="flex w-full max-w-7xl mx-auto flex-col px-3 py-2 pb-2 sm:px-4">
           {isLoading ? (
-            <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_440px]">
+            <div className={`grid grid-cols-1 gap-2 ${editMode ? "lg:grid-cols-[minmax(0,1fr)_440px]" : ""}`}>
               <Skeleton className="h-[420px] w-full rounded-xl" />
               <Skeleton className="h-[420px] w-full rounded-xl" />
             </div>
           ) : (
-            <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_440px]">
+            <div className={`grid grid-cols-1 gap-2 ${editMode ? "lg:grid-cols-[minmax(0,1fr)_440px]" : ""}`}>
               <Card data-testid="market-column">
                 <CardContent className="flex flex-col gap-4 pt-4">
                   <SymbolSelector
@@ -528,7 +529,7 @@ export function DigitsView({
                   )}
                 </CardContent>
               </Card>
-              <Card data-testid="controls-column">
+              <Card data-testid="controls-column" className={editMode ? undefined : "hidden"}>
                 <CardContent className="flex flex-col gap-4 pt-4">
                   {/* Rendered inside the controls card, so the edge fade is
                       drawn in the card colour rather than the page background. */}
