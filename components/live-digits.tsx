@@ -111,6 +111,7 @@ export function LiveDigits({
         closedPositions={trading.closedPositions}
         contractMode={trading.contractMode}
         stake={trading.stake}
+        setStake={trading.setStake}
         duration={trading.duration}
       />
     )}
