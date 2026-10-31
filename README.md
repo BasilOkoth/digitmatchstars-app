@@ -61,3 +61,4 @@ npm run build
 ```
 
 This produces a fully static export in the `/out` directory. Serve the contents of `/out` from any web server or static file host.
+DigitMatchStars Intelligence dashboard deployment.
