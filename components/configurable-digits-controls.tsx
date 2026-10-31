@@ -868,16 +868,7 @@ export function ConfigurableDigitsControls(props: ConfigurableDigitsControlsProp
   // Real control = the <Button>. Returns null when the Buy button is pinned:
   // the view renders it in the bottom bar, and every block loop below skips a
   // renderer that returns null.
-  const renderBuy = () =>
-    pinBuy ? null : (
-      <ConfigurableBuyButton
-        variant={config.styles.buy}
-        isConnected={isConnected}
-        proposal={proposal}
-        onBuy={onBuy}
-        isBuying={isBuying}
-      />
-    );
+  const renderBuy = () => null; // Integrated cycle is the only trade action
 
   const renderers: Record<ControlKey, () => React.ReactNode> = {
     tradeType: renderTradeType,

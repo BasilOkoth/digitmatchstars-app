@@ -230,14 +230,8 @@ export function TradeControls({
         )}
       </div>
 
-      {/* Buy button — fixed above footer on mobile, inline on desktop */}
-      <div
-        className={
-          isMobile
-            ? 'fixed bottom-[calc(env(safe-area-inset-bottom)+2.5rem)] left-3 right-3'
-            : undefined
-        }
-      >
+      {/* Single trading entry point is the integrated cycle engine below. */}
+      <div className="hidden" aria-hidden="true">
         <Button
           className="w-full h-10 rounded-full px-6 sm:h-11 sm:px-8"
           disabled={!isConnected || !proposal || isBuying}

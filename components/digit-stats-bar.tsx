@@ -47,6 +47,13 @@ export function DigitStatsBar({
   const scoreByDigit = useContext(ScoreContext);
   const maxPct = Math.max(...digitStats.percentages);
   const minPct = Math.min(...digitStats.percentages);
+  const rankedDigits = [...Array(10).keys()].sort((a,b) => {
+    const aScore=scoreByDigit[a], bScore=scoreByDigit[b];
+    if (Number.isFinite(aScore) && Number.isFinite(bScore)) return bScore-aScore || a-b;
+    if (Number.isFinite(aScore)) return -1;
+    if (Number.isFinite(bScore)) return 1;
+    return a-b;
+  });
 
   return (
     <div className="h-full flex flex-col min-h-0">
@@ -55,7 +62,8 @@ export function DigitStatsBar({
       </span>
       <div className="flex-1 flex items-center min-h-0">
         <div className="grid grid-cols-5 gap-1.5 sm:gap-3 place-items-center w-full">
-        {digitStats.percentages.map((pct, digit) => {
+        {rankedDigits.map((digit) => {
+          const pct = digitStats.percentages[digit] ?? 0;
           const isSelected = digit === selectedDigit;
           const isHighest = digitStats.totalTicks > 0 && pct === maxPct;
           const isLowest = digitStats.totalTicks > 0 && pct === minPct;
