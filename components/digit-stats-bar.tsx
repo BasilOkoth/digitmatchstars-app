@@ -11,15 +11,18 @@ import type { DigitStats } from '../lib/types';
 
 type ScoreMap = Record<number, number>;
 const ScoreContext = createContext<ScoreMap>({});
+const ExecutionTargetContext = createContext<{ target: number | null; setTarget: (digit: number | null) => void }>({target:null,setTarget:()=>{}});
+export function useExecutionTarget() { return useContext(ExecutionTargetContext); }
 /** Uses the SAME scoreDigits routine as the automated engine; values are
  * relative scores, NOT probabilities. The 100-tick sample resets on symbol change. */
 export function DigitScoreProvider({children, tick, pipSize, symbol}: {
  children: React.ReactNode; tick: Tick | null; pipSize: number; symbol: string;
 }) {
  const [scores, setScores] = useState<ScoreMap>({});
+ const [target, setTarget] = useState<number | null>(null);
  const history = useRef<number[]>([]);
  const lastKey = useRef('');
- useEffect(() => {history.current=[];lastKey.current='';setScores({});},[symbol,pipSize]);
+ useEffect(() => {history.current=[];lastKey.current='';setScores({});setTarget(null);},[symbol,pipSize]);
  useEffect(() => {
    if (!tick || !symbol || !Number.isFinite(tick.quote)) return;
    const key = `${tick.epoch}:${tick.quote}`;
@@ -30,7 +33,7 @@ export function DigitScoreProvider({children, tick, pipSize, symbol}: {
    for(const item of scoreDigits(history.current)) next[item.digit] = item.score;
    setScores(next);
  }, [tick,symbol,pipSize]);
- return <ScoreContext.Provider value={scores}>{children}</ScoreContext.Provider>;
+ return <ScoreContext.Provider value={scores}><ExecutionTargetContext.Provider value={{target,setTarget}}>{children}</ExecutionTargetContext.Provider></ScoreContext.Provider>;
 }
 
 interface DigitStatsBarProps {
@@ -45,6 +48,7 @@ export function DigitStatsBar({
   onDigitSelect,
 }: DigitStatsBarProps) {
   const scoreByDigit = useContext(ScoreContext);
+  const {target} = useExecutionTarget();
   const maxPct = Math.max(...digitStats.percentages);
   const minPct = Math.min(...digitStats.percentages);
   const rankedDigits = [...Array(10).keys()].sort((a,b) => {
@@ -64,7 +68,8 @@ export function DigitStatsBar({
         <div className="grid grid-cols-5 gap-1.5 sm:gap-3 place-items-center w-full">
         {rankedDigits.map((digit) => {
           const pct = digitStats.percentages[digit] ?? 0;
-          const isSelected = digit === selectedDigit;
+          // During an active cycle the locked execution digit wins; otherwise show top-ranked V1 digit.
+          const isSelected = digit === (target ?? (Number.isFinite(scoreByDigit[rankedDigits[0]]) ? rankedDigits[0] : null));
           const isHighest = digitStats.totalTicks > 0 && pct === maxPct;
           const isLowest = digitStats.totalTicks > 0 && pct === minPct;
 

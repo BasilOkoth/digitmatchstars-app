@@ -2,6 +2,7 @@
 import {useCallback,useEffect,useMemo,useRef,useState} from 'react';
 import {getLastDigit} from '@/lib/digit-stats';
 import {scoreDigits} from '@/lib/digitmatch-score';
+import {useExecutionTarget} from './digit-stats-bar';
 import type {Tick,DerivWS} from '@deriv/core';
 
 type Mode='IDLE'|'RUNNING'|'BUYING'|'SETTLING'|'WIN'|'MAX_TRADES'|'MAX_LOSS'|'UNCERTAIN'|'STOPPED';
@@ -12,6 +13,7 @@ function tone(kind:'buy'|'win'|'loss'){
 }
 const sleep=(ms:number)=>new Promise<void>(r=>setTimeout(r,ms));
 export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,pipSize,symbol}:{ws:DerivWS|null;accountId:string|null;accountType:string|null;isConnected:boolean;currentTick:Tick|null;pipSize:number;symbol:string}){
+ const {setTarget} = useExecutionTarget();
  const demo=Boolean(accountId)&&(/demo|virtual/i.test(accountType??'')||/^VRT/i.test(accountId??''));const real=Boolean(accountId)&&!demo;
  const [base,setBase]=useState('1');const [factor,setFactor]=useState('1.15');const [limit,setLimit]=useState('20');const [maxLoss,setMaxLoss]=useState('40');const [threshold,setThreshold]=useState('15.01');
  const [mode,setMode]=useState<Mode>('IDLE');const [count,setCount]=useState(0);const [pnl,setPnl]=useState(0);const [lastOutcome,setLastOutcome]=useState<Outcome|null>(null);const [err,setErr]=useState('');const [sound,setSound]=useState(true);
@@ -21,8 +23,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const next=amount(Number(base)*Math.pow(Number(factor),count));const scopeKey=`${accountId}:${symbol}`;
  const soundRef=useRef(sound);useEffect(()=>{soundRef.current=sound},[sound]);
  const play=useCallback((kind:'buy'|'win'|'loss')=>{if(soundRef.current)tone(kind)},[]);
- const stop=useCallback(()=>{halt.current=true;active.current=false;setMode(m=>m==='RUNNING'?'STOPPED':m)},[]);
- useEffect(()=>{if(scope.current!==scopeKey){scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;pending.current=false;lastTickKey.current='';setHistory([]);setScores([]);setLockedDigit(null);setCount(0);setPnl(0);setLossBlock(0);setMode('IDLE');setLastOutcome(null);setErr('')}},[scopeKey]);
+ const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
+ useEffect(()=>{if(scope.current!==scopeKey){scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;pending.current=false;lastTickKey.current='';setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode('IDLE');setLastOutcome(null);setErr('')}},[scopeKey,setTarget]);
  const execute=useCallback(async(predicted:number,stake:number)=>{
   if(!ws||!accountId||pending.current||halt.current)return;
   pending.current=true;setMode('BUYING');let contractId:number|undefined;let purchaseAttempted=false;
@@ -51,10 +53,10 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(!Number.isFinite(payout)||!Number.isFinite(buyPrice))throw new Error('Settlement amounts unavailable');
    const profit=amount(payout-buyPrice);pnlRef.current=amount(pnlRef.current+profit);setPnl(pnlRef.current);
    const win=profit>0;setLastOutcome({id:contractId,digit:predicted,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS'});play(win?'win':'loss');
-   if(win){halt.current=true;active.current=false;setMode('WIN')}
+   if(win){halt.current=true;active.current=false;setTarget(null);setMode('WIN')}
    else{
     lossBlockRef.current++;setLossBlock(lossBlockRef.current);
-    if(lossBlockRef.current>=3){lockedRef.current=null;setLockedDigit(null);lossBlockRef.current=0;setLossBlock(0)}
+    if(lossBlockRef.current>=3){lockedRef.current=null;setLockedDigit(null);setTarget(null);lossBlockRef.current=0;setLossBlock(0)}
     if(countRef.current>=Number(limit)){halt.current=true;active.current=false;setMode('MAX_TRADES')}
     else if(-pnlRef.current>=Number(maxLoss)){halt.current=true;active.current=false;setMode('MAX_LOSS')}
     else setMode('RUNNING');
@@ -63,7 +65,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(purchaseAttempted){setMode('UNCERTAIN');setErr(`${String(e)}${contractId?` — contract ${contractId}`:''}`)}
    else{setMode('STOPPED');setErr(`No trade was purchased: ${String(e)}`)}
   }finally{pending.current=false}
- },[ws,accountId,symbol,limit,maxLoss,play]);
+ },[ws,accountId,symbol,limit,maxLoss,play,setTarget]);
  const execRef=useRef(execute);useEffect(()=>{execRef.current=execute},[execute]);
  useEffect(()=>{
   if(!currentTick||!Number.isFinite(currentTick.quote))return;
@@ -74,7 +76,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   if(!active.current||halt.current||pending.current||ranking.length===0||!ws||!accountId||!isConnected)return;
   if(countRef.current>=Number(limit)){stop();setMode('MAX_TRADES');return}
   let digit=lockedRef.current;
-  if(digit===null){if(ranking[0].score<Number(threshold))return;digit=ranking[0].digit;lockedRef.current=digit;setLockedDigit(digit)}
+  if(digit===null){if(ranking[0].score<Number(threshold))return;digit=ranking[0].digit;lockedRef.current=digit;setLockedDigit(digit);setTarget(digit)}
   const stake=amount(Number(base)*Math.pow(Number(factor),countRef.current));
   // A single trade must fit remaining cycle-loss budget, not just next stake.
   if(!Number.isFinite(stake)||stake<=0||stake+Math.max(0,-pnlRef.current)>Number(maxLoss)){stop();setMode('MAX_LOSS');return}
@@ -87,7 +89,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   if(!window.confirm(`Start ${acc} automatic cycle? Contract: 1-tick DigitMatch. Maximum loss: $${maxLoss}; up to ${limit} purchases. No guaranteed returns.`))return;
   // Must begin a fresh cycle. Uncertain purchases cannot be reset with this control.
   if(mode==='UNCERTAIN')return;
-  countRef.current=0;pnlRef.current=0;lossBlockRef.current=0;lockedRef.current=null;setCount(0);setPnl(0);setLossBlock(0);setLockedDigit(null);setLastOutcome(null);setErr('');halt.current=false;active.current=true;setMode('RUNNING');if(sound)tone('buy');
+  countRef.current=0;pnlRef.current=0;lossBlockRef.current=0;lockedRef.current=null;setCount(0);setPnl(0);setLossBlock(0);setLockedDigit(null);setTarget(null);setLastOutcome(null);setErr('');halt.current=false;active.current=true;setMode('RUNNING');if(sound)tone('buy');
  }
  return <section className="w-full min-w-0 px-0 pb-2 text-slate-100"><div className="rounded-xl border border-cyan-500/30 bg-[#101a2e] p-2.5 shadow-lg shadow-black/30">
   <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><h2 className="font-bold text-cyan-300">⚡ DigitMatchStars Auto Engine</h2><span className={`rounded-full px-2 py-1 text-xs font-bold ${real?'bg-rose-900 text-rose-200':'bg-sky-900 text-sky-200'}`}>{real?'REAL MONEY':demo?'DEMO':'LOG IN'} · {mode}</span></div>
