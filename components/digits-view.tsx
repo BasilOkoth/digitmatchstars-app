@@ -383,7 +383,7 @@ export function DigitsView({
              a no-op because each instance tracks its own drag). Full reordering
              lives in the builder's phone viewport, which renders the single
              mobile column. */
-          <div className="flex w-full max-w-7xl mx-auto flex-col px-3 py-2 pb-2 sm:px-4">
+          <div className="flex w-full max-w-none mx-auto flex-col px-0 py-0 pb-1">
             {isLoading ? (
               <div className={`grid grid-cols-1 gap-2 ${editMode ? "lg:grid-cols-[minmax(0,1fr)_440px]" : ""}`}>
                 <Skeleton className="h-[420px] w-full rounded-xl" />
@@ -407,7 +407,7 @@ export function DigitsView({
         )
       ) : isMobile ? (
         /* Standard mobile layout (unchanged): trade type chips + main card. */
-        <div className="flex w-full max-w-7xl mx-auto flex-col px-3 py-2 sm:px-4 sm:py-4 gap-2 sm:gap-3 pb-10">
+        <div className="flex w-full max-w-none mx-auto flex-col px-0 py-0 gap-2 pb-2">
           {isLoading ? (
             <>
               {/* Trade type chips skeleton */}
@@ -496,7 +496,7 @@ export function DigitsView({
            controls (trade type chips + trade controls) right — so both paths
            look identical. The `lg:` guard plays the same first-paint role as
            in the no-code grid (useIsMobile initialises to false). */
-        <div className="flex w-full max-w-7xl mx-auto flex-col px-3 py-2 pb-2 sm:px-4">
+        <div className="flex w-full max-w-none mx-auto flex-col px-0 py-0 pb-1">
           {isLoading ? (
             <div className={`grid grid-cols-1 gap-2 ${editMode ? "lg:grid-cols-[minmax(0,1fr)_440px]" : ""}`}>
               <Skeleton className="h-[420px] w-full rounded-xl" />
