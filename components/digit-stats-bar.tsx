@@ -57,11 +57,11 @@ export function DigitStatsBar({
 
   return (
     <div className="h-full flex flex-col min-h-0">
-      <span className="text-xs sm:text-sm text-muted-foreground mb-1.5">
+      <span className="text-xs sm:text-sm text-muted-foreground mb-2 sm:mb-3">
         <Localize i18n_default_text="Last digit prediction" />
       </span>
       <div className="flex-1 flex items-center min-h-0">
-        <div className="grid grid-cols-5 gap-2 lg:grid-cols-10 place-items-center w-full">
+        <div className="grid grid-cols-5 gap-1.5 sm:gap-3 place-items-center w-full">
         {rankedDigits.map((digit) => {
           const pct = digitStats.percentages[digit] ?? 0;
           const isSelected = digit === selectedDigit;
@@ -69,12 +69,13 @@ export function DigitStatsBar({
           const isLowest = digitStats.totalTicks > 0 && pct === minPct;
 
           return (
-            <div key={digit} className="flex flex-col items-center gap-0.5">
+            <div key={digit} className="flex flex-col items-center gap-1 sm:gap-1.5">
               <Button
                 variant={isSelected ? 'default' : 'outline'}
                 onClick={() => onDigitSelect(digit)}
                 className={cn(
-                  'w-9 h-9 sm:w-10 sm:h-10 text-sm sm:text-base font-semibold rounded-lg p-0',
+                  'w-11 h-11 sm:w-14 sm:h-14 text-base sm:text-xl font-bold rounded-lg p-0',
+                  isSelected && 'bg-green-600 text-white border-green-400 ring-2 ring-green-400/70 hover:bg-green-500 focus-visible:ring-green-400 shadow-md shadow-green-950/40',
                   !isSelected && 'bg-muted/50 border-muted-foreground/20'
                 )}
               >
@@ -82,7 +83,7 @@ export function DigitStatsBar({
               </Button>
               <span
                 className={cn(
-                  'text-[11px] font-mono',
+                  'text-xs font-mono',
                   isHighest && 'text-green-500 font-semibold',
                   isLowest && 'text-red-500 font-semibold',
                   !isHighest && !isLowest && 'text-muted-foreground'
