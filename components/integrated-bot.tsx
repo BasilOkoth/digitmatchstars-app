@@ -23,7 +23,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const next=amount(Number(base)*Math.pow(Number(factor),count));const scopeKey=`${accountId}:${symbol}`;
  const soundRef=useRef(sound);useEffect(()=>{soundRef.current=sound},[sound]);
  const play=useCallback((kind:'buy'|'win'|'loss')=>{if(soundRef.current)tone(kind)},[]);
- const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
+ const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
  useEffect(()=>{if(scope.current!==scopeKey){scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;pending.current=false;lastTickKey.current='';setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode('IDLE');setLastOutcome(null);setErr('')}},[scopeKey,setTarget]);
  const execute=useCallback(async(predicted:number,stake:number)=>{
   if(!ws||!accountId||pending.current||halt.current)return;
@@ -57,11 +57,11 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    else{
     lossBlockRef.current++;setLossBlock(lossBlockRef.current);
     if(lossBlockRef.current>=3){lockedRef.current=null;setLockedDigit(null);setTarget(null);lossBlockRef.current=0;setLossBlock(0)}
-    if(countRef.current>=Number(limit)){halt.current=true;active.current=false;setMode('MAX_TRADES')}
-    else if(-pnlRef.current>=Number(maxLoss)){halt.current=true;active.current=false;setMode('MAX_LOSS')}
+    if(countRef.current>=Number(limit)){halt.current=true;active.current=false;setTarget(null);setMode('MAX_TRADES')}
+    else if(-pnlRef.current>=Number(maxLoss)){halt.current=true;active.current=false;setTarget(null);setMode('MAX_LOSS')}
     else setMode('RUNNING');
    }
-  }catch(e){halt.current=true;active.current=false;
+  }catch(e){halt.current=true;active.current=false;setTarget(null);
    if(purchaseAttempted){setMode('UNCERTAIN');setErr(`${String(e)}${contractId?` — contract ${contractId}`:''}`)}
    else{setMode('STOPPED');setErr(`No trade was purchased: ${String(e)}`)}
   }finally{pending.current=false}
@@ -80,6 +80,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   const stake=amount(Number(base)*Math.pow(Number(factor),countRef.current));
   // A single trade must fit remaining cycle-loss budget, not just next stake.
   if(!Number.isFinite(stake)||stake<=0||stake+Math.max(0,-pnlRef.current)>Number(maxLoss)){stop();setMode('MAX_LOSS');return}
+  // Synchronize the green target with the digit actually sent to Deriv.
+  setTarget(digit);
   void execRef.current(digit,stake);
  },[currentTick,pipSize,ws,accountId,isConnected,limit,threshold,base,factor,maxLoss,stop]);
  function start(){
