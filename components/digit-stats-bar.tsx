@@ -11,6 +11,23 @@ import type { DigitStats } from '../lib/types';
 
 type ScoreMap = Record<number, number>;
 const ScoreContext = createContext<ScoreMap>({});
+const ArrivalContext = createContext<Record<number, number>>({});
+/** Smoothed historical inter-arrival estimate, in ticks. This is descriptive,
+ * not a future-arrival guarantee: independent digits do not become due. */
+function estimateArrivalTicks(history: number[]): Record<number, number> {
+  const result: Record<number, number> = {};
+  for (let digit = 0; digit < 10; digit++) {
+    const positions: number[] = [];
+    history.forEach((d, index) => { if (d === digit) positions.push(index); });
+    if (positions.length < 3) continue; // insufficient observations
+    const gaps = positions.slice(1).map((pos, i) => pos - positions[i]);
+    // Regularise toward the 10-tick independent-digit baseline to avoid
+    // claiming that a few short gaps establish predictive 'urgency'.
+    const estimate = (gaps.reduce((sum, gap) => sum + gap, 0) + 80) / (gaps.length + 8);
+    result[digit] = Math.max(1, Math.round(estimate));
+  }
+  return result;
+}
 const ExecutionTargetContext = createContext<{ target: number | null; setTarget: (digit: number | null) => void }>({target:null,setTarget:()=>{}});
 export function useExecutionTarget() { return useContext(ExecutionTargetContext); }
 /** Uses the SAME scoreDigits routine as the automated engine; values are
@@ -19,10 +36,11 @@ export function DigitScoreProvider({children, tick, pipSize, symbol}: {
  children: React.ReactNode; tick: Tick | null; pipSize: number; symbol: string;
 }) {
  const [scores, setScores] = useState<ScoreMap>({});
+ const [arrival, setArrival] = useState<Record<number, number>>({});
  const [target, setTarget] = useState<number | null>(null);
  const history = useRef<number[]>([]);
  const lastKey = useRef('');
- useEffect(() => {history.current=[];lastKey.current='';setScores({});setTarget(null);},[symbol,pipSize]);
+ useEffect(() => {history.current=[];lastKey.current='';setScores({});setArrival({});setTarget(null);},[symbol,pipSize]);
  useEffect(() => {
    if (!tick || !symbol || !Number.isFinite(tick.quote)) return;
    const key = `${tick.epoch}:${tick.quote}`;
@@ -32,8 +50,9 @@ export function DigitScoreProvider({children, tick, pipSize, symbol}: {
    const next: ScoreMap = {};
    for(const item of scoreDigits(history.current)) next[item.digit] = item.score;
    setScores(next);
+   setArrival(estimateArrivalTicks(history.current));
  }, [tick,symbol,pipSize]);
- return <ScoreContext.Provider value={scores}><ExecutionTargetContext.Provider value={{target,setTarget}}>{children}</ExecutionTargetContext.Provider></ScoreContext.Provider>;
+ return <ScoreContext.Provider value={scores}><ArrivalContext.Provider value={arrival}><ExecutionTargetContext.Provider value={{target,setTarget}}>{children}</ExecutionTargetContext.Provider></ArrivalContext.Provider></ScoreContext.Provider>;
 }
 
 interface DigitStatsBarProps {
@@ -48,6 +67,7 @@ export function DigitStatsBar({
   onDigitSelect,
 }: DigitStatsBarProps) {
   const scoreByDigit = useContext(ScoreContext);
+  const arrivalByDigit = useContext(ArrivalContext);
   const maxPct = Math.max(...digitStats.percentages);
   const minPct = Math.min(...digitStats.percentages);
   const rankedDigits = [...Array(10).keys()].sort((a,b) => {
@@ -97,6 +117,9 @@ export function DigitStatsBar({
               </span>
               <span className="text-[10px] font-semibold tabular-nums text-cyan-400" title="Relative execution score, not probability">
                 {Number.isFinite(scoreByDigit[digit]) ? `Score ${scoreByDigit[digit].toFixed(2)}` : 'Score —'}
+              </span>
+              <span className="text-[10px] font-semibold tabular-nums text-emerald-400/90" title="Approximate historical gap between appearances, smoothed toward 10 ticks. Not a prediction or guaranteed trade count.">
+                {Number.isFinite(arrivalByDigit[digit]) ? `Est. ~${arrivalByDigit[digit]} ticks` : 'Est. —'}
               </span>
             </div>
           );
