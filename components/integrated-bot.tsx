@@ -11,7 +11,6 @@ const amount=(n:number)=>Math.round((n+Number.EPSILON)*100)/100;
 function tone(kind:'buy'|'win'|'loss'){
  try{const A=window.AudioContext;const ctx=new A();const osc=ctx.createOscillator();const gain=ctx.createGain();osc.type=kind==='win'?'sine':'triangle';osc.frequency.value=kind==='win'?880:kind==='buy'?650:250;gain.gain.value=.065;osc.connect(gain);gain.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+(kind==='win'?.42:.15));osc.onended=()=>{void ctx.close()}}catch{/* audio unsupported */}
 }
-const sleep=(ms:number)=>new Promise<void>(r=>setTimeout(r,ms));
 export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,pipSize,symbol}:{ws:DerivWS|null;accountId:string|null;accountType:string|null;isConnected:boolean;currentTick:Tick|null;pipSize:number;symbol:string}){
  const {setTarget} = useExecutionTarget();
  const demo=Boolean(accountId)&&(/demo|virtual/i.test(accountType??'')||/^VRT/i.test(accountId??''));const real=Boolean(accountId)&&!demo;
@@ -21,6 +20,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const active=useRef(false),pending=useRef(false),halt=useRef(false),countRef=useRef(0),lossBlockRef=useRef(0),pnlRef=useRef(0),lastTickKey=useRef(''),histRef=useRef<number[]>([]),scoreRef=useRef<ReturnType<typeof scoreDigits>>([]),lockedRef=useRef<number|null>(null),scope=useRef('');
  const valid=Number(base)>0&&Number(factor)>=1&&Number(factor)<=3&&Number(limit)>=1&&Number(limit)<=100&&Number(maxLoss)>0&&Number(threshold)>=0;
  const next=amount(Number(base)*Math.pow(Number(factor),count));const scopeKey=`${accountId}:${symbol}`;
+ const [latency,setLatency]=useState<{quote:number;buy:number;settlement:number}|null>(null);
  const soundRef=useRef(sound);useEffect(()=>{soundRef.current=sound},[sound]);
  const play=useCallback((kind:'buy'|'win'|'loss')=>{if(soundRef.current)tone(kind)},[]);
  const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
@@ -31,24 +31,54 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   try{
    // Proposal is for the *locked scoring digit*, never the manually selected digit.
    if(!/^[A-Za-z0-9_]{2,30}$/.test(symbol))throw new Error('No valid trading symbol selected');
+   const quoteStart=performance.now();
    const quote=await ws.send<any>({proposal:1,amount:stake,basis:'stake',contract_type:'DIGITMATCH',currency:'USD',duration:1,duration_unit:'t',underlying_symbol:symbol,barrier:String(predicted)});
+   const quoteMs=Math.round(performance.now()-quoteStart);
    const proposalId=quote?.proposal?.id;const ask=Number(quote?.proposal?.ask_price);
    if(!proposalId||!Number.isFinite(ask)||ask<=0||ask>stake*1.05)throw new Error('Quote invalid or stale');
    if(halt.current)return;
    // Send exactly one buy. Any unknown outcome is a hard stop; never retry blindly.
    purchaseAttempted=true;
+   const buyStart=performance.now();
    const bought=await ws.send<any>({buy:String(proposalId),price:ask});
+   setLatency({quote:quoteMs,buy:Math.round(performance.now()-buyStart),settlement:0});
    contractId=Number(bought?.buy?.contract_id);
    if(!Number.isSafeInteger(contractId)||contractId<=0)throw new Error('Purchase acknowledged without verifiable contract ID');
    countRef.current+=1;setCount(countRef.current);play('buy');setMode('SETTLING');
+   // Subscribe to verified contract updates. Never infer a WIN from the market display.
+   const settlementStart=performance.now();
+   let unsubscribe: (()=>Promise<void>)|undefined;
    let settle:any=null;
-   for(let tries=0;tries<35;tries++){
-    await sleep(1200);
-    const resp=await ws.send<any>({proposal_open_contract:1,contract_id:contractId});
-    const c=resp?.proposal_open_contract;
-    if(c?.is_sold||c?.status==='won'||c?.status==='lost'){settle=c;break}
-   }
-   if(!settle)throw new Error(`Contract ${contractId} not confirmed settled; blocked to avoid duplicate trades`);
+   try {
+    settle=await new Promise<any>(async(resolve,reject)=>{
+      let completed=false;
+      let pollTimer: ReturnType<typeof setInterval>|undefined;
+      const finish=(value:any,error?:Error)=>{
+        if(completed)return;completed=true;clearTimeout(timeout);if(pollTimer)clearInterval(pollTimer);
+        if(error)reject(error);else resolve(value);
+      };
+      const onContract=(data:Record<string,unknown>)=>{
+        const c=(data as any).proposal_open_contract;
+        if(!c||Number(c.contract_id)!==contractId)return;
+        if(c.is_sold||c.status==='won'||c.status==='lost')finish(c);
+      };
+      const timeout=setTimeout(()=>finish(null,new Error(`Contract ${contractId} not confirmed settled; manual reconciliation required`)),45000);
+      try {
+        const sub=await ws.subscribe({proposal_open_contract:1,contract_id:contractId},onContract);
+        unsubscribe=sub.unsubscribe;
+        // Initial subscription response can already be settled. Clean up then too.
+        if(completed)void sub.unsubscribe();
+      }catch {
+        // Fallback only if the stream cannot be established, never a second buy.
+        const check=async()=>{
+          try{const resp=await ws.send<any>({proposal_open_contract:1,contract_id:contractId});onContract(resp)}catch{/* retain timeout */}
+        };
+        pollTimer=setInterval(()=>{void check()},1200);
+        void check();
+      }
+    });
+   }finally{if(unsubscribe)void unsubscribe()}
+   setLatency(old=>old?{...old,settlement:Math.round(performance.now()-settlementStart)}:null);
    const payout=Number(settle.sell_price??settle.payout??0);const buyPrice=Number(settle.buy_price??ask);
    if(!Number.isFinite(payout)||!Number.isFinite(buyPrice))throw new Error('Settlement amounts unavailable');
    const profit=amount(payout-buyPrice);pnlRef.current=amount(pnlRef.current+profit);setPnl(pnlRef.current);
@@ -67,24 +97,39 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   }finally{pending.current=false}
  },[ws,accountId,symbol,limit,maxLoss,play,setTarget]);
  const execRef=useRef(execute);useEffect(()=>{execRef.current=execute},[execute]);
+ // Process the live WebSocket frame synchronously, BEFORE React's render cycle.
+ // Reuse the existing market subscription; do not create a duplicate tick feed.
+ const tickSettings=useRef({pipSize,limit,threshold,base,factor,maxLoss,isConnected,accountId,symbol});
+ tickSettings.current={pipSize,limit,threshold,base,factor,maxLoss,isConnected,accountId,symbol};
  useEffect(()=>{
-  if(!currentTick||!Number.isFinite(currentTick.quote))return;
-  const key=String((currentTick as any).epoch??currentTick.quote)+':'+String(currentTick.quote);
-  if(lastTickKey.current===key)return;lastTickKey.current=key;
-  const d=getLastDigit(currentTick.quote,pipSize);histRef.current=[...histRef.current.slice(-99),d];
-  const ranking=scoreDigits(histRef.current);scoreRef.current=ranking;setHistory(histRef.current);setScores(ranking);
-  if(!active.current||halt.current||pending.current||ranking.length===0||!ws||!accountId||!isConnected)return;
-  if(countRef.current>=Number(limit)){stop();setMode('MAX_TRADES');return}
-  // One source of truth: choose the highest score for EVERY new purchase.
-  if(ranking[0].score<Number(threshold))return;
-  const digit=ranking[0].digit;lockedRef.current=digit;setLockedDigit(digit);setTarget(digit);
-  const stake=amount(Number(base)*Math.pow(Number(factor),countRef.current));
-  // A single trade must fit remaining cycle-loss budget, not just next stake.
-  if(!Number.isFinite(stake)||stake<=0||stake+Math.max(0,-pnlRef.current)>Number(maxLoss)){stop();setMode('MAX_LOSS');return}
-  // Synchronize the green target with the digit actually sent to Deriv.
-  setTarget(digit);
-  void execRef.current(digit,stake);
- },[currentTick,pipSize,ws,accountId,isConnected,limit,threshold,base,factor,maxLoss,stop]);
+  if(!ws)return;
+  return ws.onMessage((frame:Record<string,unknown>)=>{
+   if(frame.msg_type!=='tick'||!frame.tick)return;
+   const tick=frame.tick as any;
+   const settings=tickSettings.current;
+   if(tick.symbol!==settings.symbol||!Number.isFinite(Number(tick.quote)))return;
+   const key=`${tick.epoch}:${tick.quote}`;
+   if(lastTickKey.current===key)return;
+   lastTickKey.current=key;
+   const digit=getLastDigit(Number(tick.quote),Number.isInteger(tick.pip_size)?tick.pip_size:settings.pipSize);
+   histRef.current=[...histRef.current.slice(-99),digit];
+   const ranking=scoreDigits(histRef.current);scoreRef.current=ranking;
+   // Render-only state; purchase scheduling does not wait for it.
+   setHistory(histRef.current);setScores(ranking);
+   if(!active.current||halt.current||pending.current||!ranking.length||!settings.accountId||!settings.isConnected)return;
+   if(countRef.current>=Number(settings.limit)){stop();setMode('MAX_TRADES');return}
+   if(ranking[0].score<Number(settings.threshold))return;
+   const target=ranking[0].digit;
+   const stake=amount(Number(settings.base)*Math.pow(Number(settings.factor),countRef.current));
+   if(!Number.isFinite(stake)||stake<=0||stake+Math.max(0,-pnlRef.current)>Number(settings.maxLoss)){
+    stop();setMode('MAX_LOSS');return;
+   }
+   lockedRef.current=target;setLockedDigit(target);setTarget(target);
+   // Lock purchase immediately; no React rerender or effect scheduling required.
+   void execRef.current(target,stake);
+  });
+ },[ws,stop,setTarget]);
+
  function start(){
   if(!valid||!accountId||!isConnected||!ws||pending.current||active.current)return;
   const acc=real?'REAL MONEY':'DEMO';
@@ -98,6 +143,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><h2 className="font-bold text-cyan-300">⚡ DigitMatchStars Auto Engine</h2><span className={`rounded-full px-2 py-1 text-xs font-bold ${real?'bg-rose-900 text-rose-200':'bg-sky-900 text-sky-200'}`}>{real?'REAL MONEY':demo?'DEMO':'LOG IN'} · {mode}</span></div>
   <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">{([['Base $',base,setBase],['Multiplier',factor,setFactor],['Max trades',limit,setLimit],['Loss limit $',maxLoss,setMaxLoss],['Min score',threshold,setThreshold]] as const).map(([name,v,fn])=><label key={name} className="text-[11px] text-slate-300">{name}<input value={v} disabled={active.current||pending.current} onChange={e=>fn(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>)}</div>
   <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4">{[['Top digit',scores[0]?.digit??'—'],['Trade',`${count}/${limit}`],['Next stake',`$${next.toFixed(2)}`],['Cycle P/L',`${pnl>=0?'+':''}$${pnl.toFixed(2)}`]].map(([k,v])=><div key={String(k)} className="rounded-lg bg-[#0a1222] px-2 py-1.5"><div className="text-[11px] text-slate-400">{k}</div><div className={`font-extrabold ${k==='Cycle P/L' ? (pnl>0 ? 'text-green-400' : pnl<0 ? 'text-red-500' : 'text-slate-100') : 'text-slate-100'}`}>{v}</div></div>)}</div>
+  {latency&&<div className="mt-1 text-[10px] text-slate-400">Quote {latency.quote}ms · Buy {latency.buy}ms · Settlement {latency.settlement||'…'}ms</div>}
   <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-300"><span>Contract target: {pending.current ? lockedDigit ?? '—' : '—'}</span><span>Sample: {history.length} ticks</span></div>
   <div className="mt-2 flex items-center gap-2">
     <button
