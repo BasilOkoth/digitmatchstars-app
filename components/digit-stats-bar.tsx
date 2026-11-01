@@ -4,6 +4,7 @@ import { createContext, useContext, useEffect, useMemo, useRef, useState } from 
 import type { Tick } from '@deriv/core';
 import { getLastDigit } from '@/lib/digit-stats';
 import { scoreDigits } from '@/lib/digitmatch-score';
+import { estimateArrivalTicks } from '@/lib/digit-urgency';
 import { Localize } from '@deriv-com/translations';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
@@ -12,22 +13,6 @@ import type { DigitStats } from '../lib/types';
 type ScoreMap = Record<number, number>;
 const ScoreContext = createContext<ScoreMap>({});
 const ArrivalContext = createContext<Record<number, number>>({});
-/** Smoothed historical inter-arrival estimate, in ticks. This is descriptive,
- * not a future-arrival guarantee: independent digits do not become due. */
-function estimateArrivalTicks(history: number[]): Record<number, number> {
-  const result: Record<number, number> = {};
-  for (let digit = 0; digit < 10; digit++) {
-    const positions: number[] = [];
-    history.forEach((d, index) => { if (d === digit) positions.push(index); });
-    if (positions.length < 3) continue; // insufficient observations
-    const gaps = positions.slice(1).map((pos, i) => pos - positions[i]);
-    // Regularise toward the 10-tick independent-digit baseline to avoid
-    // claiming that a few short gaps establish predictive 'urgency'.
-    const estimate = (gaps.reduce((sum, gap) => sum + gap, 0) + 80) / (gaps.length + 8);
-    result[digit] = Math.max(1, Math.round(estimate));
-  }
-  return result;
-}
 const ExecutionTargetContext = createContext<{ target: number | null; setTarget: (digit: number | null) => void }>({target:null,setTarget:()=>{}});
 export function useExecutionTarget() { return useContext(ExecutionTargetContext); }
 /** Uses the SAME scoreDigits routine as the automated engine; values are
