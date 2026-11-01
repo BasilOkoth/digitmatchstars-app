@@ -48,7 +48,6 @@ export function DigitStatsBar({
   onDigitSelect,
 }: DigitStatsBarProps) {
   const scoreByDigit = useContext(ScoreContext);
-  const {target} = useExecutionTarget();
   const maxPct = Math.max(...digitStats.percentages);
   const minPct = Math.min(...digitStats.percentages);
   const rankedDigits = [...Array(10).keys()].sort((a,b) => {
@@ -68,8 +67,8 @@ export function DigitStatsBar({
         <div className="grid grid-cols-5 gap-1.5 sm:gap-3 place-items-center w-full">
         {rankedDigits.map((digit) => {
           const pct = digitStats.percentages[digit] ?? 0;
-          // During an active cycle the locked execution digit wins; otherwise show top-ranked V1 digit.
-          const isSelected = digit === (target ?? (Number.isFinite(scoreByDigit[rankedDigits[0]]) ? rankedDigits[0] : null));
+          // Green always shows the current highest V1 score. An in-flight contract may target a prior digit.
+          const isSelected = digit === (Number.isFinite(scoreByDigit[rankedDigits[0]]) ? rankedDigits[0] : null);
           const isHighest = digitStats.totalTicks > 0 && pct === maxPct;
           const isLowest = digitStats.totalTicks > 0 && pct === minPct;
 

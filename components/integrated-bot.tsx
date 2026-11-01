@@ -55,8 +55,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const win=profit>0;setLastOutcome({id:contractId,digit:predicted,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS'});play(win?'win':'loss');
    if(win){halt.current=true;active.current=false;setTarget(null);setMode('WIN')}
    else{
-    lossBlockRef.current++;setLossBlock(lossBlockRef.current);
-    if(lossBlockRef.current>=3){lockedRef.current=null;setLockedDigit(null);setTarget(null);lossBlockRef.current=0;setLossBlock(0)}
+    // No three-loss digit lock: retarget at the next fresh tick.
+    lockedRef.current=null;setLockedDigit(null);setTarget(null);lossBlockRef.current=0;setLossBlock(0)
     if(countRef.current>=Number(limit)){halt.current=true;active.current=false;setTarget(null);setMode('MAX_TRADES')}
     else if(-pnlRef.current>=Number(maxLoss)){halt.current=true;active.current=false;setTarget(null);setMode('MAX_LOSS')}
     else setMode('RUNNING');
@@ -75,8 +75,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   const ranking=scoreDigits(histRef.current);scoreRef.current=ranking;setHistory(histRef.current);setScores(ranking);
   if(!active.current||halt.current||pending.current||ranking.length===0||!ws||!accountId||!isConnected)return;
   if(countRef.current>=Number(limit)){stop();setMode('MAX_TRADES');return}
-  let digit=lockedRef.current;
-  if(digit===null){if(ranking[0].score<Number(threshold))return;digit=ranking[0].digit;lockedRef.current=digit;setLockedDigit(digit);setTarget(digit)}
+  // One source of truth: choose the highest score for EVERY new purchase.
+  if(ranking[0].score<Number(threshold))return;
+  const digit=ranking[0].digit;lockedRef.current=digit;setLockedDigit(digit);setTarget(digit);
   const stake=amount(Number(base)*Math.pow(Number(factor),countRef.current));
   // A single trade must fit remaining cycle-loss budget, not just next stake.
   if(!Number.isFinite(stake)||stake<=0||stake+Math.max(0,-pnlRef.current)>Number(maxLoss)){stop();setMode('MAX_LOSS');return}
@@ -97,7 +98,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><h2 className="font-bold text-cyan-300">⚡ DigitMatchStars Auto Engine</h2><span className={`rounded-full px-2 py-1 text-xs font-bold ${real?'bg-rose-900 text-rose-200':'bg-sky-900 text-sky-200'}`}>{real?'REAL MONEY':demo?'DEMO':'LOG IN'} · {mode}</span></div>
   <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">{([['Base $',base,setBase],['Multiplier',factor,setFactor],['Max trades',limit,setLimit],['Loss limit $',maxLoss,setMaxLoss],['Min score',threshold,setThreshold]] as const).map(([name,v,fn])=><label key={name} className="text-[11px] text-slate-300">{name}<input value={v} disabled={active.current||pending.current} onChange={e=>fn(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>)}</div>
   <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4">{[['Top digit',scores[0]?.digit??'—'],['Trade',`${count}/${limit}`],['Next stake',`$${next.toFixed(2)}`],['Cycle P/L',`${pnl>=0?'+':''}$${pnl.toFixed(2)}`]].map(([k,v])=><div key={String(k)} className="rounded-lg bg-[#0a1222] px-2 py-1.5"><div className="text-[11px] text-slate-400">{k}</div><div className={`font-extrabold ${k==='Cycle P/L' ? (pnl>0 ? 'text-green-400' : pnl<0 ? 'text-red-500' : 'text-slate-100') : 'text-slate-100'}`}>{v}</div></div>)}</div>
-  <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-300"><span>Locked: {lockedDigit??'—'}</span><span>Block losses: {lossBlock}/3</span><span>Sample: {history.length} ticks</span></div>
+  <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-300"><span>Contract target: {pending.current ? lockedDigit ?? '—' : '—'}</span><span>Sample: {history.length} ticks</span></div>
   <div className="mt-2 flex items-center gap-2">
     <button
       disabled={!active.current && (!valid||!accountId||!isConnected||pending.current||mode==='UNCERTAIN')}
