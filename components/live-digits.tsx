@@ -13,6 +13,7 @@ import { useLogoSrc } from '@/components/custom/logo-src-provider';
 import { DigitsView } from './digits-view';
 import { DigitScoreProvider } from './digit-stats-bar';
 import { IntegratedBot } from './integrated-bot';
+import { NextTickCoverage } from './next-tick-coverage';
 import { IntelligencePanel } from './intelligence-panel';
 import type { DigitsAppConfig } from '../lib/app-config';
 
@@ -54,7 +55,7 @@ export function LiveDigits({
   return (
     <DigitScoreProvider tick={trading.currentTick} pipSize={trading.pipSize} symbol={trading.activeSymbol?.underlying_symbol ?? ''}>
     <>
-    <div className="mx-auto grid w-full max-w-[1500px] grid-cols-1 items-start gap-2 px-2 pt-2 lg:grid-cols-[minmax(0,1.1fr)_minmax(0,0.9fr)] lg:gap-2 lg:px-3">
+    <div className="mx-auto grid w-full max-w-[1500px] grid-cols-1 items-start gap-2 px-2 pt-2 xl:grid-cols-[minmax(0,1fr)_minmax(390px,0.8fr)] xl:gap-3 xl:px-4">
       <div className="min-w-0">
     <DigitsView
       authState={authState}
@@ -103,7 +104,7 @@ export function LiveDigits({
       onReorder={onReorder}
     />
       </div>
-    {!editMode && <div className="min-w-0 self-start lg:sticky lg:top-2"><IntegratedBot ws={ws} accountId={activeAccount?.account_id ?? null} accountType={activeAccount?.account_type ?? null} isConnected={trading.isConnected} currentTick={trading.currentTick} pipSize={trading.pipSize} symbol={trading.activeSymbol?.underlying_symbol ?? ''} /></div>}
+    {!editMode && <div className="min-w-0 lg:sticky lg:top-2"><IntegratedBot ws={ws} accountId={activeAccount?.account_id ?? null} accountType={activeAccount?.account_type ?? null} isConnected={trading.isConnected} currentTick={trading.currentTick} pipSize={trading.pipSize} symbol={trading.activeSymbol?.underlying_symbol ?? ''} /><NextTickCoverage currentTick={trading.currentTick} pipSize={trading.pipSize} symbol={trading.activeSymbol?.underlying_symbol ?? ''} /></div>}
     </div>
     {!editMode && (
       <IntelligencePanel
