@@ -17,6 +17,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const [base,setBase]=useState('1');const [factor,setFactor]=useState('1.15');const [limit,setLimit]=useState('20');const [maxLoss,setMaxLoss]=useState('40');const [threshold,setThreshold]=useState('15.01');
  const [mode,setMode]=useState<Mode>('IDLE');const [count,setCount]=useState(0);const [pnl,setPnl]=useState(0);const [lastOutcome,setLastOutcome]=useState<Outcome|null>(null);const [err,setErr]=useState('');const [sound,setSound]=useState(true);
  const [history,setHistory]=useState<number[]>([]);const [scores,setScores]=useState<ReturnType<typeof scoreDigits>>([]);const [lockedDigit,setLockedDigit]=useState<number|null>(null);const [lossBlock,setLossBlock]=useState(0);
+ const scoreHistoryRef=useRef<Record<number,number>[]>([]);
+ const [topMomentum,setTopMomentum]=useState<number|null>(null);
  const active=useRef(false),pending=useRef(false),halt=useRef(false),countRef=useRef(0),lossBlockRef=useRef(0),pnlRef=useRef(0),lastTickKey=useRef(''),histRef=useRef<number[]>([]),scoreRef=useRef<ReturnType<typeof scoreDigits>>([]),lockedRef=useRef<number|null>(null),scope=useRef('');
  const valid=Number(base)>0&&Number(factor)>=1&&Number(factor)<=3&&Number(limit)>=1&&Number(limit)<=100&&Number(maxLoss)>0&&Number(threshold)>=0;
  const next=amount(Number(base)*Math.pow(Number(factor),count));const scopeKey=`${accountId}:${symbol}`;
@@ -24,7 +26,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const soundRef=useRef(sound);useEffect(()=>{soundRef.current=sound},[sound]);
  const play=useCallback((kind:'buy'|'win'|'loss')=>{if(soundRef.current)tone(kind)},[]);
  const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
- useEffect(()=>{if(scope.current!==scopeKey){scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;pending.current=false;lastTickKey.current='';setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode('IDLE');setLastOutcome(null);setErr('')}},[scopeKey,setTarget]);
+ useEffect(()=>{if(scope.current!==scopeKey){scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];setTopMomentum(null);lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;pending.current=false;lastTickKey.current='';setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode('IDLE');setLastOutcome(null);setErr('')}},[scopeKey,setTarget]);
  const execute=useCallback(async(predicted:number,stake:number)=>{
   if(!ws||!accountId||pending.current||halt.current)return;
   pending.current=true;setMode('BUYING');let contractId:number|undefined;let purchaseAttempted=false;
@@ -114,12 +116,27 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const digit=getLastDigit(Number(tick.quote),Number.isInteger(tick.pip_size)?tick.pip_size:settings.pipSize);
    histRef.current=[...histRef.current.slice(-99),digit];
    const ranking=scoreDigits(histRef.current);scoreRef.current=ranking;
+   // Freeze all ten scores at each distinct tick. Evaluate momentum only using
+   // score history that PRECEDES the current trade decision.
+   if(ranking.length===10){
+     const snapshot:Record<number,number>={};
+     ranking.forEach(r=>{snapshot[r.digit]=r.score});
+     scoreHistoryRef.current=[...scoreHistoryRef.current.slice(-3),snapshot];
+   }
+   const top=ranking[0];
+   const hist=scoreHistoryRef.current;
+   // Three-tick net momentum; require at least two positive steps, rather
+   // than accepting a brief rebound in an otherwise weakening score.
+   const trail=top && hist.length>=4 ? hist.slice(-4).map(row=>row[top.digit]) : [];
+   const momentum=trail.length===4 ? trail[3]-trail[0] : null;
+   const rises=trail.length===4 ? trail.slice(1).filter((v,i)=>v>trail[i]).length : 0;
+   const rising=momentum!==null && momentum>0 && rises>=2;
    // Render-only state; purchase scheduling does not wait for it.
-   setHistory(histRef.current);setScores(ranking);
+   setHistory(histRef.current);setScores(ranking);setTopMomentum(momentum);
    if(!active.current||halt.current||pending.current||!ranking.length||!settings.accountId||!settings.isConnected)return;
    if(countRef.current>=Number(settings.limit)){stop();setMode('MAX_TRADES');return}
-   if(ranking[0].score<Number(settings.threshold))return;
-   const target=ranking[0].digit;
+   if(top.score<Number(settings.threshold) || !rising)return;
+   const target=top.digit;
    const stake=amount(Number(settings.base)*Math.pow(Number(settings.factor),countRef.current));
    if(!Number.isFinite(stake)||stake<=0||stake+Math.max(0,-pnlRef.current)>Number(settings.maxLoss)){
     stop();setMode('MAX_LOSS');return;
@@ -143,6 +160,12 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><h2 className="font-bold text-cyan-300">⚡ DigitMatchStars Auto Engine</h2><span className={`rounded-full px-2 py-1 text-xs font-bold ${real?'bg-rose-900 text-rose-200':'bg-sky-900 text-sky-200'}`}>{real?'REAL MONEY':demo?'DEMO':'LOG IN'} · {mode}</span></div>
   <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">{([['Base $',base,setBase],['Multiplier',factor,setFactor],['Max trades',limit,setLimit],['Loss limit $',maxLoss,setMaxLoss],['Min score',threshold,setThreshold]] as const).map(([name,v,fn])=><label key={name} className="text-[11px] text-slate-300">{name}<input value={v} disabled={active.current||pending.current} onChange={e=>fn(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>)}</div>
   <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4">{[['Top digit',scores[0]?.digit??'—'],['Trade',`${count}/${limit}`],['Next stake',`$${next.toFixed(2)}`],['Cycle P/L',`${pnl>=0?'+':''}$${pnl.toFixed(2)}`]].map(([k,v])=><div key={String(k)} className="rounded-lg bg-[#0a1222] px-2 py-1.5"><div className="text-[11px] text-slate-400">{k}</div><div className={`font-extrabold ${k==='Cycle P/L' ? (pnl>0 ? 'text-green-400' : pnl<0 ? 'text-red-500' : 'text-slate-100') : 'text-slate-100'}`}>{v}</div></div>)}</div>
+  <div className="mt-1 text-[11px] font-semibold" aria-live="polite">
+    <span className={topMomentum!==null&&topMomentum>0?'text-emerald-400':'text-rose-400'}>
+      V1 momentum: {topMomentum===null?'warming up':`${topMomentum>=0?'+':''}${topMomentum.toFixed(2)} / 3 ticks`}
+    </span>
+    <span className="ml-2 text-slate-400">Entry requires score threshold + rising trend (2 of 3 increases).</span>
+  </div>
   {latency&&<div className="mt-1 text-[10px] text-slate-400">Quote {latency.quote}ms · Buy {latency.buy}ms · Settlement {latency.settlement||'…'}ms</div>}
   <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-300"><span>Contract target: {pending.current ? lockedDigit ?? '—' : '—'}</span><span>Sample: {history.length} ticks</span></div>
   <div className="mt-2 flex items-center gap-2">
