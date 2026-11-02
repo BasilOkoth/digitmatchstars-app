@@ -154,7 +154,7 @@ export function NextTickCoverage({ currentTick, pipSize, symbol }: {
       'top1_within_10','top5_within_10','future_digits_1to10',...digitCols,
       'record_type','top1_momentum3','top1_positive_steps','top1_trend',
       ...Array.from({length:10},(_,d)=>[`digit${d}_momentum3`,`digit${d}_positive_steps`,`digit${d}_trend`]).flat(),
-      'contract_id','account_id','trade_target','trade_entry_score','trade_entry_momentum3','trade_entry_positive_steps','trade_entry_trend','trade_threshold','trade_stake','trade_payout','trade_profit','verified_trade_result'];
+      'trade_strategy','trade_lock_tick','trade_lock_duration','contract_id','account_id','trade_target','trade_entry_score','trade_entry_momentum3','trade_entry_positive_steps','trade_entry_trend','trade_threshold','trade_stake','trade_payout','trade_profit','verified_trade_result'];
     const rows = checks.map(c => {
       const complete = c.futureDigits?.length === 10;
       const extra = Array.from({length:10},(_,digit) => {
@@ -188,7 +188,7 @@ export function NextTickCoverage({ currentTick, pipSize, symbol }: {
     try{const stored=JSON.parse(localStorage.getItem(`dms-momentum-trades:v1:${symbol}`)||'[]');if(Array.isArray(stored))trades=stored;}catch{}
     const tradeRows=trades.filter(t=>t&&t.recordType==='TRADE'&&Number.isFinite(Number(t.contractId))&&['WIN','LOSS'].includes(t.outcome)).map(t=>{
       const row=Array(header.length).fill('');
-      const fields:Record<string,unknown>={timestamp_utc:t.timestamp,symbol:t.symbol,record_type:'TRADE',contract_id:t.contractId,account_id:t.accountId,trade_target:t.targetDigit,trade_entry_score:t.score,trade_entry_momentum3:t.momentum3,trade_entry_positive_steps:t.positiveSteps,trade_entry_trend:t.momentumRising?'RISING':'FALLING_OR_FLAT',trade_threshold:t.threshold,trade_stake:t.stake,trade_payout:t.payout,trade_profit:t.profit,verified_trade_result:t.outcome};
+      const fields:Record<string,unknown>={timestamp_utc:t.timestamp,symbol:t.symbol,record_type:'TRADE',trade_strategy:t.strategy??'LEGACY',trade_lock_tick:t.lockTick??'',trade_lock_duration:t.lockDuration??'',contract_id:t.contractId,account_id:t.accountId,trade_target:t.targetDigit,trade_entry_score:t.score,trade_entry_momentum3:t.momentum3,trade_entry_positive_steps:t.positiveSteps,trade_entry_trend:t.momentumRising?'RISING':'FALLING_OR_FLAT',trade_threshold:t.threshold,trade_stake:t.stake,trade_payout:t.payout,trade_profit:t.profit,verified_trade_result:t.outcome};
       for(const [field,value] of Object.entries(fields)){const i=header.indexOf(field);if(i>=0)row[i]=value;}
       return row;
     });
