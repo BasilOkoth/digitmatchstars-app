@@ -7,6 +7,7 @@ import type {Tick,DerivWS} from '@deriv/core';
 
 type Mode='IDLE'|'RUNNING'|'BUYING'|'SETTLING'|'WIN'|'MAX_TRADES'|'MAX_LOSS'|'UNCERTAIN'|'STOPPED';
 type Outcome={id:number;digit:number;stake:number;payout:number;profit:number;outcome:'WIN'|'LOSS'};
+type MomentumTrade = {recordType:'TRADE';contractId:number;accountId:string;symbol:string;timestamp:string;targetDigit:number;score:number;momentum3:number;positiveSteps:number;momentumRising:boolean;threshold:number;stake:number;payout:number;profit:number;outcome:'WIN'|'LOSS'};
 const amount=(n:number)=>Math.round((n+Number.EPSILON)*100)/100;
 function tone(kind:'buy'|'win'|'loss'){
  try{const A=window.AudioContext;const ctx=new A();const osc=ctx.createOscillator();const gain=ctx.createGain();osc.type=kind==='win'?'sine':'triangle';osc.frequency.value=kind==='win'?880:kind==='buy'?650:250;gain.gain.value=.065;osc.connect(gain);gain.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+(kind==='win'?.42:.15));osc.onended=()=>{void ctx.close()}}catch{/* audio unsupported */}
@@ -27,7 +28,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const play=useCallback((kind:'buy'|'win'|'loss')=>{if(soundRef.current)tone(kind)},[]);
  const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
  useEffect(()=>{if(scope.current!==scopeKey){scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];setTopMomentum(null);lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;pending.current=false;lastTickKey.current='';setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode('IDLE');setLastOutcome(null);setErr('')}},[scopeKey,setTarget]);
- const execute=useCallback(async(predicted:number,stake:number)=>{
+ const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number})=>{
   if(!ws||!accountId||pending.current||halt.current)return;
   pending.current=true;setMode('BUYING');let contractId:number|undefined;let purchaseAttempted=false;
   try{
@@ -85,6 +86,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(!Number.isFinite(payout)||!Number.isFinite(buyPrice))throw new Error('Settlement amounts unavailable');
    const profit=amount(payout-buyPrice);pnlRef.current=amount(pnlRef.current+profit);setPnl(pnlRef.current);
    const win=profit>0;setLastOutcome({id:contractId,digit:predicted,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS'});play(win?'win':'loss');
+   // Journal confirmed contract outcomes with entry-time momentum, not the latest score.
+   const journalRow:MomentumTrade={recordType:'TRADE',contractId,accountId,symbol,timestamp:new Date().toISOString(),targetDigit:predicted,score:signal.score,momentum3:signal.momentum3,positiveSteps:signal.positiveSteps,momentumRising:signal.momentum3>0&&signal.positiveSteps>=2,threshold:signal.threshold,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS'};
+   try{const key=`dms-momentum-trades:v1:${symbol}`;const prev=JSON.parse(localStorage.getItem(key)||'[]');const rows=Array.isArray(prev)?prev:[];if(!rows.some((x:MomentumTrade)=>x.contractId===contractId&&x.accountId===accountId)){localStorage.setItem(key,JSON.stringify([...rows.slice(-4999),journalRow]));}}catch{/* storage unavailable */}
    if(win){halt.current=true;active.current=false;setTarget(null);setMode('WIN')}
    else{
     // No three-loss digit lock: retarget at the next fresh tick.
@@ -143,7 +147,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    }
    lockedRef.current=target;setLockedDigit(target);setTarget(target);
    // Lock purchase immediately; no React rerender or effect scheduling required.
-   void execRef.current(target,stake);
+   void execRef.current(target,stake,{score:top.score,momentum3:momentum!,positiveSteps:rises,threshold:Number(settings.threshold)});
   });
  },[ws,stop,setTarget]);
 

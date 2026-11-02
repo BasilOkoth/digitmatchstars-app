@@ -14,6 +14,7 @@ type Check = {
   futureDigits?: number[];
   /** Frozen estimated ticks for digits 0–9, saved before any future observations. */
   urgencyEstimates?: (number | null)[];
+  momentum?: {digit:number;delta3:number|null;positiveSteps:number;trend:'RISING'|'FALLING_OR_FLAT'|'WARMUP'}[];
 };
 const MAX_CHECKS = 3000; // Each row stores ten digit estimates and up to ten future observations.
 const storageKey = (symbol: string, pipSize: number) => `dms-next-tick-top5:v2:${symbol}:${pipSize}`;
@@ -26,7 +27,8 @@ export function NextTickCoverage({ currentTick, pipSize, symbol }: {
   const [checks, setChecks] = useState<Check[]>([]);
   const [ready, setReady] = useState(false);
   const history = useRef<number[]>([]);
-  const pending = useRef<{ranked:Frozen[]; estimates:(number|null)[]} | null>(null);
+  const scoreHistory = useRef<Record<number,number>[]>([]);
+  const pending = useRef<{ranked:Frozen[]; estimates:(number|null)[]; momentum:NonNullable<Check['momentum']>} | null>(null);
   const lastTickKey = useRef('');
   const scope = useRef('');
   const key = `${symbol}:${pipSize}`;
@@ -35,6 +37,7 @@ export function NextTickCoverage({ currentTick, pipSize, symbol }: {
     if (scope.current !== key) {
       scope.current = key;
       history.current = [];
+      scoreHistory.current = [];
       pending.current = null;
       lastTickKey.current = '';
       setReady(false);
@@ -71,6 +74,7 @@ export function NextTickCoverage({ currentTick, pipSize, symbol }: {
         timestamp: Date.now(), symbol, pipSize, tickEpoch: Number(currentTick.epoch),
         actual, predicted: previous.ranked.map(p => ({...p})), rank: idx < 0 ? null : idx + 1,
         urgencyEstimates: [...previous.estimates],
+        momentum: previous.momentum.map(x=>({...x})),
         futureDigits: [actual],
       };
       setChecks(old => {
@@ -84,10 +88,23 @@ export function NextTickCoverage({ currentTick, pipSize, symbol }: {
     }
     history.current = [...history.current.slice(-99), actual];
     const ranking = scoreDigits(history.current);
+    if(ranking.length===10){
+      const snapshot:Record<number,number>={};
+      ranking.forEach(x=>{snapshot[x.digit]=x.score});
+      scoreHistory.current=[...scoreHistory.current.slice(-3),snapshot];
+    }
+    const scoreTrail=scoreHistory.current;
+    const frozenMomentum=Array.from({length:10},(_,digit)=>{
+      const trail=scoreTrail.length>=4?scoreTrail.slice(-4).map(s=>s[digit]):[];
+      const delta3=trail.length===4?trail[3]-trail[0]:null;
+      const positiveSteps=trail.length===4?trail.slice(1).filter((v,i)=>v>trail[i]).length:0;
+      return {digit,delta3,positiveSteps,trend:(delta3===null?'WARMUP':delta3>0&&positiveSteps>=2?'RISING':'FALLING_OR_FLAT') as 'RISING'|'FALLING_OR_FLAT'|'WARMUP'};
+    });
     const frozenEstimates = estimateArrivalTicks(history.current);
     pending.current = ranking.length >= 5 ? {
       ranked: ranking.slice(0, 5).map(p => ({digit: p.digit, score: p.score})),
       estimates: Array.from({length:10},(_,digit)=>frozenEstimates[digit] ?? null),
+      momentum:frozenMomentum,
     } : null;
     setReady(pending.current !== null);
   }, [currentTick, key, symbol, pipSize]);
@@ -134,7 +151,10 @@ export function NextTickCoverage({ currentTick, pipSize, symbol }: {
       ...Array.from({length:5},(_,i)=>[`rank${i+1}_digit`,`rank${i+1}_score`]).flat(),
       'actual_next_digit','matched_rank','top1_hit','top3_hit','top5_hit','result',
       'future_ticks_observed','target_first_hit_tick_1to10','top5_first_hit_tick_1to10',
-      'top1_within_10','top5_within_10','future_digits_1to10',...digitCols];
+      'top1_within_10','top5_within_10','future_digits_1to10',...digitCols,
+      'record_type','top1_momentum3','top1_positive_steps','top1_trend',
+      ...Array.from({length:10},(_,d)=>[`digit${d}_momentum3`,`digit${d}_positive_steps`,`digit${d}_trend`]).flat(),
+      'contract_id','account_id','trade_target','trade_entry_score','trade_entry_momentum3','trade_entry_positive_steps','trade_entry_trend','trade_threshold','trade_stake','trade_payout','trade_profit','verified_trade_result'];
     const rows = checks.map(c => {
       const complete = c.futureDigits?.length === 10;
       const extra = Array.from({length:10},(_,digit) => {
@@ -157,9 +177,22 @@ export function NextTickCoverage({ currentTick, pipSize, symbol }: {
         c.futureDigits ? (firstHit5(c) || '') : '',
         complete ? Number(firstHit1(c)>0) : '',
         complete ? Number(firstHit5(c)>0) : '',
-        c.futureDigits?.join(' ') ?? '',...extra];
+        c.futureDigits?.join(' ') ?? '',...extra,
+        'PREDICTION',c.momentum?.[c.predicted[0].digit]?.delta3??'',c.momentum?.[c.predicted[0].digit]?.positiveSteps??'',c.momentum?.[c.predicted[0].digit]?.trend??'LEGACY',
+        ...Array.from({length:10},(_,d)=>[c.momentum?.[d]?.delta3??'',c.momentum?.[d]?.positiveSteps??'',c.momentum?.[d]?.trend??'LEGACY']).flat(),
+        ...Array(12).fill('')];
     });
-    const csv = [header.map(escapeCsv).join(','),...rows.map(r=>r.map(escapeCsv).join(','))].join('\r\n');
+    // Add only verified Deriv trades, never infer wins from the next-tick monitor.
+    // Existing records can include real or demo accounts; account ID is exported for auditing.
+    let trades:any[]=[];
+    try{const stored=JSON.parse(localStorage.getItem(`dms-momentum-trades:v1:${symbol}`)||'[]');if(Array.isArray(stored))trades=stored;}catch{}
+    const tradeRows=trades.filter(t=>t&&t.recordType==='TRADE'&&Number.isFinite(Number(t.contractId))&&['WIN','LOSS'].includes(t.outcome)).map(t=>{
+      const row=Array(header.length).fill('');
+      const fields:Record<string,unknown>={timestamp_utc:t.timestamp,symbol:t.symbol,record_type:'TRADE',contract_id:t.contractId,account_id:t.accountId,trade_target:t.targetDigit,trade_entry_score:t.score,trade_entry_momentum3:t.momentum3,trade_entry_positive_steps:t.positiveSteps,trade_entry_trend:t.momentumRising?'RISING':'FALLING_OR_FLAT',trade_threshold:t.threshold,trade_stake:t.stake,trade_payout:t.payout,trade_profit:t.profit,verified_trade_result:t.outcome};
+      for(const [field,value] of Object.entries(fields)){const i=header.indexOf(field);if(i>=0)row[i]=value;}
+      return row;
+    });
+    const csv = [header.map(escapeCsv).join(','),...[...rows,...tradeRows].map(r=>r.map(escapeCsv).join(','))].join('\r\n');
     const blob = new Blob(['\uFEFF',csv],{type:'text/csv;charset=utf-8'});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -210,7 +243,7 @@ export function NextTickCoverage({ currentTick, pipSize, symbol }: {
         </span>
       </div>
       {latest && <p className="mt-1 text-[10px] text-slate-500">Frozen Top 5: {latest.predicted.map(p=>p.digit).join(' · ')} → next: {latest.actual}</p>}
-      <p className="mt-1 text-[10px] text-slate-500">Frozen Top-5 and all 10 urgency estimates included in CSV · observed first arrival marked within +10 ticks · {MAX_CHECKS.toLocaleString()} records retained locally.</p>
+      <p className="mt-1 text-[10px] text-slate-500">Frozen Top-5, urgency, pre-tick momentum and verified contract WIN/LOSS rows included in CSV · observed first arrival marked within +10 ticks · {MAX_CHECKS.toLocaleString()} records retained locally.</p>
     </section>
   );
 }
