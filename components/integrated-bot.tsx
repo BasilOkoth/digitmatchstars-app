@@ -6,9 +6,15 @@ import {useExecutionTarget} from './digit-stats-bar';
 import type {Tick,DerivWS} from '@deriv/core';
 
 type Mode='IDLE'|'RUNNING'|'BUYING'|'SETTLING'|'WIN'|'MAX_TRADES'|'MAX_LOSS'|'UNCERTAIN'|'STOPPED';
-type Outcome={id:number;digit:number;stake:number;payout:number;profit:number;outcome:'WIN'|'LOSS'};
+type Outcome={id:number;digit:number;stake:number;payout:number;profit:number;outcome:'WIN'|'LOSS';expiryDigit:number|null;expiryEpoch:number|null;signalEpoch:number;purchaseEpoch:number|null};
 type Strategy='DYNAMIC'|'MOMENTUM_LOCK';
-type MomentumTrade = {strategy?:Strategy;lockTick?:number;lockDuration?:number;recordType:'TRADE';contractId:number;accountId:string;symbol:string;timestamp:string;targetDigit:number;score:number;momentum3:number;positiveSteps:number;momentumRising:boolean;threshold:number;stake:number;payout:number;profit:number;outcome:'WIN'|'LOSS'};
+type MomentumTrade = {strategy?:Strategy;lockTick?:number;lockDuration?:number;signalEpoch?:number;purchaseEpoch?:number|null;expiryEpoch?:number|null;expiryDigit?:number|null;recordType:'TRADE';contractId:number;accountId:string;symbol:string;timestamp:string;targetDigit:number;score:number;momentum3:number;positiveSteps:number;momentumRising:boolean;threshold:number;stake:number;payout:number;profit:number;outcome:'WIN'|'LOSS'};
+const expiryDigitOf=(c:any,precision:number):number|null=>{
+ const displayed=c?.exit_tick_display_value;
+ if(typeof displayed==='string' && /\d/.test(displayed)){const chars=displayed.replace(/[^0-9]/g,'');return chars.length?Number(chars.slice(-1)):null}
+ const raw=Number(c?.exit_tick);
+ return Number.isFinite(raw)?getLastDigit(raw,precision):null;
+};
 const amount=(n:number)=>Math.round((n+Number.EPSILON)*100)/100;
 function tone(kind:'buy'|'win'|'loss'){
  try{const A=window.AudioContext;const ctx=new A();const osc=ctx.createOscillator();const gain=ctx.createGain();osc.type=kind==='win'?'sine':'triangle';osc.frequency.value=kind==='win'?880:kind==='buy'?650:250;gain.gain.value=.065;osc.connect(gain);gain.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+(kind==='win'?.42:.15));osc.onended=()=>{void ctx.close()}}catch{/* audio unsupported */}
@@ -24,11 +30,12 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const [mode,setMode]=useState<Mode>('IDLE');const [count,setCount]=useState(0);const [pnl,setPnl]=useState(0);const [lastOutcome,setLastOutcome]=useState<Outcome|null>(null);const [err,setErr]=useState('');const [sound,setSound]=useState(true);
  const [history,setHistory]=useState<number[]>([]);const [scores,setScores]=useState<ReturnType<typeof scoreDigits>>([]);const [lockedDigit,setLockedDigit]=useState<number|null>(null);const [lossBlock,setLossBlock]=useState(0);
  const scoreHistoryRef=useRef<Record<number,number>[]>([]);
- const outstanding=useRef(new Map<number,{digit:number;stake:number;tickEpoch:number}>());
+ const outstanding=useRef(new Map<number,{digit:number;stake:number;signalEpoch:number;purchaseEpoch:number|null;firstObservedEpoch:number|null}>());
  const reservedStake=useRef(0);
  const [outstandingCount,setOutstandingCount]=useState(0);
  const confirmedLosses=useRef(0);
  const [earlySignal,setEarlySignal]=useState('');
+ const [syncStatus,setSyncStatus]=useState('Waiting for a purchase');
  const [topMomentum,setTopMomentum]=useState<number|null>(null);
  const active=useRef(false),pending=useRef(false),halt=useRef(false),countRef=useRef(0),lossBlockRef=useRef(0),pnlRef=useRef(0),lastTickKey=useRef(''),histRef=useRef<number[]>([]),scoreRef=useRef<ReturnType<typeof scoreDigits>>([]),lockedRef=useRef<number|null>(null),scope=useRef('');
  const valid=Number.isInteger(Number(lockDuration))&&Number(lockDuration)>=1&&Number(lockDuration)<=30&&Number(base)>0&&Number(factor)>=1&&Number(factor)<=3&&Number(limit)>=1&&Number(limit)<=100&&Number(maxLoss)>0&&Number(threshold)>=0;
@@ -52,16 +59,24 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const proposalId=quote?.proposal?.id;const ask=Number(quote?.proposal?.ask_price);
    if(!proposalId||!Number.isFinite(ask)||ask<=0||ask>stake*1.05)throw new Error('Quote invalid or stale');
    if(halt.current)return;
+   // Never purchase a quote generated from a signal that has already been
+   // overtaken by a newer market tick. The next tick can qualify afresh.
+   const latestEpoch=Number(lastTickKey.current.split(':')[0]);
+   if(Number.isFinite(latestEpoch) && latestEpoch>tickEpoch)throw new Error('Signal expired before buy; skipped stale quote');
    purchaseAttempted=true;
    const buyStart=performance.now();
    const bought=await ws.send<any>({buy:String(proposalId),price:ask});
+   // Purchase acknowledgement is the earliest safe point to associate subsequent market ticks.
+   const purchaseEpoch=Number(bought?.buy?.start_time ?? bought?.buy?.purchase_time ?? bought?.buy?.transaction_time);
+   const acknowledgedEpoch=Number.isFinite(purchaseEpoch)&&purchaseEpoch>0?purchaseEpoch:null;
    setLatency({quote:quoteMs,buy:Math.round(performance.now()-buyStart),settlement:0});
    contractId=Number(bought?.buy?.contract_id);
    if(!Number.isSafeInteger(contractId)||contractId<=0)throw new Error('Purchase acknowledged without verifiable contract ID');
    countRef.current++;setCount(countRef.current);play('buy');
    // Keep the risk reserved and register the contract BEFORE releasing the buy lock.
    reservedStake.current=amount(reservedStake.current-stake+ask);
-   outstanding.current.set(contractId,{digit:predicted,stake:ask,tickEpoch});
+   outstanding.current.set(contractId,{digit:predicted,stake:ask,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch,firstObservedEpoch:null});
+   setSyncStatus(`Bought #${contractId} · target ${predicted} · signal ${tickEpoch} · ${acknowledgedEpoch===null?'purchase time unavailable':`buy ${acknowledgedEpoch}`}`);
    setOutstandingCount(outstanding.current.size);
    setMode('SETTLING');
    const id=contractId;
@@ -84,8 +99,13 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      if(!Number.isFinite(payout)||!Number.isFinite(buyPrice))throw new Error('Settlement amounts unavailable');
      setLatency(old=>old?{...old,settlement:Math.round(performance.now()-settlementStart)}:null);
      const profit=amount(payout-buyPrice);pnlRef.current=amount(pnlRef.current+profit);setPnl(pnlRef.current);
-     const win=profit>0;setLastOutcome({id,digit:predicted,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS'});play(win?'win':'loss');
-     const journalRow:MomentumTrade={strategy:entryStrategy,lockTick,lockDuration:lockWindow,recordType:'TRADE',contractId:id,accountId,symbol,timestamp:new Date().toISOString(),targetDigit:predicted,score:signal.score,momentum3:signal.momentum3,positiveSteps:signal.positiveSteps,momentumRising:signal.momentum3>0&&signal.positiveSteps>=2,threshold:signal.threshold,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS'};
+     const win=profit>0;
+     const expiryDigit=expiryDigitOf(settle,tickSettings.current.pipSize);
+     const expiryEpochRaw=Number(settle.exit_tick_time);
+     const expiryEpoch=Number.isFinite(expiryEpochRaw)&&expiryEpochRaw>0?expiryEpochRaw:null;
+     setSyncStatus(`Contract #${id}: target ${predicted} · expiry ${expiryDigit??'unknown'} · ${win?'WIN':'LOSS'} (Deriv verified)`);
+     setLastOutcome(old=>old?.outcome==='WIN'&&!win?old:{id,digit:predicted,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS',expiryDigit,expiryEpoch,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch});play(win?'win':'loss');
+     const journalRow:MomentumTrade={strategy:entryStrategy,lockTick,lockDuration:lockWindow,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch,expiryEpoch,expiryDigit,recordType:'TRADE',contractId:id,accountId,symbol,timestamp:new Date().toISOString(),targetDigit:predicted,score:signal.score,momentum3:signal.momentum3,positiveSteps:signal.positiveSteps,momentumRising:signal.momentum3>0&&signal.positiveSteps>=2,threshold:signal.threshold,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS'};
      try{const key=`dms-momentum-trades:v1:${symbol}`;const prev=JSON.parse(localStorage.getItem(key)||'[]');const rows=Array.isArray(prev)?prev:[];if(!rows.some((x:MomentumTrade)=>x.contractId===id&&x.accountId===accountId))localStorage.setItem(key,JSON.stringify([...rows.slice(-4999),journalRow]))}catch{}
      outstanding.current.delete(id);reservedStake.current=Math.max(0,amount(reservedStake.current-ask));setOutstandingCount(outstanding.current.size);
      if(win){halt.current=true;active.current=false;setTarget(null);setMode('WIN')}
@@ -122,8 +142,17 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const digit=getLastDigit(Number(tick.quote),Number.isInteger(tick.pip_size)?tick.pip_size:settings.pipSize);
    histRef.current=[...histRef.current.slice(-99),digit];
    // Early observation ONLY: a matching market tick is not a verified contract WIN.
-   const matches=[...outstanding.current.entries()].filter(([,v])=>v.digit===digit&&Number(tick.epoch)>v.tickEpoch);
-   setEarlySignal(matches.length?`Possible match · ${matches.map(([id])=>'#'+id).join(', ')}`:'');
+   const observations=[...outstanding.current.entries()].filter(([,v])=>{
+     // Only ticks received AFTER the buy acknowledgement are candidates.
+     // A tick during the network proposal/buy delay is NOT a contract result.
+     if(v.purchaseEpoch!==null && Number(tick.epoch)<=v.purchaseEpoch)return false;
+     if(Number(tick.epoch)<=v.signalEpoch)return false;
+     if(v.firstObservedEpoch!==null)return false;
+     v.firstObservedEpoch=Number(tick.epoch);return true;
+   });
+   if(observations.length){
+     setEarlySignal(observations.map(([id,v])=>`#${id}: first post-buy digit ${digit} ${digit===v.digit?'= target (provisional)':'≠ target (provisional)'}`).join(' · '));
+   }
    const ranking=scoreDigits(histRef.current);scoreRef.current=ranking;
    // Freeze all ten scores at each distinct tick. Evaluate momentum only using
    // score history that PRECEDES the current trade decision.
@@ -203,6 +232,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   </div>
   {latency&&<div className="mt-1 text-[10px] text-slate-400">Quote {latency.quote}ms · Buy {latency.buy}ms · Settlement {latency.settlement||'…'}ms</div>}
   <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-300"><span>Contract target: {strategy==='MOMENTUM_LOCK' ? lockRef.current?.digit ?? '—' : pending.current ? lockedDigit ?? '—' : '—'}</span><span>Outstanding: {outstandingCount}/2</span><span className="text-amber-300">{earlySignal}</span><span>Sample: {history.length} ticks</span></div>
+  <div className="mt-1 text-[10px] text-slate-400">Tick synchronization: {syncStatus} · Live digit matches are provisional; only Deriv's expiry tick determines a WIN.</div>
   <div className="mt-2 flex items-center gap-2">
     <button
       disabled={!active.current && (!valid||!accountId||!isConnected||pending.current||outstandingCount>0||mode==='UNCERTAIN')}
@@ -211,7 +241,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     >{active.current ? '■ STOP CYCLE' : '▶ START CYCLE'}</button>
     <button aria-label={sound?'Mute sounds':'Enable sounds'} title={sound?'Mute':'Unmute'} onClick={()=>{setSound(v=>!v);if(!sound)tone('buy')}} className="flex h-8 w-8 items-center justify-center rounded-md border border-slate-700 bg-slate-900 text-xs text-emerald-300">{sound?'🔊':'🔇'}</button>
   </div>
-  {lastOutcome&&<div className={`mt-3 rounded-lg border p-3 ${lastOutcome.outcome==='WIN'?'border-emerald-400 bg-emerald-500/20 text-emerald-300 shadow-lg shadow-emerald-950/30':'border-rose-500 bg-rose-500/10 text-rose-300'}`}><strong className="text-xl font-black tracking-wide">{lastOutcome.outcome==='WIN'?'🟢 WIN':'🔴 LOSS'} {lastOutcome.profit>=0?'+':''}${lastOutcome.profit.toFixed(2)}</strong><span className="ml-3 text-xs">Verified contract #{lastOutcome.id}</span></div>}
+  {lastOutcome&&<div className={`mt-3 rounded-lg border p-3 ${lastOutcome.outcome==='WIN'?'border-emerald-400 bg-emerald-500/20 text-emerald-300 shadow-lg shadow-emerald-950/30':'border-rose-500 bg-rose-500/10 text-rose-300'}`}><strong className="text-xl font-black tracking-wide">{lastOutcome.outcome==='WIN'?'🟢 WIN':'🔴 LOSS'} {lastOutcome.profit>=0?'+':''}${lastOutcome.profit.toFixed(2)}</strong><span className="ml-3 text-xs">Verified contract #{lastOutcome.id} · target {lastOutcome.digit} · expiry {lastOutcome.expiryDigit??'unavailable'} · signal tick {lastOutcome.signalEpoch} · buy {lastOutcome.purchaseEpoch??'unavailable'} · expiry time {lastOutcome.expiryEpoch??'unavailable'}</span></div>}
   {err&&<div role="alert" className="mt-3 rounded-lg border border-amber-500 p-2 text-xs text-amber-300">{err}{mode==='UNCERTAIN'?' — Purchase outcome requires verification in Deriv before restarting.':''}</div>}
 
  </div></section>
