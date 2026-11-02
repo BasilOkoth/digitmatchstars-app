@@ -13,6 +13,8 @@ import type { DigitStats } from '../lib/types';
 type ScoreMap = Record<number, number>;
 const ScoreContext = createContext<ScoreMap>({});
 const ArrivalContext = createContext<Record<number, number>>({});
+type MomentumReading = { change: number; rises: number; rising: boolean };
+const MomentumContext = createContext<Record<number, MomentumReading>>({});
 const ExecutionTargetContext = createContext<{ target: number | null; setTarget: (digit: number | null) => void }>({target:null,setTarget:()=>{}});
 export function useExecutionTarget() { return useContext(ExecutionTargetContext); }
 /** Uses the SAME scoreDigits routine as the automated engine; values are
@@ -22,10 +24,12 @@ export function DigitScoreProvider({children, tick, pipSize, symbol}: {
 }) {
  const [scores, setScores] = useState<ScoreMap>({});
  const [arrival, setArrival] = useState<Record<number, number>>({});
+ const [momentum, setMomentum] = useState<Record<number, MomentumReading>>({});
+ const scoreSnapshots = useRef<ScoreMap[]>([]);
  const [target, setTarget] = useState<number | null>(null);
  const history = useRef<number[]>([]);
  const lastKey = useRef('');
- useEffect(() => {history.current=[];lastKey.current='';setScores({});setArrival({});setTarget(null);},[symbol,pipSize]);
+ useEffect(() => {history.current=[];scoreSnapshots.current=[];lastKey.current='';setScores({});setMomentum({});setArrival({});setTarget(null);},[symbol,pipSize]);
  useEffect(() => {
    if (!tick || !symbol || !Number.isFinite(tick.quote)) return;
    const key = `${tick.epoch}:${tick.quote}`;
@@ -34,10 +38,26 @@ export function DigitScoreProvider({children, tick, pipSize, symbol}: {
    history.current = [...history.current.slice(-99),getLastDigit(tick.quote,pipSize)];
    const next: ScoreMap = {};
    for(const item of scoreDigits(history.current)) next[item.digit] = item.score;
+   // Same three-step definition used by IntegratedBot: positive net
+   // score movement plus at least two increases in the last three steps.
+   if (Object.keys(next).length === 10) {
+     scoreSnapshots.current = [...scoreSnapshots.current.slice(-3), next];
+   }
+   const four = scoreSnapshots.current;
+   const movements: Record<number, MomentumReading> = {};
+   if (four.length === 4) {
+     for (let digit = 0; digit < 10; digit++) {
+       const changes = [1, 2, 3].map(i => four[i][digit] - four[i-1][digit]);
+       const change = four[3][digit] - four[0][digit];
+       const rises = changes.filter(x => x > 0).length;
+       movements[digit] = {change, rises, rising: change > 0 && rises >= 2};
+     }
+   }
+   setMomentum(movements);
    setScores(next);
    setArrival(estimateArrivalTicks(history.current));
  }, [tick,symbol,pipSize]);
- return <ScoreContext.Provider value={scores}><ArrivalContext.Provider value={arrival}><ExecutionTargetContext.Provider value={{target,setTarget}}>{children}</ExecutionTargetContext.Provider></ArrivalContext.Provider></ScoreContext.Provider>;
+ return <ScoreContext.Provider value={scores}><ArrivalContext.Provider value={arrival}><MomentumContext.Provider value={momentum}><ExecutionTargetContext.Provider value={{target,setTarget}}>{children}</ExecutionTargetContext.Provider></MomentumContext.Provider></ArrivalContext.Provider></ScoreContext.Provider>;
 }
 
 interface DigitStatsBarProps {
@@ -53,6 +73,7 @@ export function DigitStatsBar({
 }: DigitStatsBarProps) {
   const scoreByDigit = useContext(ScoreContext);
   const arrivalByDigit = useContext(ArrivalContext);
+  const momentumByDigit = useContext(MomentumContext);
   const maxPct = Math.max(...digitStats.percentages);
   const minPct = Math.min(...digitStats.percentages);
   const rankedDigits = [...Array(10).keys()].sort((a,b) => {
@@ -102,6 +123,13 @@ export function DigitStatsBar({
               </span>
               <span className="text-[10px] font-semibold tabular-nums text-cyan-400" title="Relative execution score, not probability">
                 {Number.isFinite(scoreByDigit[digit]) ? `Score ${scoreByDigit[digit].toFixed(2)}` : 'Score —'}
+              </span>
+              <span className={cn('text-[11px] font-extrabold tabular-nums whitespace-nowrap',
+                momentumByDigit[digit]?.rising ? 'text-green-400' : 'text-red-400')}
+                title="3-tick V1 score change; rising requires two of three increases and positive overall change">
+                {momentumByDigit[digit]
+                  ? `${momentumByDigit[digit].rising ? '▲' : momentumByDigit[digit].change < 0 ? '▼' : '▬'} ${momentumByDigit[digit].change >= 0 ? '+' : ''}${momentumByDigit[digit].change.toFixed(2)}`
+                  : '—'}
               </span>
               <span className="text-[10px] font-semibold tabular-nums text-emerald-400/90" title="Approximate historical gap between appearances, smoothed toward 10 ticks. Not a prediction or guaranteed trade count.">
                 {Number.isFinite(arrivalByDigit[digit]) ? `Est. ~${arrivalByDigit[digit]} ticks` : 'Est. —'}
