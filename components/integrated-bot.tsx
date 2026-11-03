@@ -314,18 +314,15 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   </div>
   <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">{([['Base $',base,setBase],['Multiplier',factor,setFactor],['Max trades',limit,setLimit],['Loss limit $',maxLoss,setMaxLoss],['Min score',threshold,setThreshold],['Min momentum',minMomentum,setMinMomentum]] as const).map(([name,v,fn])=><label key={name} className="text-[11px] text-slate-300">{name}<input value={v} disabled={active.current||pending.current} type="number" min={name==='Min momentum'||name==='Min score'?'0':undefined} step={name==='Min momentum'?'0.1':'any'} onChange={e=>fn(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>)}</div>
   <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4">{[['Top digit',scores[0]?.digit??'—'],['Trade',`${count}/${limit}`],['Next stake',`$${next.toFixed(2)}`],['Cycle P/L',`${pnl>=0?'+':''}$${pnl.toFixed(2)}`]].map(([k,v])=><div key={String(k)} className="rounded-lg bg-[#0a1222] px-2 py-1.5"><div className="text-[11px] text-slate-400">{k}</div><div className={`font-extrabold ${k==='Cycle P/L' ? (pnl>0 ? 'text-green-400' : pnl<0 ? 'text-red-500' : 'text-slate-100') : 'text-slate-100'}`}>{v}</div></div>)}</div>
-  <div className="mt-1 text-[11px] font-semibold" aria-live="polite">
-    <span className={topMomentum!==null&&topMomentum>0?'text-emerald-400':'text-rose-400'}>
-      V1 momentum: {topMomentum===null?'warming up':`${topMomentum>=0?'+':''}${topMomentum.toFixed(2)} / 3 ticks`}
+  <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs" aria-live="polite">
+    <span className={topMomentum===null?'text-slate-400':topMomentum>0?'font-bold text-emerald-400':'font-bold text-rose-400'}>
+      Momentum {topMomentum===null?'warming up':`${topMomentum>=0?'+':''}${topMomentum.toFixed(2)}`}
     </span>
-    <span className="ml-2 text-slate-400">{strategy==='DYNAMIC'?'Each entry requires score threshold + rising trend.':'Initial lock requires threshold + rising trend; lock remains for selected ticks.'} Minimum momentum: {Number(minMomentum)===0?'> 0':`≥ +${minMomentum}`} (2 of 3 rises).</span>
+    <span className="text-slate-300">Target {strategy==='MOMENTUM_LOCK' ? lockRef.current?.digit ?? '—' : pending.current ? lockedDigit ?? '—' : '—'}</span>
+    <span className="text-slate-400">Open {outstandingCount}/2</span>
+    {matchPaused&&<span className="font-bold text-amber-300">Possible match · buys paused</span>}
+    {mode==='UNCERTAIN'&&<span className="font-bold text-amber-300">Settlement needs verification</span>}
   </div>
-  <div className="mt-1 text-[10px] text-cyan-300">Raw tick cadence: {cadenceLabel} · stream sequence #{tickSequence.current}</div>
-  <div className="mt-1 text-[10px] text-amber-200">Entry status: {!active.current ? `Not running (${mode})` : matchPaused ? 'Paused for possible match / Deriv confirmation' : pending.current ? 'Waiting for proposal / buy' : outstandingCount>=2 ? 'Two unsettled contracts' : scores.length===0 ? 'V1 warming up' : scores[0].score<Number(threshold) && strategy==='DYNAMIC' ? `V1 score ${scores[0].score.toFixed(2)} below ${threshold}` : strategy==='DYNAMIC' && (topMomentum===null || topMomentum<=0 || topMomentum<Number(minMomentum)) ? `Momentum ${topMomentum?.toFixed(2)??'—'} below entry threshold` : 'Monitoring tick signals (also requires 2 of 3 score increases)'}</div>
-  {latency&&<div className="mt-1 text-[10px] text-slate-400">Quote {latency.quote}ms · Buy {latency.buy}ms · Settlement {latency.settlement||'…'}ms</div>}
-  <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-300"><span>Contract target: {strategy==='MOMENTUM_LOCK' ? lockRef.current?.digit ?? '—' : pending.current ? lockedDigit ?? '—' : '—'}</span><span>Outstanding: {outstandingCount}/2</span>{matchPaused&&<span className="font-bold text-amber-300">MATCH DETECTED · BUYS PAUSED UNTIL DERIV CONFIRMS</span>}<span className="text-amber-300">{earlySignal}</span><span>Sample: {history.length} ticks</span></div>
-  <div className="mt-1 text-[10px] text-slate-400">Tick synchronization: {syncStatus} · Displayed market ticks may not be the contract expiry tick; Deriv settlement is authoritative.</div>
-  <div className="mt-1 text-[10px] text-sky-300">{streamStatus} · Pre-buy stale quotes are skipped without stopping the cycle.</div>
   <div className="mt-2 flex items-center gap-2">
     <button
       disabled={!active.current && (!valid||!accountId||!isConnected||pending.current||outstandingCount>0||mode==='UNCERTAIN')}
