@@ -26,7 +26,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const strategyRef=useRef<Strategy>('DYNAMIC');const lockDurationRef=useRef(5);
  const lockRef=useRef<{digit:number;elapsed:number;signal:{score:number;momentum3:number;positiveSteps:number;threshold:number}}|null>(null);
  const [lockPosition,setLockPosition]=useState(0);
- const [base,setBase]=useState('1');const [factor,setFactor]=useState('1.15');const [limit,setLimit]=useState('20');const [maxLoss,setMaxLoss]=useState('40');const [threshold,setThreshold]=useState('15.01');const [minMomentum,setMinMomentum]=useState('0');
+ const [base,setBase]=useState('1');const [factor,setFactor]=useState('1.15');const [limit,setLimit]=useState('20');const [maxLoss,setMaxLoss]=useState('40');const [threshold,setThreshold]=useState('6');const [minMomentum,setMinMomentum]=useState('0');
  const [mode,setMode]=useState<Mode>('IDLE');const [count,setCount]=useState(0);const [pnl,setPnl]=useState(0);const [lastOutcome,setLastOutcome]=useState<Outcome|null>(null);const [err,setErr]=useState('');const [sound,setSound]=useState(true);
  const [history,setHistory]=useState<number[]>([]);const [scores,setScores]=useState<ReturnType<typeof scoreDigits>>([]);const [lockedDigit,setLockedDigit]=useState<number|null>(null);const [lossBlock,setLossBlock]=useState(0);
  const scoreHistoryRef=useRef<Record<number,number>[]>([]);
@@ -72,14 +72,13 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const proposalId=quote?.proposal?.id;const ask=Number(quote?.proposal?.ask_price);
    if(!proposalId||!Number.isFinite(ask)||ask<=0||ask>stake*1.05)throw new Error('Quote invalid or stale');
    if(halt.current||matchPauseIds.current.size>0){reservedStake.current=Math.max(0,amount(reservedStake.current-stake));return}
-   // Tick-bound freshness: epoch alone is insufficient for 2+ ticks/second.
-   // Never submit a buy using a prediction superseded while awaiting its quote.
-   // This cannot guarantee execution on the signal tick: server-side purchase
-   // takes place after the buy request reaches Deriv.
+   // Reject quotes superseded by an actual newer tick, not by an estimated interval.
+   // This does not guarantee the trade settles on the signal tick.
    const signalAgeMs=performance.now()-signalReceivedAt;
-   const observedInterval=tickCadence.current.intervalMs;
-   const adaptiveAgeLimitMs=Math.max(300,Math.min(1800,(observedInterval??1000)*0.95));
-   if(tickSequence.current!==signalSequence || signalAgeMs>adaptiveAgeLimitMs){
+   // Cadence is diagnostic only. A tick's measured interval is NOT a quote
+   // expiration time: slow proposal responses can still belong to the most
+   // recently received tick. Reject only if a newer tick actually arrived.
+   if(tickSequence.current!==signalSequence){
     tickStats.current.staleQuotes++;
     reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
     setSyncStatus(`Skipped old signal #${signalSequence} at ${tickEpoch} (${Math.round(signalAgeMs)}ms old; stream #${tickSequence.current}). No buy.`);
@@ -306,6 +305,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     <span className="ml-2 text-slate-400">{strategy==='DYNAMIC'?'Each entry requires score threshold + rising trend.':'Initial lock requires threshold + rising trend; lock remains for selected ticks.'} Minimum momentum: {Number(minMomentum)===0?'> 0':`≥ +${minMomentum}`} (2 of 3 rises).</span>
   </div>
   <div className="mt-1 text-[10px] text-cyan-300">Raw tick cadence: {cadenceLabel} · stream sequence #{tickSequence.current}</div>
+  <div className="mt-1 text-[10px] text-amber-200">Entry status: {!active.current ? `Not running (${mode})` : matchPaused ? 'Paused for possible match / Deriv confirmation' : pending.current ? 'Waiting for proposal / buy' : outstandingCount>=2 ? 'Two unsettled contracts' : scores.length===0 ? 'V1 warming up' : scores[0].score<Number(threshold) && strategy==='DYNAMIC' ? `V1 score ${scores[0].score.toFixed(2)} below ${threshold}` : strategy==='DYNAMIC' && (topMomentum===null || topMomentum<=0 || topMomentum<Number(minMomentum)) ? `Momentum ${topMomentum?.toFixed(2)??'—'} below entry threshold` : 'Monitoring tick signals (also requires 2 of 3 score increases)'}</div>
   {latency&&<div className="mt-1 text-[10px] text-slate-400">Quote {latency.quote}ms · Buy {latency.buy}ms · Settlement {latency.settlement||'…'}ms</div>}
   <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-300"><span>Contract target: {strategy==='MOMENTUM_LOCK' ? lockRef.current?.digit ?? '—' : pending.current ? lockedDigit ?? '—' : '—'}</span><span>Outstanding: {outstandingCount}/2</span>{matchPaused&&<span className="font-bold text-amber-300">MATCH DETECTED · BUYS PAUSED UNTIL DERIV CONFIRMS</span>}<span className="text-amber-300">{earlySignal}</span><span>Sample: {history.length} ticks</span></div>
   <div className="mt-1 text-[10px] text-slate-400">Tick synchronization: {syncStatus} · Displayed market ticks may not be the contract expiry tick; Deriv settlement is authoritative.</div>
