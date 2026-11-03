@@ -38,6 +38,12 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const tickStats=useRef({received:0,outOfOrder:0,duplicates:0,staleQuotes:0});
  // A monotonic local sequence is essential: multiple market ticks may share one epoch second.
  const tickSequence=useRef(0);
+ // Enforce one submitted order per unique tick, in acknowledged purchase order.
+ const lastBuySignalSequence=useRef(0);
+ const lastBuyAcknowledgedAtSequence=useRef(0);
+ // De-duplicate delayed copies from the raw and useTicks fallback feeds.
+ const seenTickKeys=useRef(new Set<string>());
+ const seenTickOrder=useRef<string[]>([]);
  const tickCadence=useRef<{lastArrival:number|null;intervalMs:number|null}>({lastArrival:null,intervalMs:null});
  const [cadenceLabel,setCadenceLabel]=useState('Measuring tick interval');
  const [streamStatus,setStreamStatus]=useState('Tick stream warming up');
@@ -57,9 +63,11 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const soundRef=useRef(sound);useEffect(()=>{soundRef.current=sound},[sound]);
  const play=useCallback((kind:'buy'|'win'|'loss')=>{if(soundRef.current)tone(kind)},[]);
  const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;lockRef.current=null;setLockPosition(0);setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
- useEffect(()=>{if(scope.current!==scopeKey){scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];lockRef.current=null;setLockPosition(0);setTopMomentum(null);lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;pending.current=false;lastTickKey.current='';tickSequence.current=0;tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(outstanding.current.size?'UNCERTAIN':'IDLE');setLastOutcome(null);if(!outstanding.current.size)setErr('')}},[scopeKey,setTarget]);
+ useEffect(()=>{if(scope.current!==scopeKey){scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];lockRef.current=null;setLockPosition(0);setTopMomentum(null);lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;pending.current=false;lastTickKey.current='';tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(outstanding.current.size?'UNCERTAIN':'IDLE');setLastOutcome(null);if(!outstanding.current.size)setErr('')}},[scopeKey,setTarget]);
  const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number)=>{
   if(!ws||!accountId||pending.current||halt.current||matchPauseIds.current.size>0||outstanding.current.size>=2)return;
+  // Never replay ticks skipped while a previous buy was in flight.
+  if(signalSequence<=lastBuySignalSequence.current || signalSequence<=lastBuyAcknowledgedAtSequence.current)return;
   // Pending buy locks only the quote/purchase sequence. Settlement is independent.
   pending.current=true;setMode('BUYING');let contractId:number|undefined;let purchaseAttempted=false;
   // Reserve this risk immediately so a later tick cannot exceed the cycle budget.
@@ -69,13 +77,15 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // Both Demo and Real use the same one-request Deriv buy. One tick can
    // trigger at most one irreversible purchase; the WS acknowledgement is
    // never interpreted as an already-settled WIN.
-   if(tickSequence.current!==signalSequence || halt.current || matchPauseIds.current.size>0){
+   if(tickSequence.current!==signalSequence || signalSequence<=lastBuySignalSequence.current || signalSequence<=lastBuyAcknowledgedAtSequence.current || halt.current || matchPauseIds.current.size>0){
      tickStats.current.staleQuotes++;
      reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
      setMode(outstanding.current.size?'SETTLING':'RUNNING');
      return;
    }
-   // Guard this once, synchronously, before submitting an irreversible buy.
+   // Reserve this tick before an irreversible buy request.
+   // The next request must be driven by a *later tick*, not a queued signal.
+   lastBuySignalSequence.current=signalSequence;
    purchaseAttempted=true;
    const buyStart=performance.now();
    const bought=await ws.send<any>({
@@ -94,6 +104,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const acknowledgedEpoch=Number.isFinite(purchaseEpoch)&&purchaseEpoch>0?purchaseEpoch:null;
    contractId=Number(bought?.buy?.contract_id);
    if(!Number.isSafeInteger(contractId)||contractId<=0)throw new Error('Purchase acknowledged without verifiable contract ID');
+   // Only ticks processed AFTER this acknowledgement may trigger buy #2.
+   lastBuyAcknowledgedAtSequence.current=tickSequence.current;
    if(!Number.isFinite(ask)||ask<=0||ask>stake*1.05+0.001)throw new Error('Confirmed purchase price exceeds maximum; reconcile with Deriv');
    countRef.current++;setCount(countRef.current);play('buy');
    // Keep the risk reserved and register the contract BEFORE releasing the buy lock.
@@ -176,12 +188,19 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(!Number.isFinite(epoch))return;
    // Same identity across raw frames and useTicks (which may omit tick.id).
    const key=`${epoch}:${Number(tick.quote)}`;
-   if(lastTickKey.current===key){tickStats.current.duplicates++;return}
+   // A delayed duplicate tick from the other source must not be traded again.
+   if(seenTickKeys.current.has(key)){tickStats.current.duplicates++;return}
    const prevEpoch=Number(lastTickKey.current.split(':')[0]);
    if(lastTickKey.current && Number.isFinite(prevEpoch) && epoch<prevEpoch){
      tickStats.current.outOfOrder++;return;
    }
    lastTickKey.current=key;
+   seenTickKeys.current.add(key);
+   seenTickOrder.current.push(key);
+   if(seenTickOrder.current.length>256){
+     const expired=seenTickOrder.current.shift();
+     if(expired)seenTickKeys.current.delete(expired);
+   }
    const digit=getLastDigit(Number(tick.quote),Number.isInteger(tick.pip_size)?tick.pip_size:settings.pipSize);
    const receivedAt=performance.now();
    const previousArrival=tickCadence.current.lastArrival;
@@ -267,6 +286,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const signal=settings.strategy==='MOMENTUM_LOCK'?selected!.signal:{score:top.score,momentum3:momentum!,positiveSteps:rises,threshold:Number(settings.threshold)};
    const lockTick=settings.strategy==='MOMENTUM_LOCK'?selected!.elapsed:0;
    if(pending.current||matchPauseIds.current.size>0||outstanding.current.size>=2)return;
+   // One purchase per tick; after buy #1 ACK, wait for a NEW market tick.
+   if(sequence<=lastBuySignalSequence.current || sequence<=lastBuyAcknowledgedAtSequence.current)return;
    const stake=amount(Number(settings.base)*Math.pow(Number(settings.factor),confirmedLosses.current));
    if(!Number.isFinite(stake)||stake<=0||stake+reservedStake.current+Math.max(0,-pnlRef.current)>Number(settings.maxLoss)){
     stop();setMode('MAX_LOSS');return;
