@@ -165,16 +165,18 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  // Reuse the existing market subscription; do not create a duplicate tick feed.
  const tickSettings=useRef({pipSize,limit,threshold,minMomentum,base,factor,maxLoss,isConnected,accountId,symbol,strategy,lockDuration});
  tickSettings.current={pipSize,limit,threshold,minMomentum,base,factor,maxLoss,isConnected,accountId,symbol,strategy,lockDuration};
- useEffect(()=>{
-  if(!ws)return;
-  return ws.onMessage((frame:Record<string,unknown>)=>{
-   if(frame.msg_type!=='tick'||!frame.tick)return;
-   const tick=frame.tick as any;
+ // A single processing path handles both the raw WebSocket callback and the
+ // already-subscribed useTicks market feed. The market feed is a fallback when
+ // onMessage receives only an initial snapshot rather than subscription updates.
+ // Deduplication is shared, so an arrival through both paths is processed once.
+ const processMarketTick=useCallback((tick:any)=>{
    const settings=tickSettings.current;
-   if(tick.symbol!==settings.symbol||!Number.isFinite(Number(tick.quote)))return;
+   if(tick.symbol && tick.symbol!==settings.symbol)return;
+   if(!settings.symbol || !Number.isFinite(Number(tick.quote)))return;
    const epoch=Number(tick.epoch);
    if(!Number.isFinite(epoch))return;
-   const key=typeof tick.id==='string'&&tick.id ? `id:${tick.id}` : `${epoch}:${tick.quote}`;
+   // Same identity across raw frames and useTicks (which may omit tick.id).
+   const key=`${epoch}:${Number(tick.quote)}`;
    if(lastTickKey.current===key){tickStats.current.duplicates++;return}
    const prevEpoch=Number(lastTickKey.current.split(':')[0]);
    if(lastTickKey.current && Number.isFinite(prevEpoch) && epoch<prevEpoch){
@@ -273,8 +275,22 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    lockedRef.current=target;setLockedDigit(target);setTarget(target);
    // Lock purchase immediately; no React rerender or effect scheduling required.
    void execRef.current(target,stake,signal,epoch,sequence,receivedAt,settings.strategy,lockTick,settings.strategy==='MOMENTUM_LOCK'?Number(settings.lockDuration):0);
+ },[stop,setTarget]);
+
+ useEffect(()=>{
+  if(!ws)return;
+  // Existing socket listener is retained for lowest possible latency.
+  return ws.onMessage((frame:Record<string,unknown>)=>{
+   if(frame.msg_type==='tick' && frame.tick)processMarketTick(frame.tick);
   });
- },[ws,stop,setTarget]);
+ },[ws,processMarketTick]);
+
+ useEffect(()=>{
+  // useTicks has a dedicated subscription and powers the working market UI.
+  // Feed its ticks to V1 as well; shared keys prevent duplicate buys.
+  if(!isConnected || !currentTick || !symbol)return;
+  processMarketTick({...currentTick,symbol});
+ },[currentTick,symbol,isConnected,processMarketTick]);
 
  function start(){
   if(!valid||!accountId||!isConnected||!ws||pending.current||active.current||outstanding.current.size)return;
