@@ -66,36 +66,35 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   reservedStake.current+=stake;
   try{
    if(!/^[A-Za-z0-9_]{2,30}$/.test(symbol))throw new Error('No valid trading symbol selected');
-   const quoteStart=performance.now();
-   const quote=await ws.send<any>({proposal:1,amount:stake,basis:'stake',contract_type:'DIGITMATCH',currency:'USD',duration:1,duration_unit:'t',underlying_symbol:symbol,barrier:String(predicted)});
-   const quoteMs=Math.round(performance.now()-quoteStart);
-   const proposalId=quote?.proposal?.id;const ask=Number(quote?.proposal?.ask_price);
-   if(!proposalId||!Number.isFinite(ask)||ask<=0||ask>stake*1.05)throw new Error('Quote invalid or stale');
-   if(halt.current||matchPauseIds.current.size>0){reservedStake.current=Math.max(0,amount(reservedStake.current-stake));return}
-   // Reject quotes superseded by an actual newer tick, not by an estimated interval.
-   // This does not guarantee the trade settles on the signal tick.
-   const signalAgeMs=performance.now()-signalReceivedAt;
-   // Cadence is diagnostic only. A tick's measured interval is NOT a quote
-   // expiration time: slow proposal responses can still belong to the most
-   // recently received tick. Reject only if a newer tick actually arrived.
-   if(tickSequence.current!==signalSequence){
-    tickStats.current.staleQuotes++;
-    reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
-    setSyncStatus(`Skipped old signal #${signalSequence} at ${tickEpoch} (${Math.round(signalAgeMs)}ms old; stream #${tickSequence.current}). No buy.`);
-    setMode(outstanding.current.size?'SETTLING':'RUNNING');
-    return;
+   // Both Demo and Real use the same one-request Deriv buy. One tick can
+   // trigger at most one irreversible purchase; the WS acknowledgement is
+   // never interpreted as an already-settled WIN.
+   if(tickSequence.current!==signalSequence || halt.current || matchPauseIds.current.size>0){
+     tickStats.current.staleQuotes++;
+     reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
+     setMode(outstanding.current.size?'SETTLING':'RUNNING');
+     return;
    }
-   // Last synchronous guard before submitting the irreversible purchase.
-   if(halt.current||matchPauseIds.current.size>0){reservedStake.current=Math.max(0,amount(reservedStake.current-stake));return}
+   // Guard this once, synchronously, before submitting an irreversible buy.
    purchaseAttempted=true;
    const buyStart=performance.now();
-   const bought=await ws.send<any>({buy:String(proposalId),price:ask});
+   const bought=await ws.send<any>({
+     buy:'1', price:amount(stake*1.05),
+     parameters:{amount:stake,basis:'stake',contract_type:'DIGITMATCH',
+       currency:'USD',duration:1,duration_unit:'t',underlying_symbol:symbol,
+       barrier:String(predicted)},
+   });
+   const buyMs=Math.round(performance.now()-buyStart);
+   const quoteMs=0;
+   const paid=Number(bought?.buy?.buy_price);
+   const ask=Number.isFinite(paid)&&paid>0?paid:stake;
+   setLatency({quote:quoteMs,buy:buyMs,settlement:0});
    // Purchase acknowledgement is the earliest safe point to associate subsequent market ticks.
    const purchaseEpoch=Number(bought?.buy?.start_time ?? bought?.buy?.purchase_time ?? bought?.buy?.transaction_time);
    const acknowledgedEpoch=Number.isFinite(purchaseEpoch)&&purchaseEpoch>0?purchaseEpoch:null;
-   setLatency({quote:quoteMs,buy:Math.round(performance.now()-buyStart),settlement:0});
    contractId=Number(bought?.buy?.contract_id);
    if(!Number.isSafeInteger(contractId)||contractId<=0)throw new Error('Purchase acknowledged without verifiable contract ID');
+   if(!Number.isFinite(ask)||ask<=0||ask>stake*1.05+0.001)throw new Error('Confirmed purchase price exceeds maximum; reconcile with Deriv');
    countRef.current++;setCount(countRef.current);play('buy');
    // Keep the risk reserved and register the contract BEFORE releasing the buy lock.
    reservedStake.current=amount(reservedStake.current-stake+ask);
