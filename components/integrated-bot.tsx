@@ -185,21 +185,26 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // Early observation ONLY: a matching market tick is not a verified contract WIN.
    // Deriv's official expiry may be a different tick because buy acknowledgement
    // and WebSocket market updates are independent asynchronous messages.
+   // Watch EVERY subsequent observed tick while a contract remains unsettled.
+   // The previous implementation examined only the first post-buy tick and
+   // silently ignored later appearances of the locked digit.
+   // These market appearances are provisional, NEVER confirmed contract wins.
    const observations=[...outstanding.current.entries()].filter(([,v])=>{
-     // Only ticks received AFTER the buy acknowledgement are candidates.
-     // A tick during the network proposal/buy delay is NOT a contract result.
-     // Missing authoritative purchase epoch means we cannot align the live
-     // stream to the contract: do not manufacture a provisional match.
-     if(v.purchaseEpoch===null || Number(tick.epoch)<=v.purchaseEpoch)return false;
-     if(Number(tick.epoch)<=v.signalEpoch)return false;
-     if(v.firstObservedEpoch!==null)return false;
-     v.firstObservedEpoch=Number(tick.epoch);v.firstObservedDigit=digit;return true;
+     if(v.purchaseEpoch===null || epoch<=v.purchaseEpoch || epoch<=v.signalEpoch)return false;
+     if(v.firstObservedEpoch===null){v.firstObservedEpoch=epoch;v.firstObservedDigit=digit}
+     return true;
    });
    if(observations.length){
-     // Put the pause in place BEFORE evaluating V1 or scheduling this tick's buy.
-     for(const [id,v] of observations){if(digit===v.digit)matchPauseIds.current.add(id)}
-     setMatchPaused(matchPauseIds.current.size>0);
-     setEarlySignal(observations.map(([id,v])=>`#${id}: first observed browser digit ${digit} at ${v.firstObservedEpoch} ${digit===v.digit?'= target (provisional)':'≠ target (provisional)'}`).join(' · '));
+     // Synchronous hold: block a new quote/purchase BEFORE considering this tick.
+     // A match on the second, third, etc. observation now triggers the hold too.
+     const matches=observations.filter(([,v])=>digit===v.digit);
+     for(const [id] of matches)matchPauseIds.current.add(id);
+     if(matches.length){
+       setMatchPaused(true);
+       setEarlySignal(matches.map(([id,v])=>`#${id}: observed ${digit} at tick ${epoch} = target ${v.digit} (PROVISIONAL; awaiting Deriv expiry)`).join(' · '));
+     }else if(!matchPauseIds.current.size){
+       setEarlySignal(observations.map(([id,v])=>`#${id}: observed ${digit} at tick ${epoch} ≠ target ${v.digit} (not a contract result)`).join(' · '));
+     }
    }
    const ranking=scoreDigits(histRef.current);scoreRef.current=ranking;
    // Freeze all ten scores at each distinct tick. Evaluate momentum only using
