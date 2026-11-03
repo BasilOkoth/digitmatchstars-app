@@ -39,7 +39,6 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  // Hold all new purchases until every observed matching open contract settles.
  const matchHoldIds=useRef(new Set<number>());
  const [matchHoldCount,setMatchHoldCount]=useState(0);
- const [entryStatus,setEntryStatus]=useState('Waiting for signal');
  // A match can arrive while a buy request is awaiting its acknowledgement.
  // Once that purchase gets its contract ID, attach the match hold to it.
  const pendingMatchObserved=useRef(false);
@@ -73,7 +72,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const soundRef=useRef(sound);useEffect(()=>{soundRef.current=sound},[sound]);
  const play=useCallback((kind:'buy'|'win'|'loss')=>{if(soundRef.current)tone(kind)},[]);
  const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;lockRef.current=null;setLockPosition(0);setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
- useEffect(()=>{if(scope.current!==scopeKey){scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];lockRef.current=null;setLockPosition(0);setTopMomentum(null);lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;pending.current=false;lastTickKey.current='';matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(outstanding.current.size?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(!outstanding.current.size)setErr('')}},[scopeKey,setTarget]);
+ useEffect(()=>{if(scope.current!==scopeKey){scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];lockRef.current=null;setLockPosition(0);setTopMomentum(null);lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;pending.current=false;lastTickKey.current='';matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(outstanding.current.size?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(!outstanding.current.size)setErr('')}},[scopeKey,setTarget]);
  const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number)=>{
   if(!ws||!accountId||pending.current||halt.current||matchHoldIds.current.size>0||outstanding.current.size>=3)return;
   // Never replay ticks skipped while a previous buy was in flight.
@@ -176,7 +175,6 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      // this contract's match hold. Other matching unsettled contracts still hold.
      matchHoldIds.current.delete(id);
      setMatchHoldCount(matchHoldIds.current.size);
-     if(!winConfirmed.current && matchHoldIds.current.size===0)setEntryStatus('Ready for next qualifying tick');
      outstanding.current.delete(id);reservedStake.current=Math.max(0,amount(reservedStake.current-ask));setOutstandingCount(outstanding.current.size);
      if(win){winConfirmed.current=true;halt.current=true;active.current=false;setTarget(null);setMode('WIN')}
      else {
@@ -248,30 +246,17 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // Check the ACTUAL current market digit against open contract targets.
    // Freeze the next buy synchronously, before this tick can trigger trading.
    // The observed match is not a WIN; only Deriv settlement can resolve it.
-   // Compare ONLY the currently executing/locked target. Previously any old
-   // outstanding target could freeze the whole cycle even after V1 switched.
-   // When there is no live lock, a historical contract match is not a new
-   // reason to freeze a different target's signal.
-   const currentLockedTarget=settings.strategy==='MOMENTUM_LOCK'
-     ? lockRef.current?.digit ?? null
-     : lockedRef.current;
    let foundMatch=false;
-   if(currentLockedTarget!==null && digit===currentLockedTarget){
-     for(const [id,contract] of outstanding.current){
-       if(contract.digit===currentLockedTarget){
-         matchHoldIds.current.add(id);
-         foundMatch=true;
-       }
-     }
-     if(pending.current){
-       pendingMatchObserved.current=true;
-       foundMatch=true;
-     }
+   for(const [id,contract] of outstanding.current){
+     if(contract.digit===digit){matchHoldIds.current.add(id);foundMatch=true}
    }
-   if(foundMatch){
-     setMatchHoldCount(matchHoldIds.current.size || 1);
-     setEntryStatus('Matching tick seen · awaiting settlement');
+   // A purchase may already have been transmitted but not acknowledged.
+   // Its target is recorded before the irreversible buy send.
+   if(pending.current && lockedRef.current===digit){
+     pendingMatchObserved.current=true;
+     foundMatch=true;
    }
+   if(foundMatch)setMatchHoldCount(matchHoldIds.current.size || 1);
    const ranking=scoreDigits(histRef.current);scoreRef.current=ranking;
    // Freeze all ten scores at each distinct tick. Evaluate momentum only using
    // score history that PRECEDES the current trade decision.
@@ -301,39 +286,28 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      if(selected.elapsed>Number(settings.lockDuration)){selected=null;lockRef.current=null;setLockPosition(0)}
      else {lockRef.current=selected;setLockPosition(selected.elapsed)}
    }else if(settings.strategy!=='MOMENTUM_LOCK' && selected){lockRef.current=null;selected=null;setLockPosition(0)}
-   if(!active.current||halt.current||!settings.accountId||!settings.isConnected)return;
-   if(!ranking.length){setEntryStatus('V1 warming up');return}
-   if(countRef.current>=Number(settings.limit)){halt.current=true;active.current=false;setMode('MAX_TRADES');setEntryStatus('Max trades reached');return}
+   if(!active.current||halt.current||!ranking.length||!settings.accountId||!settings.isConnected)return;
+   if(countRef.current>=Number(settings.limit)){halt.current=true;active.current=false;setMode('MAX_TRADES');return}
    if(settings.strategy==='MOMENTUM_LOCK' && !selected){
-     if(top.score<Number(settings.threshold)){setEntryStatus('Waiting for V1 score');return}
-     if(!rising){setEntryStatus('Waiting for rising momentum');return}
+     if(top.score<Number(settings.threshold)||!rising)return;
      selected={digit:top.digit,elapsed:1,signal:{score:top.score,momentum3:momentum!,positiveSteps:rises,threshold:Number(settings.threshold)}};
      lockRef.current=selected;setLockPosition(1);
    }
-   if(settings.strategy==='DYNAMIC'){
-     if(top.score<Number(settings.threshold)){setEntryStatus('Waiting for V1 score');return}
-     if(!rising){setEntryStatus('Waiting for rising momentum');return}
-   }
+   if(settings.strategy==='DYNAMIC'&&(top.score<Number(settings.threshold)||!rising))return;
    const target=settings.strategy==='MOMENTUM_LOCK'?selected!.digit:top.digit;
    const signal=settings.strategy==='MOMENTUM_LOCK'?selected!.signal:{score:top.score,momentum3:momentum!,positiveSteps:rises,threshold:Number(settings.threshold)};
    const lockTick=settings.strategy==='MOMENTUM_LOCK'?selected!.elapsed:0;
    // Do not buy on the same tick where the selected locked/target digit
    // has ALREADY appeared. For an observed match on an open contract, keep
    // all new purchases paused until that contract settles authoritatively.
-   if(matchHoldIds.current.size>0 || pendingMatchObserved.current){setEntryStatus('Matching contract · awaiting settlement');return}
-   // A digit on the CURRENT tick is already in the past; do not buy on it.
-   // This is a one-tick skip, NOT a long-lived hold unless a relevant contract
-   // is actually outstanding. The next nonmatching fresh tick can buy.
-   if(digit===target){setEntryStatus('Target appeared · skip this tick');return}
-   if(pending.current){setEntryStatus('Waiting for buy acknowledgment');return}
-   if(outstanding.current.size>=3){setEntryStatus('3 contracts unsettled');return}
+   if(digit===target || matchHoldIds.current.size>0 || pendingMatchObserved.current)return;
+   if(pending.current||outstanding.current.size>=3)return;
    // One purchase per tick; after buy #1 ACK, wait for a NEW market tick.
-   if(sequence<=lastBuySignalSequence.current || sequence<=lastBuyAcknowledgedAtSequence.current){setEntryStatus('Awaiting new tick');return}
+   if(sequence<=lastBuySignalSequence.current || sequence<=lastBuyAcknowledgedAtSequence.current)return;
    const stake=amount(Number(settings.base)*Math.pow(Number(settings.factor),confirmedLosses.current));
    if(!Number.isFinite(stake)||stake<=0||stake+reservedStake.current+Math.max(0,-pnlRef.current)>Number(settings.maxLoss)){
     stop();setMode('MAX_LOSS');return;
    }
-   setEntryStatus('Sending buy');
    lockedRef.current=target;setLockedDigit(target);setTarget(target);
    // Lock purchase immediately; no React rerender or effect scheduling required.
    void execRef.current(target,stake,signal,epoch,sequence,receivedAt,settings.strategy,lockTick,settings.strategy==='MOMENTUM_LOCK'?Number(settings.lockDuration):0);
@@ -361,7 +335,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   if(!window.confirm(`Start ${acc} automatic cycle? Contract: 1-tick DigitMatch. Maximum loss: $${maxLoss}; up to ${limit} purchases. No guaranteed returns.`))return;
   // Must begin a fresh cycle. Uncertain purchases cannot be reset with this control.
   if(mode==='UNCERTAIN'||outstanding.current.size>0)return;
-  matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');countRef.current=0;pnlRef.current=0;confirmedLosses.current=0;lossBlockRef.current=0;lockedRef.current=null;lockRef.current=null;setLockPosition(0);setCount(0);setPnl(0);setLossBlock(0);setLockedDigit(null);setTarget(null);setLastOutcome(null);winConfirmed.current=false;setErr('');halt.current=false;active.current=true;setMode('RUNNING');if(sound)tone('buy');
+  matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);countRef.current=0;pnlRef.current=0;confirmedLosses.current=0;lossBlockRef.current=0;lockedRef.current=null;lockRef.current=null;setLockPosition(0);setCount(0);setPnl(0);setLossBlock(0);setLockedDigit(null);setTarget(null);setLastOutcome(null);winConfirmed.current=false;setErr('');halt.current=false;active.current=true;setMode('RUNNING');if(sound)tone('buy');
  }
  return <section className="w-full min-w-0 px-0 pb-2 text-slate-100"><div className="rounded-xl border border-cyan-500/30 bg-[#101a2e] p-2.5 shadow-lg shadow-black/30">
   <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><h2 className="font-bold text-cyan-300">⚡ DigitMatchStars Auto Engine</h2><span className={`rounded-full px-2 py-1 text-xs font-bold ${real?'bg-rose-900 text-rose-200':'bg-sky-900 text-sky-200'}`}>{real?'REAL MONEY':demo?'DEMO':'LOG IN'} · {mode}</span></div>
@@ -382,7 +356,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     </span>
     <span className="text-slate-300">Target {strategy==='MOMENTUM_LOCK' ? lockRef.current?.digit ?? '—' : pending.current ? lockedDigit ?? '—' : '—'}</span>
     <span className="text-slate-400">Open {outstandingCount}/3</span>
-    {active.current && <span className="text-slate-400">{entryStatus}</span>}
+    {matchHoldCount>0 && <span className="font-semibold text-amber-300">Match seen · waiting for settlement</span>}
 
     {mode==='UNCERTAIN'&&<span className="font-bold text-amber-300">Settlement needs verification</span>}
   </div>
