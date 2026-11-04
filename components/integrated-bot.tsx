@@ -365,7 +365,6 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  function start(){
   if(!valid||!accountId||!isConnected||!ws||pending.current||active.current||outstanding.current.size)return;
   const acc=real?'REAL MONEY':'DEMO';
-  if(real&&!window.confirm(`REAL MONEY: Automated DigitMatch on ${symbol}, with up to FOUR unsettled contracts at once. Up to ${limit} purchases, progression ${factor}×, maximum cycle loss $${maxLoss}. Confirm you accept overlapping real-money exposure.`))return;
   if(!window.confirm(`Start ${acc} automatic cycle? Contract: 1-tick DigitMatch. Maximum loss: $${maxLoss}; up to ${limit} purchases. No guaranteed returns.`))return;
   // Must begin a fresh cycle. Uncertain purchases cannot be reset with this control.
   if(mode==='UNCERTAIN'||outstanding.current.size>0)return;
