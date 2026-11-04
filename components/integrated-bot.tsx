@@ -74,7 +74,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const play=useCallback((kind:'buy'|'win'|'loss')=>{if(soundRef.current)tone(kind)},[]);
  const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;lockRef.current=null;setLockPosition(0);setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
  useEffect(()=>{if(scope.current!==scopeKey){scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];lockRef.current=null;setLockPosition(0);setTopMomentum(null);lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;pending.current=false;lastTickKey.current='';matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(outstanding.current.size?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(!outstanding.current.size)setErr('')}},[scopeKey,setTarget]);
- const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,firstLockMatch:boolean)=>{
+ const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,signalTickMatch:boolean)=>{
   if(!ws||!accountId||pending.current||halt.current||matchHoldIds.current.size>0||outstanding.current.size>=4)return;
   // Never replay ticks skipped while a previous buy was in flight.
   if(signalSequence<=lastBuySignalSequence.current || signalSequence<=lastBuyAcknowledgedAtSequence.current)return;
@@ -124,9 +124,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // Keep the risk reserved and register the contract BEFORE releasing the buy lock.
    reservedStake.current=amount(reservedStake.current-stake+ask);
    outstanding.current.set(contractId,{digit:predicted,stake:ask,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch});
-   if(pendingMatchObserved.current || firstLockMatch){
-     // First qualifying Momentum Lock match was submitted without a skip.
-     // Prevent a second purchase until this accepted contract settles.
+   if(pendingMatchObserved.current || signalTickMatch){
+     // A signal-tick match in either strategy is purchased immediately.
+     // Block further purchases until the acknowledged contract settles.
      matchHoldIds.current.add(contractId);
      setMatchHoldCount(matchHoldIds.current.size);
      // The accepted contract now owns the hold; clear the transient pending flag.
@@ -300,7 +300,6 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // The establishing tick is position 1. The next four ticks remain eligible
    // with the same digit, regardless of changes in live rankings/momentum.
    let selected=lockRef.current;
-   let justLocked=false;
    if(settings.strategy==='MOMENTUM_LOCK' && selected){
      selected={...selected,elapsed:selected.elapsed+1};
      if(selected.elapsed>Number(settings.lockDuration)){selected=null;lockRef.current=null;setLockPosition(0)}
@@ -314,7 +313,6 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      if(!rising){setEntryStatus('Waiting for rising momentum');return}
      selected={digit:top.digit,elapsed:1,signal:{score:top.score,momentum3:momentum!,positiveSteps:rises,threshold:Number(settings.threshold)}};
      lockRef.current=selected;setLockPosition(1);
-     justLocked=true;
    }
    if(settings.strategy==='DYNAMIC'){
      if(top.score<Number(settings.threshold)){setEntryStatus('Waiting for V1 score');return}
@@ -323,16 +321,18 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const target=settings.strategy==='MOMENTUM_LOCK'?selected!.digit:top.digit;
    const signal=settings.strategy==='MOMENTUM_LOCK'?selected!.signal:{score:top.score,momentum3:momentum!,positiveSteps:rises,threshold:Number(settings.threshold)};
    const lockTick=settings.strategy==='MOMENTUM_LOCK'?selected!.elapsed:0;
-   // When Momentum Lock first selects the live digit, send its first buy
-   // immediately instead of skipping the qualifying tick. This is NOT a
-   // retroactive purchase on the observed tick; Deriv controls contract entry.
-   const firstLockMatch=settings.strategy==='MOMENTUM_LOCK' && justLocked && digit===target;
-   if(matchHoldIds.current.size>0 || pendingMatchObserved.current){setEntryStatus('Matching contract · awaiting settlement');return}
-   // Once a contract is open, a matching digit must hold ALL subsequent buys.
-   if(digit===target && (!firstLockMatch || outstanding.current.size>0)){
-     setEntryStatus(outstanding.current.size>0?'Target matched · awaiting settlement':'Target appeared · awaiting next tick');
-     return;
+   // Both strategies buy immediately on a qualifying signal tick. This does
+   // not retroactively buy the observed tick; Deriv controls contract expiry.
+   const signalTickMatch=digit===target;
+   // If the live digit matches a contract already open for the active target,
+   // pause further purchases until Deriv settles that matching contract.
+   if(signalTickMatch){
+     for(const [id,contract] of outstanding.current){
+       if(contract.digit===target)matchHoldIds.current.add(id);
+     }
+     if(matchHoldIds.current.size>0)setMatchHoldCount(matchHoldIds.current.size);
    }
+   if(matchHoldIds.current.size>0 || pendingMatchObserved.current){setEntryStatus('Matching contract · awaiting settlement');return}
    if(pending.current){setEntryStatus('Waiting for buy acknowledgment');return}
    if(outstanding.current.size>=4){setEntryStatus('4 contracts unsettled');return}
    // One purchase per tick; after buy #1 ACK, wait for a NEW market tick.
@@ -341,10 +341,10 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(!Number.isFinite(stake)||stake<=0||stake+reservedStake.current+Math.max(0,-pnlRef.current)>Number(settings.maxLoss)){
     stop();setMode('MAX_LOSS');return;
    }
-   setEntryStatus(firstLockMatch?'Lock matched · sending first buy':'Sending buy');
+   setEntryStatus(signalTickMatch?'Target matched · sending buy':'Sending buy');
    lockedRef.current=target;setLockedDigit(target);setTarget(target);
    // Lock purchase immediately; no React rerender or effect scheduling required.
-   void execRef.current(target,stake,signal,epoch,sequence,receivedAt,settings.strategy,lockTick,settings.strategy==='MOMENTUM_LOCK'?Number(settings.lockDuration):0,firstLockMatch);
+   void execRef.current(target,stake,signal,epoch,sequence,receivedAt,settings.strategy,lockTick,settings.strategy==='MOMENTUM_LOCK'?Number(settings.lockDuration):0,signalTickMatch);
  },[stop,setTarget]);
 
  useEffect(()=>{
