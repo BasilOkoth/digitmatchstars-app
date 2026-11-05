@@ -277,42 +277,62 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      setEntryStatus('Matching tick seen · awaiting settlement');
    }
    const ranking=scoreDigits(histRef.current);scoreRef.current=ranking;
-   // Freeze all ten scores at each distinct tick. Evaluate momentum only using
-   // score history that PRECEDES the current trade decision.
+   // One snapshot contains scores for ALL ten digits on each observed market tick.
+   // Five consecutive snapshots establish both three-tick score momentum and
+   // whether that momentum is still accelerating. No extra scan or API call.
    if(ranking.length===10){
      const snapshot:Record<number,number>={};
      ranking.forEach(r=>{snapshot[r.digit]=r.score});
-     scoreHistoryRef.current=[...scoreHistoryRef.current.slice(-3),snapshot];
+     scoreHistoryRef.current=[...scoreHistoryRef.current.slice(-4),snapshot];
    }
    const top=ranking[0];
    const hist=scoreHistoryRef.current;
-   // Three-tick net momentum; require at least two positive steps, rather
-   // than accepting a brief rebound in an otherwise weakening score.
    const trail=top && hist.length>=4 ? hist.slice(-4).map(row=>row[top.digit]) : [];
    const momentum=trail.length===4 ? trail[3]-trail[0] : null;
    const rises=trail.length===4 ? trail.slice(1).filter((v,i)=>v>trail[i]).length : 0;
-   // The minimum momentum magnitude is user-controlled; a zero setting
-   // preserves the original strictly-positive momentum entry rule.
+   // Dynamic V1 retains its original threshold and rising-momentum criteria.
    const rising=momentum!==null && momentum>0 && momentum>=Number(settings.minMomentum) && rises>=2;
-   // Render-only state; purchase scheduling does not wait for it.
-   setHistory(histRef.current);setScores(ranking);setTopMomentum(momentum);
-   // Lock life is measured in observed market ticks, never settlement callbacks.
-   // The establishing tick is position 1. The next four ticks remain eligible
-   // with the same digit, regardless of changes in live rankings/momentum.
+   type MomentumCandidate={digit:number;score:number;momentum:number;change:number};
+   const candidates:MomentumCandidate[]=hist.length<5?[]:ranking.flatMap(row=>{
+     const values=hist.slice(-5).map(snapshot=>snapshot[row.digit]);
+     const current=values[4]-values[1];
+     const previous=values[3]-values[0];
+     const accelerating=current-previous;
+     const steady=values[4]>values[3] && values[3]>values[2] && values[2]>values[1];
+     return steady && current>0 && current>=Number(settings.minMomentum) &&
+       accelerating>0 && row.score>=Number(settings.threshold)
+       ? [{digit:row.digit,score:row.score,momentum:current,change:accelerating}] : [];
+   }).sort((a,b)=>b.change-a.change||b.momentum-a.momentum||b.score-a.score);
+   // Keep the same lock while it remains eligible; replace a weakening lock
+   // synchronously using the ALREADY-COMPUTED candidate list for this tick.
    let selected=lockRef.current;
-   if(settings.strategy==='MOMENTUM_LOCK' && selected){
-     selected={...selected,elapsed:selected.elapsed+1};
-     if(selected.elapsed>Number(settings.lockDuration)){selected=null;lockRef.current=null;setLockPosition(0)}
-     else {lockRef.current=selected;setLockPosition(selected.elapsed)}
-   }else if(settings.strategy!=='MOMENTUM_LOCK' && selected){lockRef.current=null;selected=null;setLockPosition(0)}
+   if(settings.strategy==='MOMENTUM_LOCK'){
+     const stillRising=selected ? candidates.find(c=>c.digit===selected!.digit) : undefined;
+     const canKeep=Boolean(stillRising && selected!.elapsed<Number(settings.lockDuration));
+     if(canKeep){
+       selected={digit:stillRising!.digit,elapsed:selected!.elapsed+1,
+         signal:{score:stillRising!.score,momentum3:stillRising!.momentum,
+           positiveSteps:3,threshold:Number(settings.threshold)}};
+     }else{
+       // If this digit weakens or expires, select a fresh eligible alternative
+       // on the SAME callback. If none qualifies, unlock without a forced trade.
+       const replacement=candidates.find(c=>c.digit!==selected?.digit)??candidates[0];
+       selected=replacement?{digit:replacement.digit,elapsed:1,
+         signal:{score:replacement.score,momentum3:replacement.momentum,
+           positiveSteps:3,threshold:Number(settings.threshold)}}:null;
+     }
+     lockRef.current=selected;
+     setLockPosition(selected?.elapsed??0);
+   }else if(selected){lockRef.current=null;selected=null;setLockPosition(0)}
+   // Presentation updates do not determine the lock. Executing decisions above
+   // happen synchronously on this tick; no React render is awaited.
+   setHistory(histRef.current);setScores(ranking);
+   setTopMomentum(settings.strategy==='MOMENTUM_LOCK'?selected?.signal.momentum3??null:momentum);
    if(!active.current||halt.current||!settings.accountId||!settings.isConnected)return;
    if(!ranking.length){setEntryStatus('V1 warming up');return}
    if(countRef.current>=Number(settings.limit)){halt.current=true;active.current=false;setMode('MAX_TRADES');setEntryStatus('Max trades reached');return}
    if(settings.strategy==='MOMENTUM_LOCK' && !selected){
-     if(top.score<Number(settings.threshold)){setEntryStatus('Waiting for V1 score');return}
-     if(!rising){setEntryStatus('Waiting for rising momentum');return}
-     selected={digit:top.digit,elapsed:1,signal:{score:top.score,momentum3:momentum!,positiveSteps:rises,threshold:Number(settings.threshold)}};
-     lockRef.current=selected;setLockPosition(1);
+     setEntryStatus('Waiting for steady rising momentum');return;
    }
    if(settings.strategy==='DYNAMIC'){
      if(top.score<Number(settings.threshold)){setEntryStatus('Waiting for V1 score');return}
