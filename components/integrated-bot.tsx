@@ -70,8 +70,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  // Prepared Deriv price proposals are optional; a stale/missing quote NEVER delays a direct buy.
  const proposalCache=useRef(new Map<number,{id:string;stake:number;ask:number;receivedAt:number;symbol:string}>());
  const proposalRequestInFlight=useRef(false);
+ const proposalQueuedLeader=useRef<number|null>(null);
  const proposalLastAttemptAt=useRef(0);
- const warmProposalNow=useRef<()=>void>(()=>{});
+ const warmProposalNow=useRef<(leader?:number)=>void>(()=>{});
  const [proposalStatus,setProposalStatus]=useState('Direct buy ready');
  const [syncStatus,setSyncStatus]=useState('Waiting for a purchase');
  const [topMomentum,setTopMomentum]=useState<number|null>(null);
@@ -82,7 +83,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const soundRef=useRef(sound);useEffect(()=>{soundRef.current=sound},[sound]);
  const play=useCallback((kind:'buy'|'win'|'loss')=>{if(soundRef.current)tone(kind)},[]);
  const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;lockRef.current=null;setLockPosition(0);setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
- useEffect(()=>{if(scope.current!==scopeKey){scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];lockRef.current=null;setLockPosition(0);setTopMomentum(null);lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;pending.current=false;lastTickKey.current='';primaryTickStream.current=null;primaryTickArrivedAt.current=null;lastFallbackTick.current=null;proposalCache.current.clear();proposalRequestInFlight.current=false;proposalLastAttemptAt.current=0;matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(outstanding.current.size?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(!outstanding.current.size)setErr('')}},[scopeKey,setTarget]);
+ useEffect(()=>{if(scope.current!==scopeKey){scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];lockRef.current=null;setLockPosition(0);setTopMomentum(null);lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;pending.current=false;lastTickKey.current='';primaryTickStream.current=null;primaryTickArrivedAt.current=null;lastFallbackTick.current=null;proposalCache.current.clear();proposalQueuedLeader.current=null;proposalRequestInFlight.current=false;proposalLastAttemptAt.current=0;matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(outstanding.current.size?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(!outstanding.current.size)setErr('')}},[scopeKey,setTarget]);
  const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,firstLockMatch:boolean)=>{
   if(!ws||!accountId||pending.current||halt.current||matchHoldIds.current.size>0||outstanding.current.size>=4)return;
   // Never replay ticks skipped while a previous buy was in flight.
@@ -143,9 +144,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // Keep the risk reserved and register the contract BEFORE releasing the buy lock.
    reservedStake.current=amount(reservedStake.current-stake+ask);
    outstanding.current.set(contractId,{digit:predicted,stake:ask,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch});
-   if(pendingMatchObserved.current || firstLockMatch){
-     // A qualifying signal tick matched; the resulting contract holds subsequent purchases.
-     // Prevent a second purchase until this accepted contract settles.
+   if(pendingMatchObserved.current){
+     // Only a match OBSERVED AFTER submitting the buy may create a hold.
+     // The signal tick itself happened before the contract could exist.
      matchHoldIds.current.add(contractId);
      setMatchHoldCount(matchHoldIds.current.size);
      // The accepted contract now owns the hold; clear the transient pending flag.
@@ -219,47 +220,55 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   }finally{pendingMatchObserved.current=false;pending.current=false}
  },[ws,accountId,symbol,limit,maxLoss,play,setTarget]);
  const execRef=useRef(execute);useEffect(()=>{execRef.current=execute},[execute]);
- // Warm the current V1 leader asynchronously while START is active. Never await a proposal in the tick handler.
- // Price proposals may become invalid; only a recent exact-digit/exact-stake quote may be used.
- useEffect(()=>{
-   if(!ws || !isConnected)return;
-   let disposed=false;
-   const warm=async()=>{
-     if(disposed||!active.current||halt.current||pending.current||proposalRequestInFlight.current)return;
-     const leader=strategy==='MOMENTUM_LOCK'?lockRef.current?.digit??scoreRef.current[0]?.digit:scoreRef.current[0]?.digit;
-     if(leader===undefined)return;
-     const askStake=amount(Number(base)*Math.pow(Number(factor),confirmedLosses.current));
-     if(!Number.isFinite(askStake)||askStake<=0)return;
-     const now=performance.now();
-     const cached=proposalCache.current.get(leader);
-     if(cached?.stake===askStake && cached.symbol===symbol && now-cached.receivedAt<1700)return;
-     if(now-proposalLastAttemptAt.current<900)return;
-     proposalLastAttemptAt.current=now;
-     proposalRequestInFlight.current=true;
-     try{
-       let timeout:ReturnType<typeof setTimeout>|undefined;
-       const result=await Promise.race([
-         ws.send<any>({proposal:1,amount:askStake,basis:'stake',contract_type:'DIGITMATCH',
-           currency:'USD',duration:1,duration_unit:'t',underlying_symbol:symbol,barrier:String(leader)}),
-         new Promise<never>((_,reject)=>{timeout=setTimeout(()=>reject(new Error('Proposal request timed out')),4000)}),
-       ]).finally(()=>{if(timeout)clearTimeout(timeout)});
-       if(disposed||!active.current)return;
-       const id=result?.proposal?.id;
-       const ask=Number(result?.proposal?.ask_price);
-       if(typeof id==='string' && id.length>=16 && Number.isFinite(ask) && ask>0 && ask<=askStake*1.05+0.001){
-         proposalCache.current.set(leader,{id,stake:askStake,ask,receivedAt:performance.now(),symbol});
-         setProposalStatus(`Proposal ready · digit ${leader}`);
-       }
-     }catch{
-       // A failed proposal is not a failed purchase. Direct buy remains available.
-       if(!disposed)setProposalStatus('Direct buy ready');
-     }finally{proposalRequestInFlight.current=false}
-   };
-   warmProposalNow.current=()=>{void warm()};
-   const timer=setInterval(()=>void warm(),1050);
-   void warm();
-   return()=>{disposed=true;warmProposalNow.current=()=>{};clearInterval(timer);proposalCache.current.clear()};
- },[ws,isConnected,strategy,base,factor,symbol]);
+  // Prepare the current V1 leader at market-tick cadence, not by polling every 1,050 ms.
+  // One proposal request at a time; if V1 changes during an in-flight request,
+  // remember the latest leader and warm it as soon as the request completes.
+  // A proposal is never awaited by a buy and never constitutes an order.
+  useEffect(()=>{
+    if(!ws || !isConnected)return;
+    let disposed=false;
+    const warm=async(candidate?:number)=>{
+      const leader=candidate ?? (strategy==='MOMENTUM_LOCK'?lockRef.current?.digit??scoreRef.current[0]?.digit:scoreRef.current[0]?.digit);
+      if(disposed||!active.current||halt.current||leader===undefined||!Number.isInteger(leader)||leader<0||leader>9)return;
+      if(proposalRequestInFlight.current){proposalQueuedLeader.current=leader;return}
+      const askStake=amount(Number(base)*Math.pow(Number(factor),confirmedLosses.current));
+      if(!Number.isFinite(askStake)||askStake<=0)return;
+      const now=performance.now();
+      const cached=proposalCache.current.get(leader);
+      // Avoid duplicate requests while an exact price proposal is still recent.
+      if(cached?.stake===askStake && cached.symbol===symbol && now-cached.receivedAt<1700)return;
+      // A short failure throttle protects against exceeding API request limits.
+      if(now-proposalLastAttemptAt.current<250)return;
+      proposalLastAttemptAt.current=now;
+      proposalRequestInFlight.current=true;
+      try{
+        let timeout:ReturnType<typeof setTimeout>|undefined;
+        const result=await Promise.race([
+          ws.send<any>({proposal:1,amount:askStake,basis:'stake',contract_type:'DIGITMATCH',
+            currency:'USD',duration:1,duration_unit:'t',underlying_symbol:symbol,barrier:String(leader)}),
+          new Promise<never>((_,reject)=>{timeout=setTimeout(()=>reject(new Error('Proposal request timed out')),4000)}),
+        ]).finally(()=>{if(timeout)clearTimeout(timeout)});
+        if(disposed||!active.current)return;
+        const id=result?.proposal?.id;
+        const ask=Number(result?.proposal?.ask_price);
+        if(typeof id==='string' && id.length>=16 && Number.isFinite(ask) && ask>0 && ask<=askStake*1.05+0.001){
+          proposalCache.current.set(leader,{id,stake:askStake,ask,receivedAt:performance.now(),symbol});
+          setProposalStatus(`Proposal ready · digit ${leader}`);
+        }
+      }catch{
+        // Proposal failure cannot delay buying. Existing direct-buy fallback stays active.
+        if(!disposed)setProposalStatus('Direct buy ready');
+      }finally{
+        proposalRequestInFlight.current=false;
+        const latest=proposalQueuedLeader.current;
+        proposalQueuedLeader.current=null;
+        if(!disposed && latest!==null && latest!==leader)void warm(latest);
+      }
+    };
+    warmProposalNow.current=(leader?:number)=>{void warm(leader)};
+    void warm();
+    return()=>{disposed=true;warmProposalNow.current=()=>{};proposalQueuedLeader.current=null;proposalCache.current.clear()};
+  },[ws,isConnected,strategy,base,factor,symbol]);
  // Process the live WebSocket frame synchronously, BEFORE React's render cycle.
  // Reuse the existing market subscription; do not create a duplicate tick feed.
  const tickSettings=useRef({pipSize,limit,threshold,minMomentum,base,factor,maxLoss,isConnected,accountId,symbol,strategy,lockDuration});
@@ -342,6 +351,10 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      setEntryStatus('Matching contract · awaiting settlement (market match unverified)');
    }
    const ranking=scoreDigits(histRef.current);scoreRef.current=ranking;
+    // Warm the new leader on EVERY accepted tick, even before V1 qualifies.
+    // Do not wait for React or the proposal response before evaluating a buy.
+    if(ranking.length)warmProposalNow.current(settings.strategy==='MOMENTUM_LOCK'
+      ? lockRef.current?.digit ?? ranking[0].digit : ranking[0].digit);
    // Freeze all ten scores at each distinct tick. Evaluate momentum only using
    // score history that PRECEDES the current trade decision.
    if(ranking.length===10){
@@ -438,7 +451,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   if(!window.confirm(`Start ${acc} automatic cycle? Contract: 1-tick DigitMatch. Maximum loss: $${maxLoss}; up to ${limit} purchases. No guaranteed returns.`))return;
   // Must begin a fresh cycle. Uncertain purchases cannot be reset with this control.
   if(mode==='UNCERTAIN'||outstanding.current.size>0)return;
-  matchHoldIds.current.clear();pendingMatchObserved.current=false;proposalCache.current.clear();setProposalStatus('Preparing V1 proposal');setMatchHoldCount(0);setEntryStatus('Waiting for signal');countRef.current=0;pnlRef.current=0;confirmedLosses.current=0;lossBlockRef.current=0;lockedRef.current=null;lockRef.current=null;setLockPosition(0);setCount(0);setPnl(0);setLossBlock(0);setLockedDigit(null);setTarget(null);setLastOutcome(null);winConfirmed.current=false;setErr('');halt.current=false;active.current=true;setMode('RUNNING');warmProposalNow.current();if(sound)tone('buy');
+  matchHoldIds.current.clear();pendingMatchObserved.current=false;proposalQueuedLeader.current=null;proposalCache.current.clear();setProposalStatus('Tick-synced proposal warming');setMatchHoldCount(0);setEntryStatus('Waiting for signal');countRef.current=0;pnlRef.current=0;confirmedLosses.current=0;lossBlockRef.current=0;lockedRef.current=null;lockRef.current=null;setLockPosition(0);setCount(0);setPnl(0);setLossBlock(0);setLockedDigit(null);setTarget(null);setLastOutcome(null);winConfirmed.current=false;setErr('');halt.current=false;active.current=true;setMode('RUNNING');warmProposalNow.current();if(sound)tone('buy');
  }
  return <section className="w-full min-w-0 px-0 pb-2 text-slate-100"><div className="rounded-xl border border-cyan-500/30 bg-[#101a2e] p-2.5 shadow-lg shadow-black/30">
   <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><h2 className="font-bold text-cyan-300">⚡ DigitMatchStars Auto Engine</h2><span className={`rounded-full px-2 py-1 text-xs font-bold ${real?'bg-rose-900 text-rose-200':'bg-sky-900 text-sky-200'}`}>{real?'REAL MONEY':demo?'DEMO':'LOG IN'} · {mode}</span></div>
