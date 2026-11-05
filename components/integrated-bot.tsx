@@ -88,7 +88,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   const stop=useCallback(()=>{stagedEntry.current=null;halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;lockRef.current=null;setLockPosition(0);setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
  useEffect(()=>{if(scope.current!==scopeKey){scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];stagedEntry.current=null;lockRef.current=null;setLockPosition(0);setTopMomentum(null);lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;pending.current=false;lastTickKey.current='';primaryTickStream.current=null;primaryTickArrivedAt.current=null;lastFallbackTick.current=null;proposalCache.current.clear();proposalRequestInFlight.current=false;proposalLastAttemptAt.current=0;matchHoldIds.current.clear();setMatchHoldCount(0);setEntryStatus('Waiting for signal');tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(outstanding.current.size?'UNCERTAIN':'IDLE');setLastOutcome(null);setRecentSettlements([]);winConfirmed.current=false;if(!outstanding.current.size)setErr('')}},[scopeKey,setTarget]);
  const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,firstLockMatch:boolean)=>{
-  if(!ws||!accountId||pending.current||halt.current||matchHoldIds.current.size>0||outstanding.current.size>=4)return;
+  if(!ws||!accountId||pending.current||halt.current||matchHoldIds.current.size>0||outstanding.current.size>=1)return;
   // Never replay ticks skipped while a previous buy was in flight.
   if(signalSequence<=lastBuySignalSequence.current || signalSequence<=lastBuyAcknowledgedAtSequence.current)return;
   // Pending buy locks only the quote/purchase sequence. Settlement is independent.
@@ -375,7 +375,13 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     // Signal tick N is ONLY for ranking and proposal preparation.
     // A purchase may be sent on tick N+1, but never on N itself. Do not replay
     // a missed tick later and do not buy if the target is already visible.
-    const prior=stagedEntry.current;
+    // Single-contract mode: never stage or submit a new signal while settlement is pending.
+     if(outstanding.current.size>0){
+       stagedEntry.current=null;
+       setEntryStatus('One contract open · awaiting settlement');
+       return;
+     }
+     const prior=stagedEntry.current;
     const fromPreviousTick=prior!==null && prior.signalSequence===sequence-1 &&
       prior.strategy===settings.strategy && prior.digit===target;
     // Stage the latest V1 candidate independently of whether a purchase is allowed.
@@ -392,7 +398,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     if(digit===target){setEntryStatus('Target appeared · no new purchase');return}
     if(!fromPreviousTick){setEntryStatus('V1 staged · awaiting next distinct tick');return}
     if(pending.current){setEntryStatus('Waiting for buy acknowledgment');return}
-    if(outstanding.current.size>=4){setEntryStatus('4 contracts unsettled');return}
+    if(outstanding.current.size>=1){setEntryStatus('One contract open · awaiting settlement');return}
     // Each accepted order requires a fresh post-ack market tick.
     if(sequence<=lastBuySignalSequence.current || sequence<=lastBuyAcknowledgedAtSequence.current){setEntryStatus('Awaiting new tick');return}
     const stake=amount(Number(settings.base)*Math.pow(Number(settings.factor),confirmedLosses.current));
@@ -450,7 +456,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       Momentum {topMomentum===null?'warming up':`${topMomentum>=0?'+':''}${topMomentum.toFixed(2)}`}
     </span>
     <span className="text-slate-300">Target {strategy==='MOMENTUM_LOCK' ? lockRef.current?.digit ?? '—' : pending.current ? lockedDigit ?? '—' : '—'}</span>
-    <span className="text-slate-400">Open {outstandingCount}/4</span>
+    <span className="text-slate-400">Open {outstandingCount}/1</span>
     <span className="text-slate-400">{proposalStatus}</span>
     {active.current && <span className={/awaiting (?:Deriv )?settlement/i.test(entryStatus) ? "font-semibold text-yellow-400" : "text-slate-400"}>{entryStatus}</span>}
 
