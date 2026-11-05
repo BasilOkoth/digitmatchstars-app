@@ -20,6 +20,28 @@ const spotDigit=(spot:unknown,precision:number):number|null=>{
 const expiryDigitOf=(c:any,precision:number):number|null=>
  spotDigit(c?.exit_spot??c?.exit_tick??c?.exit_tick_display_value,precision);
 const amount=(n:number)=>Math.round((n+Number.EPSILON)*100)/100;
+// Historical diagnostic: how often this digit occurred within the next H
+// observed ticks following a similar last-digit context. Windows must be
+// fully in the past. Shrink sparse samples toward the independence baseline.
+// This is a heuristic, NOT a calibrated Deriv contract-win probability.
+function historicalHorizonCoverage(history:number[],target:number,horizon:number){
+ const h=Math.max(1,Math.min(30,Math.floor(horizon)));
+ const baseline=1-Math.pow(0.9,h);
+ if(history.length<h+12)return {rate:baseline,observed:baseline,samples:0,baseline};
+ const last=history[history.length-1];
+ let hits=0,samples=0;
+ // Each record is an earlier signal tick with a FULL observed future window.
+ for(let i=0;i+h<history.length;i++){
+   if(history[i]!==last)continue;
+   samples++;
+   if(history.slice(i+1,i+h+1).includes(target))hits++;
+ }
+ // Pseudocount protects against spurious 100% hit rates on 1-2 samples.
+ const priorWeight=20;
+ return {rate:(hits+priorWeight*baseline)/(samples+priorWeight),
+         observed:samples?hits/samples:baseline,samples,baseline};
+}
+
 function tone(kind:'buy'|'win'|'loss'){
  try{const A=window.AudioContext;const ctx=new A();const osc=ctx.createOscillator();const gain=ctx.createGain();osc.type=kind==='win'?'sine':'triangle';osc.frequency.value=kind==='win'?880:kind==='buy'?650:250;gain.gain.value=.065;osc.connect(gain);gain.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+(kind==='win'?.42:.15));osc.onended=()=>{void ctx.close()}}catch{/* audio unsupported */}
 }
@@ -67,6 +89,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const [syncStatus,setSyncStatus]=useState('Waiting for a purchase');
  const [topMomentum,setTopMomentum]=useState<number|null>(null);
  const [expiryStrength,setExpiryStrength]=useState<number|null>(null);
+ const [fiveTickCoverage,setFiveTickCoverage]=useState<{rate:number;samples:number;baseline:number}|null>(null);
  const active=useRef(false),pending=useRef(false),halt=useRef(false),countRef=useRef(0),lossBlockRef=useRef(0),pnlRef=useRef(0),lastTickKey=useRef(''),histRef=useRef<number[]>([]),scoreRef=useRef<ReturnType<typeof scoreDigits>>([]),lockedRef=useRef<number|null>(null),scope=useRef('');
  const valid=Number.isInteger(Number(lockDuration))&&Number(lockDuration)>=1&&Number(lockDuration)<=30&&Number(base)>0&&Number(factor)>=1&&Number(factor)<=3&&Number(limit)>=1&&Number(limit)<=100&&Number(maxLoss)>0&&Number(threshold)>=0&&minMomentum.trim()!==''&&Number.isFinite(Number(minMomentum))&&Number(minMomentum)>=0;
  const next=amount(Number(base)*Math.pow(Number(factor),confirmedLosses.current));const scopeKey=`${accountId}:${symbol}`;
@@ -292,7 +315,10 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // Future-expiry candidate strength, NOT a calibrated win probability.
    // Momentum is a soft feature; a one-tick momentum dip does not disqualify
    // a digit with stronger transition evidence and stable V1 scores.
-   type ExpiryCandidate={digit:number;score:number;momentum:number;positiveSteps:number;strength:number;support:number};
+   type ExpiryCandidate={digit:number;score:number;momentum:number;positiveSteps:number;strength:number;support:number;horizonCoverage:{rate:number;samples:number;baseline:number}};
+   // Assess the full manually configured hold window (five ticks by default).
+   // The signal is derived only from completed, previously observed windows.
+   const horizon=settings.strategy==='MOMENTUM_LOCK'?Number(settings.lockDuration):5;
    const candidates:ExpiryCandidate[]=ranking.map(row=>{
      const values=newest.map(snapshot=>snapshot[row.digit]);
      const deltas=values.slice(1).map((value,i)=>value-values[i]);
@@ -308,8 +334,12 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      const recent=histRef.current.slice(-25);
      const recentFrequency=recent.filter(d=>d===row.digit).length/Math.max(1,recent.length);
      const frequencyStrength=50+35*Math.tanh((recentFrequency-0.1)*4);
-     const strength=0.46*scoreStrength+0.24*(transitions*100)+0.12*stabilityStrength+0.12*frequencyStrength+0.06*momentumStrength;
-     return {digit:row.digit,score:row.score,momentum,positiveSteps,strength,support:transitions};
+     const horizonCoverage=historicalHorizonCoverage(histRef.current,row.digit,horizon);
+     const originalStrength=0.46*scoreStrength+0.24*(transitions*100)+0.12*stabilityStrength+0.12*frequencyStrength+0.06*momentumStrength;
+     // Historical horizon evidence affects candidate ranking, but does not
+     // replace V1 or imply any one-tick contract hit probability.
+     const strength=0.72*originalStrength+0.28*(100*horizonCoverage.rate);
+     return {digit:row.digit,score:row.score,momentum,positiveSteps,strength,support:transitions,horizonCoverage};
    }).sort((a,b)=>b.strength-a.strength||b.score-a.score);
    // Minimum V1 score is the only mandatory candidate-quality filter. The
    // minimum momentum is advisory: lowering momentum alone must not halt all
@@ -347,6 +377,11 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      ? candidates.find(c=>c.digit===selected?.digit):best;
    setTopMomentum(chosen?.momentum??null);
    setExpiryStrength(chosen?.strength??null);
+    setFiveTickCoverage(chosen?{
+      rate:chosen.horizonCoverage.rate,
+      samples:chosen.horizonCoverage.samples,
+      baseline:chosen.horizonCoverage.baseline
+    }:null);
    if(!active.current||halt.current||!settings.accountId||!settings.isConnected)return;
    if(!ranking.length){setEntryStatus('V1 warming up');return}
    if(countRef.current>=Number(settings.limit)){halt.current=true;active.current=false;setMode('MAX_TRADES');setEntryStatus('Max trades reached');return}
@@ -426,6 +461,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     </span>
     <span className="text-slate-300">Expiry forecast {strategy==='MOMENTUM_LOCK' ? lockRef.current?.digit ?? '—' : pending.current ? lockedDigit ?? '—' : '—'}</span>
      <span className="text-cyan-300">Signal strength {expiryStrength===null?'warming up':expiryStrength.toFixed(1)+'/100'} (heuristic)</span>
+     <span className="text-sky-300">Historical {strategy==='MOMENTUM_LOCK'?lockDuration:'5'}-tick coverage {fiveTickCoverage===null?'warming up':`${(100*fiveTickCoverage.rate).toFixed(1)}% · ${fiveTickCoverage.samples} contextual samples`} (not contract win rate)</span>
     <span className="text-slate-400">Open {outstandingCount}/4</span>
     {active.current && <span className={/awaiting settlement/i.test(entryStatus) ? "font-semibold text-yellow-400" : "text-slate-400"}>{entryStatus}</span>}
 
