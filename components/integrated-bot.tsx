@@ -318,22 +318,33 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const best=qualified[0];
    let selected=lockRef.current;
    if(settings.strategy==='MOMENTUM_LOCK'){
-     const retained=selected?qualified.find(c=>c.digit===selected!.digit):undefined;
-     const expired=Boolean(selected && selected.elapsed>=Number(settings.lockDuration));
-     // Hysteresis prevents switching for tiny score fluctuations. Replace on
-     // this tick when the lock expires, becomes ineligible or falls notably
-     // behind a new candidate. Never wait for a second scan or a React render.
-     const shouldReplace=!retained || expired || (best && best.digit!==retained.digit && best.strength>retained.strength+5);
-     const choice=shouldReplace?best:retained;
-     selected=choice?{digit:choice.digit,elapsed:!shouldReplace&&selected?selected.elapsed+1:1,
-       signal:{score:choice.score,momentum3:choice.momentum,positiveSteps:choice.positiveSteps,threshold:Number(settings.threshold)}}:null;
+     // Manual fixed-tick lock: no automatic replacement due to momentum,
+     // strength, ranking or eligibility changes while a lock is active.
+     // The establishing tick counts as tick 1. At the configured lifetime
+     // release the digit and consider a DIFFERENT qualified digit on this tick.
+     if(selected && selected.elapsed>=Number(settings.lockDuration)){
+       const expiredDigit=selected.digit;
+       const replacement=qualified.find(c=>c.digit!==expiredDigit);
+       selected=replacement?{digit:replacement.digit,elapsed:1,
+         signal:{score:replacement.score,momentum3:replacement.momentum,
+                 positiveSteps:replacement.positiveSteps,threshold:Number(settings.threshold)}}:null;
+     }else if(selected){
+       // Preserve the original digit until exactly the user-set tick count.
+       selected={...selected,elapsed:selected.elapsed+1};
+     }else if(best){
+       selected={digit:best.digit,elapsed:1,
+         signal:{score:best.score,momentum3:best.momentum,
+                 positiveSteps:best.positiveSteps,threshold:Number(settings.threshold)}};
+     }
      lockRef.current=selected;
      setLockPosition(selected?.elapsed??0);
    }else if(selected){lockRef.current=null;selected=null;setLockPosition(0)}
-   // UI state is descriptive only: prediction and buy use synchronous locals.
+   // Render-only state: the tick callback chooses and buys synchronously.
    setHistory(histRef.current);setScores(ranking);
+   // A locked digit stays tradable for the full configured window even if its
+   // current score drops below threshold. Threshold is for NEW selections.
    const chosen=settings.strategy==='MOMENTUM_LOCK'
-     ? qualified.find(c=>c.digit===selected?.digit):best;
+     ? candidates.find(c=>c.digit===selected?.digit):best;
    setTopMomentum(chosen?.momentum??null);
    setExpiryStrength(chosen?.strength??null);
    if(!active.current||halt.current||!settings.accountId||!settings.isConnected)return;
@@ -404,8 +415,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
         <option value="DYNAMIC">Dynamic V1</option><option value="MOMENTUM_LOCK">Momentum Lock</option>
       </select>
     </label>
-    {strategy==='MOMENTUM_LOCK'&&<label className="flex items-center gap-2">Lock ticks <input type="number" min="1" max="30" step="1" value={lockDuration} disabled={active.current||pending.current||outstandingCount>0} onChange={e=>setLockDuration(e.target.value)} className="w-14 rounded border border-slate-600 bg-[#0b1425] px-2 py-1 text-white" /></label>}
-    {strategy==='MOMENTUM_LOCK'&&<span className="text-emerald-400">{lockRef.current?`Locked ${lockRef.current.digit} · tick ${lockPosition}/${lockDuration}`:'Waiting for candidate strength'}</span>}
+    {strategy==='MOMENTUM_LOCK'&&<label className="flex items-center gap-2">Hold ticks <input type="number" min="1" max="30" step="1" value={lockDuration} disabled={active.current||pending.current||outstandingCount>0} onChange={e=>setLockDuration(e.target.value)} className="w-14 rounded border border-slate-600 bg-[#0b1425] px-2 py-1 text-white" /></label>}
+    {strategy==='MOMENTUM_LOCK'&&<span className="text-emerald-400">{lockRef.current?`Locked ${lockRef.current.digit} · tick ${lockPosition}/${lockDuration}`:'Waiting for next qualified digit'}</span>}
   </div>
   <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">{([['Base $',base,setBase],['Multiplier',factor,setFactor],['Max trades',limit,setLimit],['Loss limit $',maxLoss,setMaxLoss],['Min score',threshold,setThreshold],['Min momentum',minMomentum,setMinMomentum]] as const).map(([name,v,fn])=><label key={name} className="text-[11px] text-slate-300">{name}<input value={v} disabled={active.current||pending.current} type="number" min={name==='Min momentum'||name==='Min score'?'0':undefined} step={name==='Min momentum'?'0.1':'any'} onChange={e=>fn(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>)}</div>
   <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4">{[['Top digit',scores[0]?.digit??'—'],['Trade',`${count}/${limit}`],['Next stake',`$${next.toFixed(2)}`],['Cycle P/L',`${pnl>=0?'+':''}$${pnl.toFixed(2)}`]].map(([k,v])=><div key={String(k)} className="rounded-lg bg-[#0a1222] px-2 py-1.5"><div className="text-[11px] text-slate-400">{k}</div><div className={`font-extrabold ${k==='Cycle P/L' ? (pnl>0 ? 'text-green-400' : pnl<0 ? 'text-red-500' : 'text-slate-100') : 'text-slate-100'}`}>{v}</div></div>)}</div>
