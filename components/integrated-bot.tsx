@@ -66,6 +66,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const confirmedLosses=useRef(0);
  const [syncStatus,setSyncStatus]=useState('Waiting for a purchase');
  const [topMomentum,setTopMomentum]=useState<number|null>(null);
+ const [expiryStrength,setExpiryStrength]=useState<number|null>(null);
  const active=useRef(false),pending=useRef(false),halt=useRef(false),countRef=useRef(0),lossBlockRef=useRef(0),pnlRef=useRef(0),lastTickKey=useRef(''),histRef=useRef<number[]>([]),scoreRef=useRef<ReturnType<typeof scoreDigits>>([]),lockedRef=useRef<number|null>(null),scope=useRef('');
  const valid=Number.isInteger(Number(lockDuration))&&Number(lockDuration)>=1&&Number(lockDuration)<=30&&Number(base)>0&&Number(factor)>=1&&Number(factor)<=3&&Number(limit)>=1&&Number(limit)<=100&&Number(maxLoss)>0&&Number(threshold)>=0&&minMomentum.trim()!==''&&Number.isFinite(Number(minMomentum))&&Number(minMomentum)>=0;
  const next=amount(Number(base)*Math.pow(Number(factor),confirmedLosses.current));const scopeKey=`${accountId}:${symbol}`;
@@ -73,7 +74,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const soundRef=useRef(sound);useEffect(()=>{soundRef.current=sound},[sound]);
  const play=useCallback((kind:'buy'|'win'|'loss')=>{if(soundRef.current)tone(kind)},[]);
  const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;lockRef.current=null;setLockPosition(0);setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
- useEffect(()=>{if(scope.current!==scopeKey){scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];lockRef.current=null;setLockPosition(0);setTopMomentum(null);lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;pending.current=false;lastTickKey.current='';matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(outstanding.current.size?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(!outstanding.current.size)setErr('')}},[scopeKey,setTarget]);
+ useEffect(()=>{if(scope.current!==scopeKey){scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];lockRef.current=null;setLockPosition(0);setTopMomentum(null);setExpiryStrength(null);lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;pending.current=false;lastTickKey.current='';matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(outstanding.current.size?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(!outstanding.current.size)setErr('')}},[scopeKey,setTarget]);
  const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,signalTickMatch:boolean)=>{
   if(!ws||!accountId||pending.current||halt.current||matchHoldIds.current.size>0||outstanding.current.size>=4)return;
   // Never replay ticks skipped while a previous buy was in flight.
@@ -287,62 +288,66 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    }
    const top=ranking[0];
    const hist=scoreHistoryRef.current;
-   const trail=top && hist.length>=4 ? hist.slice(-4).map(row=>row[top.digit]) : [];
-   const momentum=trail.length===4 ? trail[3]-trail[0] : null;
-   const rises=trail.length===4 ? trail.slice(1).filter((v,i)=>v>trail[i]).length : 0;
-   // Dynamic V1 retains its original threshold and rising-momentum criteria.
-   const rising=momentum!==null && momentum>0 && momentum>=Number(settings.minMomentum) && rises>=2;
-   type MomentumCandidate={digit:number;score:number;momentum:number;change:number};
-   const candidates:MomentumCandidate[]=hist.length<5?[]:ranking.flatMap(row=>{
-     const values=hist.slice(-5).map(snapshot=>snapshot[row.digit]);
-     const current=values[4]-values[1];
-     const previous=values[3]-values[0];
-     const accelerating=current-previous;
-     const steady=values[4]>values[3] && values[3]>values[2] && values[2]>values[1];
-     return steady && current>0 && current>=Number(settings.minMomentum) &&
-       accelerating>0 && row.score>=Number(settings.threshold)
-       ? [{digit:row.digit,score:row.score,momentum:current,change:accelerating}] : [];
-   }).sort((a,b)=>b.change-a.change||b.momentum-a.momentum||b.score-a.score);
-   // Keep the same lock while it remains eligible; replace a weakening lock
-   // synchronously using the ALREADY-COMPUTED candidate list for this tick.
+   const newest=hist.length>=5?hist.slice(-5):[];
+   // Future-expiry candidate strength, NOT a calibrated win probability.
+   // Momentum is a soft feature; a one-tick momentum dip does not disqualify
+   // a digit with stronger transition evidence and stable V1 scores.
+   type ExpiryCandidate={digit:number;score:number;momentum:number;positiveSteps:number;strength:number;support:number};
+   const candidates:ExpiryCandidate[]=ranking.map(row=>{
+     const values=newest.map(snapshot=>snapshot[row.digit]);
+     const deltas=values.slice(1).map((value,i)=>value-values[i]);
+     const momentum=values.length===5?values[4]-values[1]:0;
+     const positiveSteps=deltas.filter(x=>x>0).length;
+     const stability=deltas.length?1-Math.min(1,deltas.reduce((sum,x)=>sum+Math.abs(x),0)/Math.max(1,Math.abs(values[values.length-1]-values[0])+6)):0.5;
+     // Existing transition1/2 signals are smoothed estimates based on past
+     // digit transitions; treat them as weak signals, not future certainty.
+     const transitions=Math.max(0,Math.min(1,(row.transition1*0.55+row.transition2*0.45)/0.35));
+     const scoreStrength=50+35*Math.tanh(row.score/12);
+     const momentumStrength=50+35*Math.tanh(momentum/6);
+     const stabilityStrength=100*Math.max(0,Math.min(1,stability));
+     const recent=histRef.current.slice(-25);
+     const recentFrequency=recent.filter(d=>d===row.digit).length/Math.max(1,recent.length);
+     const frequencyStrength=50+35*Math.tanh((recentFrequency-0.1)*4);
+     const strength=0.46*scoreStrength+0.24*(transitions*100)+0.12*stabilityStrength+0.12*frequencyStrength+0.06*momentumStrength;
+     return {digit:row.digit,score:row.score,momentum,positiveSteps,strength,support:transitions};
+   }).sort((a,b)=>b.strength-a.strength||b.score-a.score);
+   // Minimum V1 score is the only mandatory candidate-quality filter. The
+   // minimum momentum is advisory: lowering momentum alone must not halt all
+   // trading when other metrics favor a digit.
+   const qualified=candidates.filter(c=>c.score>=Number(settings.threshold));
+   const best=qualified[0];
    let selected=lockRef.current;
    if(settings.strategy==='MOMENTUM_LOCK'){
-     const stillRising=selected ? candidates.find(c=>c.digit===selected!.digit) : undefined;
-     const canKeep=Boolean(stillRising && selected!.elapsed<Number(settings.lockDuration));
-     if(canKeep){
-       selected={digit:stillRising!.digit,elapsed:selected!.elapsed+1,
-         signal:{score:stillRising!.score,momentum3:stillRising!.momentum,
-           positiveSteps:3,threshold:Number(settings.threshold)}};
-     }else{
-       // If this digit weakens or expires, select a fresh eligible alternative
-       // on the SAME callback. If none qualifies, unlock without a forced trade.
-       const replacement=candidates.find(c=>c.digit!==selected?.digit)??candidates[0];
-       selected=replacement?{digit:replacement.digit,elapsed:1,
-         signal:{score:replacement.score,momentum3:replacement.momentum,
-           positiveSteps:3,threshold:Number(settings.threshold)}}:null;
-     }
+     const retained=selected?qualified.find(c=>c.digit===selected!.digit):undefined;
+     const expired=Boolean(selected && selected.elapsed>=Number(settings.lockDuration));
+     // Hysteresis prevents switching for tiny score fluctuations. Replace on
+     // this tick when the lock expires, becomes ineligible or falls notably
+     // behind a new candidate. Never wait for a second scan or a React render.
+     const shouldReplace=!retained || expired || (best && best.digit!==retained.digit && best.strength>retained.strength+5);
+     const choice=shouldReplace?best:retained;
+     selected=choice?{digit:choice.digit,elapsed:!shouldReplace&&selected?selected.elapsed+1:1,
+       signal:{score:choice.score,momentum3:choice.momentum,positiveSteps:choice.positiveSteps,threshold:Number(settings.threshold)}}:null;
      lockRef.current=selected;
      setLockPosition(selected?.elapsed??0);
    }else if(selected){lockRef.current=null;selected=null;setLockPosition(0)}
-   // Presentation updates do not determine the lock. Executing decisions above
-   // happen synchronously on this tick; no React render is awaited.
+   // UI state is descriptive only: prediction and buy use synchronous locals.
    setHistory(histRef.current);setScores(ranking);
-   setTopMomentum(settings.strategy==='MOMENTUM_LOCK'?selected?.signal.momentum3??null:momentum);
+   const chosen=settings.strategy==='MOMENTUM_LOCK'
+     ? qualified.find(c=>c.digit===selected?.digit):best;
+   setTopMomentum(chosen?.momentum??null);
+   setExpiryStrength(chosen?.strength??null);
    if(!active.current||halt.current||!settings.accountId||!settings.isConnected)return;
    if(!ranking.length){setEntryStatus('V1 warming up');return}
    if(countRef.current>=Number(settings.limit)){halt.current=true;active.current=false;setMode('MAX_TRADES');setEntryStatus('Max trades reached');return}
-   if(settings.strategy==='MOMENTUM_LOCK' && !selected){
-     setEntryStatus('Waiting for steady rising momentum');return;
+   if(!chosen || (settings.strategy==='MOMENTUM_LOCK' && !selected)){
+     setEntryStatus('Waiting for a qualifying future-expiry candidate');return;
    }
-   if(settings.strategy==='DYNAMIC'){
-     if(top.score<Number(settings.threshold)){setEntryStatus('Waiting for V1 score');return}
-     if(!rising){setEntryStatus('Waiting for rising momentum');return}
-   }
-   const target=settings.strategy==='MOMENTUM_LOCK'?selected!.digit:top.digit;
-   const signal=settings.strategy==='MOMENTUM_LOCK'?selected!.signal:{score:top.score,momentum3:momentum!,positiveSteps:rises,threshold:Number(settings.threshold)};
+   const target=chosen.digit;
+   const signal={score:chosen.score,momentum3:chosen.momentum,positiveSteps:chosen.positiveSteps,threshold:Number(settings.threshold)};
    const lockTick=settings.strategy==='MOMENTUM_LOCK'?selected!.elapsed:0;
-   // Both strategies buy immediately on a qualifying signal tick. This does
-   // not retroactively buy the observed tick; Deriv controls contract expiry.
+   // Forecast the contract's FUTURE expiry digit from the just-observed tick.
+   // Deriv determines entry and expiry after the buy; this is not a prediction
+   // of the already-observed signal digit.
    const signalTickMatch=digit===target;
    // If the live digit matches a contract already open for the active target,
    // pause further purchases until Deriv settles that matching contract.
@@ -361,7 +366,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(!Number.isFinite(stake)||stake<=0||stake+reservedStake.current+Math.max(0,-pnlRef.current)>Number(settings.maxLoss)){
     stop();setMode('MAX_LOSS');return;
    }
-   setEntryStatus(signalTickMatch?'Target matched · sending buy':'Sending buy');
+   setEntryStatus('Forecasting future expiry · sending buy');
    lockedRef.current=target;setLockedDigit(target);setTarget(target);
    // Lock purchase immediately; no React rerender or effect scheduling required.
    void execRef.current(target,stake,signal,epoch,sequence,receivedAt,settings.strategy,lockTick,settings.strategy==='MOMENTUM_LOCK'?Number(settings.lockDuration):0,signalTickMatch);
@@ -400,7 +405,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       </select>
     </label>
     {strategy==='MOMENTUM_LOCK'&&<label className="flex items-center gap-2">Lock ticks <input type="number" min="1" max="30" step="1" value={lockDuration} disabled={active.current||pending.current||outstandingCount>0} onChange={e=>setLockDuration(e.target.value)} className="w-14 rounded border border-slate-600 bg-[#0b1425] px-2 py-1 text-white" /></label>}
-    {strategy==='MOMENTUM_LOCK'&&<span className="text-emerald-400">{lockRef.current?`Locked ${lockRef.current.digit} · tick ${lockPosition}/${lockDuration}`:'Waiting for rising momentum'}</span>}
+    {strategy==='MOMENTUM_LOCK'&&<span className="text-emerald-400">{lockRef.current?`Locked ${lockRef.current.digit} · tick ${lockPosition}/${lockDuration}`:'Waiting for candidate strength'}</span>}
   </div>
   <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">{([['Base $',base,setBase],['Multiplier',factor,setFactor],['Max trades',limit,setLimit],['Loss limit $',maxLoss,setMaxLoss],['Min score',threshold,setThreshold],['Min momentum',minMomentum,setMinMomentum]] as const).map(([name,v,fn])=><label key={name} className="text-[11px] text-slate-300">{name}<input value={v} disabled={active.current||pending.current} type="number" min={name==='Min momentum'||name==='Min score'?'0':undefined} step={name==='Min momentum'?'0.1':'any'} onChange={e=>fn(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>)}</div>
   <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4">{[['Top digit',scores[0]?.digit??'—'],['Trade',`${count}/${limit}`],['Next stake',`$${next.toFixed(2)}`],['Cycle P/L',`${pnl>=0?'+':''}$${pnl.toFixed(2)}`]].map(([k,v])=><div key={String(k)} className="rounded-lg bg-[#0a1222] px-2 py-1.5"><div className="text-[11px] text-slate-400">{k}</div><div className={`font-extrabold ${k==='Cycle P/L' ? (pnl>0 ? 'text-green-400' : pnl<0 ? 'text-red-500' : 'text-slate-100') : 'text-slate-100'}`}>{v}</div></div>)}</div>
@@ -408,7 +413,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     <span className={topMomentum===null?'text-slate-400':topMomentum>0?'font-bold text-emerald-400':'font-bold text-rose-400'}>
       Momentum {topMomentum===null?'warming up':`${topMomentum>=0?'+':''}${topMomentum.toFixed(2)}`}
     </span>
-    <span className="text-slate-300">Target {strategy==='MOMENTUM_LOCK' ? lockRef.current?.digit ?? '—' : pending.current ? lockedDigit ?? '—' : '—'}</span>
+    <span className="text-slate-300">Expiry forecast {strategy==='MOMENTUM_LOCK' ? lockRef.current?.digit ?? '—' : pending.current ? lockedDigit ?? '—' : '—'}</span>
+     <span className="text-cyan-300">Signal strength {expiryStrength===null?'warming up':expiryStrength.toFixed(1)+'/100'} (heuristic)</span>
     <span className="text-slate-400">Open {outstandingCount}/4</span>
     {active.current && <span className={/awaiting settlement/i.test(entryStatus) ? "font-semibold text-yellow-400" : "text-slate-400"}>{entryStatus}</span>}
 
