@@ -332,7 +332,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const executionRanking=executionForecast?.ranked??[];
    const execTop=executionRanking[0]??null;
    if(sequence%5===0)setExecutionAudit(executionForecastRef.current.audit());
-   setHorizonTarget(execTop?.digit??null);
+   setHorizonTarget(execTop?.digit??null); // Research only; never an execution target
    setHorizonProbability(execTop?.executionProbability??null);
    const top=ranking[0];
    // Derive momentum from the SAME all-ten forecast used for prediction.
@@ -341,7 +341,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const rises=top?.positiveSteps ?? 0;
    const rising=momentum!==null && momentum>0 && momentum>=Number(settings.minMomentum) && rises>=2;
    const supported=Boolean(top && top.probability>=.10);
-   const executionSupported=Boolean(execTop && execTop.executionProbability>=.10);
+   // Execution forecasts are research-only: they must not replace the V1 target.
+   // The 10% probability baseline is descriptive, not an entry veto.
    // Freeze only a qualifying V1 signal for NEXT tick's scorecard.
    // This is independent of trade execution and stays active while the bot is stopped.
    if(top && top.score>=Number(settings.threshold) && rising && supported){
@@ -362,51 +363,49 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      lockRef.current=null;selected=null;setLockPosition(0);
    }
    // Current top and locked target can differ. Display both independently.
-   const displayTarget=settings.strategy==='MOMENTUM_LOCK' ? selected?.digit ?? null : execTop?.digit ?? null;
+   const displayTarget=settings.strategy==='MOMENTUM_LOCK' ? selected?.digit ?? top?.digit ?? null : top?.digit ?? null;
    const displayForecast=ranking.find(row=>row.digit===displayTarget);
    setTargetMomentum(displayForecast?.momentum3??null);
    setTargetProbability(displayForecast?.probability??null);
    if(!active.current||halt.current||uncertainPurchase.current||!settings.accountId||!settings.isConnected)return;
    if(!ranking.length){setEntryStatus('V1 warming up');return}
    if(countRef.current>=Number(settings.limit)){halt.current=true;active.current=false;setMode('MAX_TRADES');setEntryStatus('Max trades reached');return}
+   // V1 is authoritative for the candidate, score threshold and momentum.
+   // The execution-horizon research is kept for audit only; a lag estimate
+   // is NOT a verified expiry forecast and may not change the chosen digit.
+   if(!top){setEntryStatus('V1 warming up');return}
    if(settings.strategy==='MOMENTUM_LOCK' && !selected){
-     if(!execTop){setEntryStatus('Execution forecast warming up');return}
-     if(execTop.score<Number(settings.threshold)){setEntryStatus('Waiting for execution V1 score');return}
-     if(execTop.momentum3<=0 || execTop.momentum3<Number(settings.minMomentum) || execTop.positiveSteps<2){setEntryStatus('Waiting for execution-target momentum');return}
-     if(!executionSupported){setEntryStatus('Execution forecast below 10% baseline');return}
-     selected={digit:execTop.digit,elapsed:1,signal:{score:execTop.score,momentum3:execTop.momentum3,positiveSteps:execTop.positiveSteps,threshold:Number(settings.threshold)}};
+     if(top.score<Number(settings.threshold)){setEntryStatus('Waiting for V1 score');return}
+     if(!rising){setEntryStatus('Waiting for rising V1 momentum');return}
+     selected={digit:top.digit,elapsed:1,signal:{score:top.score,momentum3:top.momentum3,positiveSteps:top.positiveSteps,threshold:Number(settings.threshold)}};
      lockRef.current=selected;setLockPosition(1);
-     setTargetMomentum(execTop.momentum3);setTargetProbability(execTop.executionProbability);
+     setTargetMomentum(top.momentum3);setTargetProbability(top.probability);
    }
    if(settings.strategy==='DYNAMIC'){
-     if(!execTop){setEntryStatus('Execution forecast warming up');return}
-     if(execTop.score<Number(settings.threshold)){setEntryStatus('Waiting for execution V1 score');return}
-     if(execTop.momentum3<=0 || execTop.momentum3<Number(settings.minMomentum) || execTop.positiveSteps<2){setEntryStatus('Waiting for execution-target momentum');return}
-     if(!executionSupported){setEntryStatus('Execution forecast below 10% baseline');return}
+     if(top.score<Number(settings.threshold)){setEntryStatus('Waiting for V1 score');return}
+     if(!rising){setEntryStatus('Waiting for rising V1 momentum');return}
    }
-   const horizonEvidence=executionForecastRef.current.audit().horizons[(executionForecast?.horizon??2)-1];
-   if(requireEvidence && (horizonEvidence.trials<150 || horizonEvidence.lower95<=0.1)){
-     setEntryStatus(`Execution evidence gate: +${horizonEvidence.horizon} ${horizonEvidence.trials}/150; lower bound must exceed 10%`);
+   // Optional gate tests the actual V1 next-tick candidate, rather than a
+   // different, horizon-optimized digit. The contract break-even rate may be
+   // much higher than the 10% uniform random-digit baseline.
+   if(requireEvidence && (eligibleResults.current.length<150 ||
+       wilsonLower(eligibleResults.current.reduce((a,b)=>a+b,0),eligibleResults.current.length)<=0.1)){
+     setEntryStatus(`V1 evidence gate: ${eligibleResults.current.length}/150; lower bound must exceed 10%`);
      return;
    }
-   const target=settings.strategy==='MOMENTUM_LOCK'?selected!.digit:execTop!.digit;
-   // Use fresh values for the actual candidate, not historical momentum saved
-   // when the lock was created and not today's top digit if it has changed.
+   const target=settings.strategy==='MOMENTUM_LOCK'?selected!.digit:top.digit;
    const chosenForecast=ranking.find(row=>row.digit===target);
-   if(!chosenForecast){setEntryStatus('Target forecast unavailable');return}
+   if(!chosenForecast){setEntryStatus('V1 target unavailable');return}
    const ownMomentum=chosenForecast.momentum3;
    const ownRises=chosenForecast.positiveSteps;
    const ownRising=ownMomentum>0 && ownMomentum>=Number(settings.minMomentum) && ownRises>=2;
-   if(settings.strategy==='MOMENTUM_LOCK' && (
-       chosenForecast.score<Number(settings.threshold) || !ownRising)){
-     setEntryStatus(`Locked ${target} weakening · skip until its own momentum and V1 score qualify`);
+   if(settings.strategy==='MOMENTUM_LOCK' &&
+      (chosenForecast.score<Number(settings.threshold) || !ownRising)){
+     setEntryStatus(`Locked ${target} weakening · skip until its own V1 momentum and score qualify`);
      return;
    }
-   const executionTarget=executionRanking.find(row=>row.digit===target);
-   if(!executionTarget || executionTarget.executionProbability<.10){
-     setEntryStatus(`Execution target ${target} forecast ${((executionTarget?.executionProbability??0)*100).toFixed(1)}% below 10% baseline · skip`);
-     return;
-   }
+   // Deliberately do not reject V1 purely for an uncalibrated 10% probability
+   // estimate. Such thresholds are evaluated offline against actual outcomes.
    const signal={score:chosenForecast.score,momentum3:ownMomentum,positiveSteps:ownRises,threshold:Number(settings.threshold)};
    const lockTick=settings.strategy==='MOMENTUM_LOCK'?selected!.elapsed:0;
    // Never enter on a market tick whose observed last digit equals the target.
@@ -426,7 +425,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(!Number.isFinite(stake)||stake<=0||stake+reservedStake.current+Math.max(0,-pnlRef.current)>Number(settings.maxLoss)){
     stop();setMode('MAX_LOSS');return;
    }
-   setEntryStatus(`Sending execution-horizon (+${executionForecast?.horizon??1}) forecast to Deriv`);
+   setEntryStatus(`Submitting V1 target ${target} · execution timing monitored (+${executionForecast?.horizon??1} research horizon)`);
    lastSignalDispatchMs.current=receivedAt;
    lockedRef.current=target;setLockedDigit(target);setTarget(target);
    // Lock purchase immediately; no React rerender or effect scheduling required.
@@ -490,7 +489,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     {intelligenceAudit && <div className="mt-1 text-[10px] text-cyan-200">All-10 digit audit: {intelligenceAudit.topHits}/{intelligenceAudit.trials} top-1 hits ({(intelligenceAudit.topHitRate*100).toFixed(1)}%) · Brier {intelligenceAudit.brier.toFixed(3)} vs uniform {intelligenceAudit.uniformBrier.toFixed(3)} · log loss {intelligenceAudit.logLoss.toFixed(3)} · leading probability {scores.length && 'probability' in scores[0] ? ((scores[0] as any).probability*100).toFixed(1)+'%' : '—'}. Online expert weights: {Object.entries(intelligenceAudit.weights).map(([k,v])=>`${k} ${(v*100).toFixed(0)}%`).join(' · ')}.</div>}
     {executionAudit && <div className="mt-1 text-[10px] text-emerald-200">Execution-aware research (observed-tick horizons, NOT verified expiry timing): {executionAudit.horizons.map(h=>`+${h.horizon}: ${h.hits}/${h.trials} (${(h.hitRate*100).toFixed(1)}%, lower 95% ${(h.lower95*100).toFixed(1)}%)`).join(' · ')}. ACK samples {executionAudit.ackSamples} · verified contracts {executionAudit.verifiedTrades} ({executionAudit.verifiedWins} wins).</div>}
     {intelligenceAudit && <div className="mt-1 text-[10px] text-amber-200">Forward validation: momentum-qualified {intelligenceAudit.eligibleHits}/{intelligenceAudit.eligibleTrials} ({intelligenceAudit.eligibleTrials?(100*intelligenceAudit.eligibleHits/intelligenceAudit.eligibleTrials).toFixed(1):'0.0'}%; lower 95% {(100*intelligenceAudit.eligibleLower95).toFixed(1)}%). Entropy regimes: {(['LOW','MID','HIGH'] as const).map(k=>`${k} ${intelligenceAudit.regimes[k].hits}/${intelligenceAudit.regimes[k].trials} (${(100*intelligenceAudit.regimes[k].rate).toFixed(1)}%)`).join(' · ')}. Lower log loss is better; uniform baseline {intelligenceAudit.uniformLogLoss.toFixed(3)}.</div>}
-    <p className="mt-1 text-[10px] text-slate-400">Optional evidence gate: when enabled, the bot waits for 150 forward-horizon observations and a 95% lower confidence bound above 10%. This is not proof of profitability; quoted break-even may be much higher. Demo-test before any live trading.</p>
+    <p className="mt-1 text-[10px] text-slate-400">Optional evidence gate: when enabled, the bot waits for 150 eligible V1 next-tick observations and a 95% lower confidence bound above 10%. This is not proof of profitability; quoted break-even may be much higher. Demo-test before any live trading.</p>
   </div>
   <div className="mt-2 flex items-center gap-2">
     <button
