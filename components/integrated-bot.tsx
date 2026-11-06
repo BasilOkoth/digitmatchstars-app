@@ -4,7 +4,7 @@ import {getLastDigit} from '@/lib/digit-stats';
 import {scoreDigits} from '@/lib/digitmatch-score';
 import {NextTickIntelligence} from '@/lib/next-tick-intelligence';
 import {ExecutionAwareForecast} from '@/lib/execution-aware-forecast';
-import {useExecutionTarget} from './digit-stats-bar';
+import {useExecutionTarget,useEngineForecast} from './digit-stats-bar';
 import type {Tick,DerivWS} from '@deriv/core';
 
 type Mode='IDLE'|'RUNNING'|'BUYING'|'SETTLING'|'WIN'|'MAX_TRADES'|'MAX_LOSS'|'UNCERTAIN'|'STOPPED';
@@ -27,6 +27,7 @@ function tone(kind:'buy'|'win'|'loss'){
 }
 export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,pipSize,symbol}:{ws:DerivWS|null;accountId:string|null;accountType:string|null;isConnected:boolean;currentTick:Tick|null;pipSize:number;symbol:string}){
  const {setTarget} = useExecutionTarget();
+ const {publishForecast} = useEngineForecast();
  const demo=Boolean(accountId)&&(/demo|virtual/i.test(accountType??'')||/^VRT/i.test(accountId??''));const real=Boolean(accountId)&&!demo;
  const [strategy,setStrategy]=useState<Strategy>('DYNAMIC');const [lockDuration,setLockDuration]=useState('5');
  const lockRef=useRef<{digit:number;elapsed:number;signal:{score:number;momentum3:number;positiveSteps:number;threshold:number}}|null>(null);
@@ -407,6 +408,20 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      setTargetMomentum(displayForecast?.momentum3??null);
      setTargetProbability(displayForecast?.probability??null);
    });
+   // Publish precisely the ranking computed by this engine for this market tick.
+   // The callback reads the final lock state when it runs, so a newly-created
+   // Momentum Lock remains visually distinct from the top-ranked forecast.
+   // Presentation updates never delay or initiate a buy.
+   queueMicrotask(()=>{
+     if(scope.current!==telemetryScope)return;
+     publishForecast({
+       symbol:settings.symbol,
+       sequence,
+       rows:ranking.map(row=>({digit:row.digit,score:row.score,
+         probability:row.probability,momentum3:row.momentum3,positiveSteps:row.positiveSteps})),
+       lockedDigit:settings.strategy==='MOMENTUM_LOCK' ? lockRef.current?.digit??null : null,
+     });
+   });
    if(!active.current||halt.current||uncertainPurchase.current||!settings.accountId||!settings.isConnected)return;
    if(!ranking.length){setEntryStatus('V1 warming up');return}
    if(countRef.current>=Number(settings.limit)){halt.current=true;active.current=false;setMode('MAX_TRADES');setEntryStatus('Max trades reached');return}
@@ -475,7 +490,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      setLockedDigit(target);setTarget(target);
      if(pending.current)setEntryStatus(`V1 target ${target} dispatched; awaiting acknowledgment`);
    });
- },[stop,setTarget,requireEvidence]);
+ },[stop,setTarget,requireEvidence,publishForecast]);
 
  useEffect(()=>{
   if(!ws)return;

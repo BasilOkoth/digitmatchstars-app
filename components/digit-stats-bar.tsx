@@ -13,6 +13,19 @@ import type { DigitStats } from '../lib/types';
 type ScoreMap = Record<number, number>;
 const ScoreContext = createContext<ScoreMap>({});
 const ArrivalContext = createContext<Record<number, number>>({});
+// This is the engine's authoritative, already-ranked frozen snapshot.
+// No second NextTickIntelligence instance is created in the prediction table.
+export type EngineForecastSnapshot = {
+  symbol: string;
+  sequence: number;
+  rows: Array<{digit:number;score:number;probability:number;momentum3:number;positiveSteps:number}>;
+  lockedDigit: number | null;
+};
+const EngineForecastContext = createContext<{
+  forecast: EngineForecastSnapshot | null;
+  publishForecast: (snapshot: EngineForecastSnapshot) => void;
+}>({forecast:null,publishForecast:()=>{}});
+export function useEngineForecast() { return useContext(EngineForecastContext); }
 type MomentumReading = { change: number; rises: number; rising: boolean };
 const MomentumContext = createContext<Record<number, MomentumReading>>({});
 const ExecutionTargetContext = createContext<{ target: number | null; setTarget: (digit: number | null) => void }>({target:null,setTarget:()=>{}});
@@ -23,13 +36,14 @@ export function DigitScoreProvider({children, tick, pipSize, symbol}: {
  children: React.ReactNode; tick: Tick | null; pipSize: number; symbol: string;
 }) {
  const [scores, setScores] = useState<ScoreMap>({});
+ const [engineForecast, setEngineForecast] = useState<EngineForecastSnapshot | null>(null);
  const [arrival, setArrival] = useState<Record<number, number>>({});
  const [momentum, setMomentum] = useState<Record<number, MomentumReading>>({});
  const scoreSnapshots = useRef<ScoreMap[]>([]);
  const [target, setTarget] = useState<number | null>(null);
  const history = useRef<number[]>([]);
  const lastKey = useRef('');
- useEffect(() => {history.current=[];scoreSnapshots.current=[];lastKey.current='';setScores({});setMomentum({});setArrival({});setTarget(null);},[symbol,pipSize]);
+ useEffect(() => {history.current=[];scoreSnapshots.current=[];lastKey.current='';setScores({});setMomentum({});setArrival({});setTarget(null);setEngineForecast(null);},[symbol,pipSize]);
  useEffect(() => {
    if (!tick || !symbol || !Number.isFinite(tick.quote)) return;
    const key = `${tick.epoch}:${tick.quote}`;
@@ -57,7 +71,7 @@ export function DigitScoreProvider({children, tick, pipSize, symbol}: {
    setScores(next);
    setArrival(estimateArrivalTicks(history.current));
  }, [tick,symbol,pipSize]);
- return <ScoreContext.Provider value={scores}><ArrivalContext.Provider value={arrival}><MomentumContext.Provider value={momentum}><ExecutionTargetContext.Provider value={{target,setTarget}}>{children}</ExecutionTargetContext.Provider></MomentumContext.Provider></ArrivalContext.Provider></ScoreContext.Provider>;
+ return <EngineForecastContext.Provider value={{forecast:engineForecast?.symbol===symbol?engineForecast:null,publishForecast:setEngineForecast}}><ScoreContext.Provider value={scores}><ArrivalContext.Provider value={arrival}><MomentumContext.Provider value={momentum}><ExecutionTargetContext.Provider value={{target,setTarget}}>{children}</ExecutionTargetContext.Provider></MomentumContext.Provider></ArrivalContext.Provider></ScoreContext.Provider></EngineForecastContext.Provider>;
 }
 
 interface DigitStatsBarProps {
@@ -72,17 +86,21 @@ export function DigitStatsBar({
   onDigitSelect,
 }: DigitStatsBarProps) {
   const scoreByDigit = useContext(ScoreContext);
+  const {forecast} = useEngineForecast();
+  const engineRows = forecast?.rows.length === 10 ? forecast.rows : null;
+  const engineByDigit = engineRows ? new Map(engineRows.map(row => [row.digit, row])) : null;
   const arrivalByDigit = useContext(ArrivalContext);
   const momentumByDigit = useContext(MomentumContext);
   const maxPct = Math.max(...digitStats.percentages);
   const minPct = Math.min(...digitStats.percentages);
-  const rankedDigits = [...Array(10).keys()].sort((a,b) => {
+  const fallbackDigits = [...Array(10).keys()].sort((a,b) => {
     const aScore=scoreByDigit[a], bScore=scoreByDigit[b];
     if (Number.isFinite(aScore) && Number.isFinite(bScore)) return bScore-aScore || a-b;
     if (Number.isFinite(aScore)) return -1;
     if (Number.isFinite(bScore)) return 1;
     return a-b;
   });
+  const rankedDigits = engineRows ? engineRows.map(row => row.digit) : fallbackDigits;
 
   return (
     <div className="h-full flex flex-col min-h-0">
@@ -93,8 +111,13 @@ export function DigitStatsBar({
         <div className="grid grid-cols-5 gap-1.5 sm:gap-3 place-items-center w-full">
         {rankedDigits.map((digit) => {
           const pct = digitStats.percentages[digit] ?? 0;
+          const engineRow = engineByDigit?.get(digit);
+          const shownScore = engineRow?.score ?? scoreByDigit[digit];
+          const shownMovement = engineRow
+            ? {change:engineRow.momentum3,rises:engineRow.positiveSteps,rising:engineRow.momentum3>0&&engineRow.positiveSteps>=2}
+            : momentumByDigit[digit];
           // Green always shows the current highest V1 score. An in-flight contract may target a prior digit.
-          const isSelected = digit === (Number.isFinite(scoreByDigit[rankedDigits[0]]) ? rankedDigits[0] : null);
+          const isSelected = digit === (engineRows ? rankedDigits[0] : Number.isFinite(scoreByDigit[rankedDigits[0]]) ? rankedDigits[0] : null);
           const isHighest = digitStats.totalTicks > 0 && pct === maxPct;
           const isLowest = digitStats.totalTicks > 0 && pct === minPct;
 
@@ -121,14 +144,18 @@ export function DigitStatsBar({
               >
                 {pct.toFixed(1)}%
               </span>
-              <span className="text-[10px] font-semibold tabular-nums text-cyan-400" title="Relative execution score, not probability">
-                {Number.isFinite(scoreByDigit[digit]) ? `Score ${scoreByDigit[digit].toFixed(2)}` : 'Score —'}
+              <span className="text-[10px] font-semibold tabular-nums text-cyan-400" title="Same V1 score used by engine; relative score, not a probability">
+                {Number.isFinite(shownScore) ? `Score ${shownScore.toFixed(2)}` : 'Score —'}
               </span>
+              {engineRow && <span className="text-[10px] font-semibold tabular-nums text-sky-300" title="Online combined next-tick forecast probability, not an established trading edge">
+                {(engineRow.probability*100).toFixed(2)}% forecast
+              </span>}
+              {forecast?.lockedDigit === digit && <span className="text-[10px] font-bold text-amber-300" title="Momentum-locked trade target can differ from top-ranked digit">🔒 Trade lock</span>}
               <span className={cn('text-[11px] font-extrabold tabular-nums whitespace-nowrap',
-                momentumByDigit[digit]?.rising ? 'text-green-400' : 'text-red-400')}
+                shownMovement?.rising ? 'text-green-400' : 'text-red-400')}
                 title="3-tick V1 score change; rising requires two of three increases and positive overall change">
-                {momentumByDigit[digit]
-                  ? `${momentumByDigit[digit].rising ? '▲' : momentumByDigit[digit].change < 0 ? '▼' : '▬'} ${momentumByDigit[digit].change >= 0 ? '+' : ''}${momentumByDigit[digit].change.toFixed(2)}`
+                {shownMovement
+                  ? `${shownMovement.rising ? '▲' : shownMovement.change < 0 ? '▼' : '▬'} ${shownMovement.change >= 0 ? '+' : ''}${shownMovement.change.toFixed(2)}`
                   : '—'}
               </span>
               <span className="text-[10px] font-semibold tabular-nums text-emerald-400/90" title="Approximate historical gap between appearances, smoothed toward 10 ticks. Not a prediction or guaranteed trade count.">
