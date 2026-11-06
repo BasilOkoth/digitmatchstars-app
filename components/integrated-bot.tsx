@@ -2,6 +2,7 @@
 import {useCallback,useEffect,useRef,useState} from 'react';
 import {getLastDigit} from '@/lib/digit-stats';
 import {scoreDigits} from '@/lib/digitmatch-score';
+import {NextTickIntelligence} from '@/lib/next-tick-intelligence';
 import {useExecutionTarget} from './digit-stats-bar';
 import type {Tick,DerivWS} from '@deriv/core';
 
@@ -33,6 +34,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const [mode,setMode]=useState<Mode>('IDLE');const [count,setCount]=useState(0);const [pnl,setPnl]=useState(0);const [lastOutcome,setLastOutcome]=useState<Outcome|null>(null);const [err,setErr]=useState('');const [sound,setSound]=useState(true);
  const [history,setHistory]=useState<number[]>([]);const [scores,setScores]=useState<ReturnType<typeof scoreDigits>>([]);const [lockedDigit,setLockedDigit]=useState<number|null>(null);const [lossBlock,setLossBlock]=useState(0);
  const scoreHistoryRef=useRef<Record<number,number>[]>([]);
+ const intelligenceRef=useRef(new NextTickIntelligence());
+ const [intelligenceAudit,setIntelligenceAudit]=useState<ReturnType<NextTickIntelligence['getAudit']>|null>(null);
  const outstanding=useRef(new Map<number,{digit:number;stake:number;signalEpoch:number;purchaseEpoch:number|null;}>());
  const reservedStake=useRef(0);
  // A request that may have reached Deriv must block subsequent orders until reconciled.
@@ -90,7 +93,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const soundRef=useRef(sound);useEffect(()=>{soundRef.current=sound},[sound]);
  const play=useCallback((kind:'buy'|'win'|'loss')=>{if(soundRef.current)tone(kind)},[]);
  const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;lockRef.current=null;setLockPosition(0);setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
- useEffect(()=>{if(scope.current!==scopeKey){const unsettled=outstanding.current.size>0||pending.current||uncertainPurchase.current;scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];nextTickPending.current=null;eligibleResults.current=[];setAccuracyAudit({trials:0,hits:0,lower95:0});confirmedLosses.current=0;lockRef.current=null;setLockPosition(0);setTopMomentum(null);lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;if(!unsettled){pending.current=false;reservedStake.current=0;uncertainPurchase.current=false;}lastTickKey.current='';if(!unsettled)matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(unsettled?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(unsettled)setErr('Account/symbol changed with a pending or unsettled order. Reconcile on Deriv before restarting.');else setErr('')}},[scopeKey,setTarget]);
+ useEffect(()=>{if(scope.current!==scopeKey){const unsettled=outstanding.current.size>0||pending.current||uncertainPurchase.current;scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];intelligenceRef.current.reset();setIntelligenceAudit(null);nextTickPending.current=null;eligibleResults.current=[];setAccuracyAudit({trials:0,hits:0,lower95:0});confirmedLosses.current=0;lockRef.current=null;setLockPosition(0);setTopMomentum(null);lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;if(!unsettled){pending.current=false;reservedStake.current=0;uncertainPurchase.current=false;}lastTickKey.current='';if(!unsettled)matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(unsettled?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(unsettled)setErr('Account/symbol changed with a pending or unsettled order. Reconcile on Deriv before restarting.');else setErr('')}},[scopeKey,setTarget]);
  const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,firstLockMatch:boolean)=>{
   if(!ws||!accountId||pending.current||halt.current||uncertainPurchase.current||matchHoldIds.current.size>0||outstanding.current.size>0)return;
   // Never replay ticks skipped while a previous buy was in flight.
@@ -307,7 +310,10 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      setMatchHoldCount(matchHoldIds.current.size || 1);
      setEntryStatus('Matching tick seen · awaiting settlement');
    }
-   const ranking=scoreDigits(histRef.current);scoreRef.current=ranking;
+   // Causal all-ten-digit evaluation: grade the prior frozen forecast, then
+   // produce the next forecast from history that ends at this observed tick.
+   const ranking=intelligenceRef.current.observe(digit);scoreRef.current=ranking;
+   if(sequence%5===0)setIntelligenceAudit(intelligenceRef.current.getAudit());
    // Freeze all ten scores at each distinct tick. Evaluate momentum only using
    // score history that PRECEDES the current trade decision.
    if(ranking.length===10){
@@ -325,9 +331,12 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // The minimum momentum magnitude is user-controlled; a zero setting
    // preserves the original strictly-positive momentum entry rule.
    const rising=momentum!==null && momentum>0 && momentum>=Number(settings.minMomentum) && rises>=2;
+   // Avoid treating momentum as a probability. Require the chosen digit's
+   // blended forecast probability not to be below a 10%-uniform baseline.
+   const supported=Boolean(top && 'probability' in top && top.probability>=.10);
    // Freeze only a qualifying V1 signal for NEXT tick's scorecard.
    // This is independent of trade execution and stays active while the bot is stopped.
-   if(top && top.score>=Number(settings.threshold) && rising){
+   if(top && top.score>=Number(settings.threshold) && rising && supported){
      nextTickPending.current=top.digit;
    }
    // Render-only state; purchase scheduling does not wait for it.
@@ -348,6 +357,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(settings.strategy==='MOMENTUM_LOCK' && !selected){
      if(top.score<Number(settings.threshold)){setEntryStatus('Waiting for V1 score');return}
      if(!rising){setEntryStatus('Waiting for rising momentum');return}
+     if(!supported){setEntryStatus('Forecast below 10% baseline');return}
      selected={digit:top.digit,elapsed:1,signal:{score:top.score,momentum3:momentum!,positiveSteps:rises,threshold:Number(settings.threshold)}};
      lockRef.current=selected;setLockPosition(1);
      justLocked=true;
@@ -355,6 +365,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(settings.strategy==='DYNAMIC'){
      if(top.score<Number(settings.threshold)){setEntryStatus('Waiting for V1 score');return}
      if(!rising){setEntryStatus('Waiting for rising momentum');return}
+     if(!supported){setEntryStatus('Forecast below 10% baseline');return}
    }
    if(requireEvidence && (eligibleResults.current.length<150 || wilsonLower(eligibleResults.current.reduce((a,b)=>a+b,0),eligibleResults.current.length)<=0.1)){
      setEntryStatus(`Evidence gate: ${eligibleResults.current.length}/150 evaluated; require 95% lower bound > 10%`);
@@ -439,6 +450,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       <span>Eligible V1 NEXT-tick accuracy: <strong className="text-white">{accuracyAudit.trials ? `${(100*accuracyAudit.hits/accuracyAudit.trials).toFixed(1)}%` : '—'}</strong> ({accuracyAudit.hits}/{accuracyAudit.trials}) · 95% lower bound {(accuracyAudit.lower95*100).toFixed(1)}% · random benchmark 10%</span>
       <label className="flex items-center gap-1.5"><input type="checkbox" checked={requireEvidence} disabled={active.current || pending.current || outstandingCount>0} onChange={e=>setRequireEvidence(e.target.checked)} />Require measured edge before purchases</label>
     </div>
+    {intelligenceAudit && <div className="mt-1 text-[10px] text-cyan-200">All-10 digit audit: {intelligenceAudit.topHits}/{intelligenceAudit.trials} top-1 hits ({(intelligenceAudit.topHitRate*100).toFixed(1)}%) · Brier {intelligenceAudit.brier.toFixed(3)} vs uniform {intelligenceAudit.uniformBrier.toFixed(3)} · log loss {intelligenceAudit.logLoss.toFixed(3)} · leading probability {scores.length && 'probability' in scores[0] ? ((scores[0] as any).probability*100).toFixed(1)+'%' : '—'}. Online expert weights: {Object.entries(intelligenceAudit.weights).map(([k,v])=>`${k} ${(v*100).toFixed(0)}%`).join(' · ')}.</div>}
     <p className="mt-1 text-[10px] text-slate-400">Optional evidence gate: when enabled, the bot waits for 150 qualifying next-tick observations and a 95% lower confidence bound above 10%. This is not proof of profitability; quoted break-even may be much higher. Demo-test before any live trading.</p>
   </div>
   <div className="mt-2 flex items-center gap-2">
