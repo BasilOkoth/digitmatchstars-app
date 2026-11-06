@@ -3,6 +3,7 @@ import {useCallback,useEffect,useRef,useState} from 'react';
 import {getLastDigit} from '@/lib/digit-stats';
 import {scoreDigits} from '@/lib/digitmatch-score';
 import {NextTickIntelligence} from '@/lib/next-tick-intelligence';
+import {ExecutionAwareForecast} from '@/lib/execution-aware-forecast';
 import {useExecutionTarget} from './digit-stats-bar';
 import type {Tick,DerivWS} from '@deriv/core';
 
@@ -35,6 +36,10 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const [history,setHistory]=useState<number[]>([]);const [scores,setScores]=useState<ReturnType<typeof scoreDigits>>([]);const [lockedDigit,setLockedDigit]=useState<number|null>(null);const [lossBlock,setLossBlock]=useState(0);
  const scoreHistoryRef=useRef<Record<number,number>[]>([]);
  const intelligenceRef=useRef(new NextTickIntelligence());
+ const executionForecastRef=useRef(new ExecutionAwareForecast());
+ const [executionAudit,setExecutionAudit]=useState<ReturnType<ExecutionAwareForecast['audit']>|null>(null);
+ const [horizonTarget,setHorizonTarget]=useState<number|null>(null);
+ const [horizonProbability,setHorizonProbability]=useState<number|null>(null);
  const [intelligenceAudit,setIntelligenceAudit]=useState<ReturnType<NextTickIntelligence['getAudit']>|null>(null);
  const outstanding=useRef(new Map<number,{digit:number;stake:number;signalEpoch:number;purchaseEpoch:number|null;}>());
  const reservedStake=useRef(0);
@@ -73,6 +78,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const confirmedLosses=useRef(0);
  const [syncStatus,setSyncStatus]=useState('Waiting for a purchase');
  const [topMomentum,setTopMomentum]=useState<number|null>(null);
+ const [targetMomentum,setTargetMomentum]=useState<number|null>(null);
+ const [targetProbability,setTargetProbability]=useState<number|null>(null);
  // Next-tick audit: a prediction is frozen on tick N and graded ONLY on tick N+1.
  // Sampled only when V1's score and momentum conditions qualify; no look-ahead.
  const nextTickPending=useRef<number|null>(null);
@@ -94,8 +101,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const [latency,setLatency]=useState<{quote:number;buy:number;settlement:number}|null>(null);
  const soundRef=useRef(sound);useEffect(()=>{soundRef.current=sound},[sound]);
  const play=useCallback((kind:'buy'|'win'|'loss')=>{if(soundRef.current)tone(kind)},[]);
- const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;lockRef.current=null;setLockPosition(0);setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
- useEffect(()=>{if(scope.current!==scopeKey){const unsettled=outstanding.current.size>0||pending.current||uncertainPurchase.current;scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];intelligenceRef.current.reset();setIntelligenceAudit(null);nextTickPending.current=null;eligibleResults.current=[];setAccuracyAudit({trials:0,hits:0,lower95:0});confirmedLosses.current=0;lockRef.current=null;setLockPosition(0);setTopMomentum(null);lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;if(!unsettled){pending.current=false;reservedStake.current=0;uncertainPurchase.current=false;}lastTickKey.current='';if(!unsettled)matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(unsettled?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(unsettled)setErr('Account/symbol changed with a pending or unsettled order. Reconcile on Deriv before restarting.');else setErr('')}},[scopeKey,setTarget]);
+ const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;lockRef.current=null;setLockPosition(0);setTargetMomentum(null);setTargetProbability(null);setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
+ useEffect(()=>{if(scope.current!==scopeKey){const unsettled=outstanding.current.size>0||pending.current||uncertainPurchase.current;scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];intelligenceRef.current.reset();executionForecastRef.current.reset();setExecutionAudit(null);setHorizonTarget(null);setHorizonProbability(null);setIntelligenceAudit(null);nextTickPending.current=null;eligibleResults.current=[];setAccuracyAudit({trials:0,hits:0,lower95:0});confirmedLosses.current=0;lockRef.current=null;setLockPosition(0);setTopMomentum(null);setTargetMomentum(null);setTargetProbability(null);lockedRef.current=null;countRef.current=0;lossBlockRef.current=0;pnlRef.current=0;if(!unsettled){pending.current=false;reservedStake.current=0;uncertainPurchase.current=false;}lastTickKey.current='';if(!unsettled)matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(unsettled?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(unsettled)setErr('Account/symbol changed with a pending or unsettled order. Reconcile on Deriv before restarting.');else setErr('')}},[scopeKey,setTarget]);
  const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,firstLockMatch:boolean)=>{
   if(!ws||!accountId||pending.current||halt.current||uncertainPurchase.current||outstanding.current.size>0)return;
   // Never replay ticks skipped while a previous buy was in flight.
@@ -149,6 +156,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    });
    const buyMs=Math.round(performance.now()-buyStart);
    const ticksDuringAcknowledgment=Math.max(0,tickSequence.current-signalSequence);
+   executionForecastRef.current.observeAcknowledgment(ticksDuringAcknowledgment);
    const acknowledgedAt=performance.now();
    const quoteMs=0;
    const paid=Number(bought?.buy?.buy_price);
@@ -208,6 +216,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      setLatency(old=>old?{...old,settlement:Math.round(performance.now()-settlementStart)}:null);
      const profit=amount(payout-buyPrice);pnlRef.current=amount(pnlRef.current+profit);setPnl(pnlRef.current);
      const win=profit>0;
+     executionForecastRef.current.observeSettlement(win);
      const expiryDigit=expiryDigitOf(settle,pipSize);
      const entrySpot=settle.entry_spot??settle.entry_tick??null;
      const entryEpochRaw=Number(settle.entry_spot_time??settle.entry_tick_time);
@@ -312,12 +321,19 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    }
    nextTickPending.current=null;
    histRef.current=[...histRef.current.slice(-99),digit];
+   executionForecastRef.current.observe(digit);
    // Market observations update forecasting; a matching digit blocks a NEW BUY
    // only at the entry gates below, never settles an existing Deriv contract.
    // Causal all-ten-digit evaluation: grade the prior frozen forecast, then
    // produce the next forecast from history that ends at this observed tick.
    const ranking=intelligenceRef.current.observe(digit);scoreRef.current=ranking;
    if(sequence%5===0)setIntelligenceAudit(intelligenceRef.current.getAudit());
+   const executionForecast=executionForecastRef.current.forecast(ranking);
+   const executionRanking=executionForecast?.ranked??[];
+   const execTop=executionRanking[0]??null;
+   if(sequence%5===0)setExecutionAudit(executionForecastRef.current.audit());
+   setHorizonTarget(execTop?.digit??null);
+   setHorizonProbability(execTop?.executionProbability??null);
    const top=ranking[0];
    // Derive momentum from the SAME all-ten forecast used for prediction.
    // Do not recompute it from a separately modified score ranking.
@@ -325,6 +341,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const rises=top?.positiveSteps ?? 0;
    const rising=momentum!==null && momentum>0 && momentum>=Number(settings.minMomentum) && rises>=2;
    const supported=Boolean(top && top.probability>=.10);
+   const executionSupported=Boolean(execTop && execTop.executionProbability>=.10);
    // Freeze only a qualifying V1 signal for NEXT tick's scorecard.
    // This is independent of trade execution and stays active while the bot is stopped.
    if(top && top.score>=Number(settings.threshold) && rising && supported){
@@ -332,40 +349,65 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    }
    // Render-only state; purchase scheduling does not wait for it.
    setHistory(histRef.current);setScores(ranking);setTopMomentum(momentum);
-   // Lock life is measured in observed market ticks, never settlement callbacks.
-   // The establishing tick is position 1. The next four ticks remain eligible
-   // with the same digit, regardless of changes in live rankings/momentum.
+   // Momentum Lock lasts the configured number of observed ticks. Every new
+   // tick re-evaluates the LOCKED digit's own forecast. Other digits becoming
+   // top-ranked cannot silently alter an open lock or its trade target.
    let selected=lockRef.current;
-
    if(settings.strategy==='MOMENTUM_LOCK' && selected){
      selected={...selected,elapsed:selected.elapsed+1};
-     if(selected.elapsed>Number(settings.lockDuration)){selected=null;lockRef.current=null;setLockPosition(0)}
-     else {lockRef.current=selected;setLockPosition(selected.elapsed)}
-   }else if(settings.strategy!=='MOMENTUM_LOCK' && selected){lockRef.current=null;selected=null;setLockPosition(0)}
+     if(selected.elapsed>Number(settings.lockDuration)){
+       selected=null;lockRef.current=null;setLockPosition(0);
+     } else {lockRef.current=selected;setLockPosition(selected.elapsed)}
+   }else if(settings.strategy!=='MOMENTUM_LOCK' && selected){
+     lockRef.current=null;selected=null;setLockPosition(0);
+   }
+   // Current top and locked target can differ. Display both independently.
+   const displayTarget=settings.strategy==='MOMENTUM_LOCK' ? selected?.digit ?? null : execTop?.digit ?? null;
+   const displayForecast=ranking.find(row=>row.digit===displayTarget);
+   setTargetMomentum(displayForecast?.momentum3??null);
+   setTargetProbability(displayForecast?.probability??null);
    if(!active.current||halt.current||uncertainPurchase.current||!settings.accountId||!settings.isConnected)return;
    if(!ranking.length){setEntryStatus('V1 warming up');return}
    if(countRef.current>=Number(settings.limit)){halt.current=true;active.current=false;setMode('MAX_TRADES');setEntryStatus('Max trades reached');return}
    if(settings.strategy==='MOMENTUM_LOCK' && !selected){
-     if(top.score<Number(settings.threshold)){setEntryStatus('Waiting for V1 score');return}
-     if(!rising){setEntryStatus('Waiting for rising momentum');return}
-     if(!supported){setEntryStatus('Forecast below 10% baseline');return}
-     selected={digit:top.digit,elapsed:1,signal:{score:top.score,momentum3:momentum!,positiveSteps:rises,threshold:Number(settings.threshold)}};
+     if(!execTop){setEntryStatus('Execution forecast warming up');return}
+     if(execTop.score<Number(settings.threshold)){setEntryStatus('Waiting for execution V1 score');return}
+     if(execTop.momentum3<=0 || execTop.momentum3<Number(settings.minMomentum) || execTop.positiveSteps<2){setEntryStatus('Waiting for execution-target momentum');return}
+     if(!executionSupported){setEntryStatus('Execution forecast below 10% baseline');return}
+     selected={digit:execTop.digit,elapsed:1,signal:{score:execTop.score,momentum3:execTop.momentum3,positiveSteps:execTop.positiveSteps,threshold:Number(settings.threshold)}};
      lockRef.current=selected;setLockPosition(1);
-
+     setTargetMomentum(execTop.momentum3);setTargetProbability(execTop.executionProbability);
    }
    if(settings.strategy==='DYNAMIC'){
-     if(top.score<Number(settings.threshold)){setEntryStatus('Waiting for V1 score');return}
-     if(!rising){setEntryStatus('Waiting for rising momentum');return}
-     if(!supported){setEntryStatus('Forecast below 10% baseline');return}
+     if(!execTop){setEntryStatus('Execution forecast warming up');return}
+     if(execTop.score<Number(settings.threshold)){setEntryStatus('Waiting for execution V1 score');return}
+     if(execTop.momentum3<=0 || execTop.momentum3<Number(settings.minMomentum) || execTop.positiveSteps<2){setEntryStatus('Waiting for execution-target momentum');return}
+     if(!executionSupported){setEntryStatus('Execution forecast below 10% baseline');return}
    }
-   if(requireEvidence && (eligibleResults.current.length<150 || wilsonLower(eligibleResults.current.reduce((a,b)=>a+b,0),eligibleResults.current.length)<=0.1)){
-     setEntryStatus(`Evidence gate: ${eligibleResults.current.length}/150 evaluated; require 95% lower bound > 10%`);
+   const horizonEvidence=executionForecastRef.current.audit().horizons[(executionForecast?.horizon??2)-1];
+   if(requireEvidence && (horizonEvidence.trials<150 || horizonEvidence.lower95<=0.1)){
+     setEntryStatus(`Execution evidence gate: +${horizonEvidence.horizon} ${horizonEvidence.trials}/150; lower bound must exceed 10%`);
      return;
    }
-   const target=settings.strategy==='MOMENTUM_LOCK'?selected!.digit:top.digit;
-   const signal=settings.strategy==='MOMENTUM_LOCK'?selected!.signal:{score:top.score,momentum3:momentum!,positiveSteps:rises,threshold:Number(settings.threshold)};
+   const target=settings.strategy==='MOMENTUM_LOCK'?selected!.digit:execTop!.digit;
+   // Use fresh values for the actual candidate, not historical momentum saved
+   // when the lock was created and not today's top digit if it has changed.
    const chosenForecast=ranking.find(row=>row.digit===target);
-   if(!chosenForecast || chosenForecast.probability<.10){setEntryStatus('Locked digit forecast below 10% baseline');return;}
+   if(!chosenForecast){setEntryStatus('Target forecast unavailable');return}
+   const ownMomentum=chosenForecast.momentum3;
+   const ownRises=chosenForecast.positiveSteps;
+   const ownRising=ownMomentum>0 && ownMomentum>=Number(settings.minMomentum) && ownRises>=2;
+   if(settings.strategy==='MOMENTUM_LOCK' && (
+       chosenForecast.score<Number(settings.threshold) || !ownRising)){
+     setEntryStatus(`Locked ${target} weakening · skip until its own momentum and V1 score qualify`);
+     return;
+   }
+   const executionTarget=executionRanking.find(row=>row.digit===target);
+   if(!executionTarget || executionTarget.executionProbability<.10){
+     setEntryStatus(`Execution target ${target} forecast ${((executionTarget?.executionProbability??0)*100).toFixed(1)}% below 10% baseline · skip`);
+     return;
+   }
+   const signal={score:chosenForecast.score,momentum3:ownMomentum,positiveSteps:ownRises,threshold:Number(settings.threshold)};
    const lockTick=settings.strategy==='MOMENTUM_LOCK'?selected!.elapsed:0;
    // Never enter on a market tick whose observed last digit equals the target.
    // This is an ENTRY rule, not an assumption about a Deriv contract outcome.
@@ -384,7 +426,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(!Number.isFinite(stake)||stake<=0||stake+reservedStake.current+Math.max(0,-pnlRef.current)>Number(settings.maxLoss)){
     stop();setMode('MAX_LOSS');return;
    }
-   setEntryStatus('Sending next-tick forecast to Deriv');
+   setEntryStatus(`Sending execution-horizon (+${executionForecast?.horizon??1}) forecast to Deriv`);
    lastSignalDispatchMs.current=receivedAt;
    lockedRef.current=target;setLockedDigit(target);setTarget(target);
    // Lock purchase immediately; no React rerender or effect scheduling required.
@@ -432,7 +474,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     <span className={topMomentum===null?'text-slate-400':topMomentum>0?'font-bold text-emerald-400':'font-bold text-rose-400'}>
       Momentum {topMomentum===null?'warming up':`${topMomentum>=0?'+':''}${topMomentum.toFixed(2)}`}
     </span>
-    <span className="text-slate-300">Target {strategy==='MOMENTUM_LOCK' ? lockRef.current?.digit ?? '—' : pending.current ? lockedDigit ?? '—' : '—'}</span>
+    <span className="text-slate-300">V1 target {strategy==='MOMENTUM_LOCK' ? lockRef.current?.digit ?? '—' : scores[0]?.digit ?? '—'}</span>
+    <span className="text-cyan-300">Target momentum {targetMomentum===null?'—':`${targetMomentum>=0?'+':''}${targetMomentum.toFixed(2)}`}</span>
+    <span className="text-slate-300">Target forecast {targetProbability===null?'—':`${(targetProbability*100).toFixed(2)}%`}</span>
     <span className="text-slate-400">Open {outstandingCount}/1</span>
     {active.current && <span className={/awaiting settlement/i.test(entryStatus) ? "font-semibold text-yellow-400" : "text-slate-400"}>{entryStatus}</span>}
 
@@ -444,8 +488,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       <label className="flex items-center gap-1.5"><input type="checkbox" checked={requireEvidence} disabled={active.current || pending.current || outstandingCount>0} onChange={e=>setRequireEvidence(e.target.checked)} />Require measured edge before purchases</label>
     </div>
     {intelligenceAudit && <div className="mt-1 text-[10px] text-cyan-200">All-10 digit audit: {intelligenceAudit.topHits}/{intelligenceAudit.trials} top-1 hits ({(intelligenceAudit.topHitRate*100).toFixed(1)}%) · Brier {intelligenceAudit.brier.toFixed(3)} vs uniform {intelligenceAudit.uniformBrier.toFixed(3)} · log loss {intelligenceAudit.logLoss.toFixed(3)} · leading probability {scores.length && 'probability' in scores[0] ? ((scores[0] as any).probability*100).toFixed(1)+'%' : '—'}. Online expert weights: {Object.entries(intelligenceAudit.weights).map(([k,v])=>`${k} ${(v*100).toFixed(0)}%`).join(' · ')}.</div>}
+    {executionAudit && <div className="mt-1 text-[10px] text-emerald-200">Execution-aware research (observed-tick horizons, NOT verified expiry timing): {executionAudit.horizons.map(h=>`+${h.horizon}: ${h.hits}/${h.trials} (${(h.hitRate*100).toFixed(1)}%, lower 95% ${(h.lower95*100).toFixed(1)}%)`).join(' · ')}. ACK samples {executionAudit.ackSamples} · verified contracts {executionAudit.verifiedTrades} ({executionAudit.verifiedWins} wins).</div>}
     {intelligenceAudit && <div className="mt-1 text-[10px] text-amber-200">Forward validation: momentum-qualified {intelligenceAudit.eligibleHits}/{intelligenceAudit.eligibleTrials} ({intelligenceAudit.eligibleTrials?(100*intelligenceAudit.eligibleHits/intelligenceAudit.eligibleTrials).toFixed(1):'0.0'}%; lower 95% {(100*intelligenceAudit.eligibleLower95).toFixed(1)}%). Entropy regimes: {(['LOW','MID','HIGH'] as const).map(k=>`${k} ${intelligenceAudit.regimes[k].hits}/${intelligenceAudit.regimes[k].trials} (${(100*intelligenceAudit.regimes[k].rate).toFixed(1)}%)`).join(' · ')}. Lower log loss is better; uniform baseline {intelligenceAudit.uniformLogLoss.toFixed(3)}.</div>}
-    <p className="mt-1 text-[10px] text-slate-400">Optional evidence gate: when enabled, the bot waits for 150 qualifying next-tick observations and a 95% lower confidence bound above 10%. This is not proof of profitability; quoted break-even may be much higher. Demo-test before any live trading.</p>
+    <p className="mt-1 text-[10px] text-slate-400">Optional evidence gate: when enabled, the bot waits for 150 forward-horizon observations and a 95% lower confidence bound above 10%. This is not proof of profitability; quoted break-even may be much higher. Demo-test before any live trading.</p>
   </div>
   <div className="mt-2 flex items-center gap-2">
     <button
