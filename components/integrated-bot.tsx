@@ -314,26 +314,13 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // produce the next forecast from history that ends at this observed tick.
    const ranking=intelligenceRef.current.observe(digit);scoreRef.current=ranking;
    if(sequence%5===0)setIntelligenceAudit(intelligenceRef.current.getAudit());
-   // Freeze all ten scores at each distinct tick. Evaluate momentum only using
-   // score history that PRECEDES the current trade decision.
-   if(ranking.length===10){
-     const snapshot:Record<number,number>={};
-     ranking.forEach(r=>{snapshot[r.digit]=r.score});
-     scoreHistoryRef.current=[...scoreHistoryRef.current.slice(-3),snapshot];
-   }
    const top=ranking[0];
-   const hist=scoreHistoryRef.current;
-   // Three-tick net momentum; require at least two positive steps, rather
-   // than accepting a brief rebound in an otherwise weakening score.
-   const trail=top && hist.length>=4 ? hist.slice(-4).map(row=>row[top.digit]) : [];
-   const momentum=trail.length===4 ? trail[3]-trail[0] : null;
-   const rises=trail.length===4 ? trail.slice(1).filter((v,i)=>v>trail[i]).length : 0;
-   // The minimum momentum magnitude is user-controlled; a zero setting
-   // preserves the original strictly-positive momentum entry rule.
+   // Derive momentum from the SAME all-ten forecast used for prediction.
+   // Do not recompute it from a separately modified score ranking.
+   const momentum=top?.momentum3 ?? null;
+   const rises=top?.positiveSteps ?? 0;
    const rising=momentum!==null && momentum>0 && momentum>=Number(settings.minMomentum) && rises>=2;
-   // Avoid treating momentum as a probability. Require the chosen digit's
-   // blended forecast probability not to be below a 10%-uniform baseline.
-   const supported=Boolean(top && 'probability' in top && top.probability>=.10);
+   const supported=Boolean(top && top.probability>=.10);
    // Freeze only a qualifying V1 signal for NEXT tick's scorecard.
    // This is independent of trade execution and stays active while the bot is stopped.
    if(top && top.score>=Number(settings.threshold) && rising && supported){
@@ -373,6 +360,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    }
    const target=settings.strategy==='MOMENTUM_LOCK'?selected!.digit:top.digit;
    const signal=settings.strategy==='MOMENTUM_LOCK'?selected!.signal:{score:top.score,momentum3:momentum!,positiveSteps:rises,threshold:Number(settings.threshold)};
+   const chosenForecast=ranking.find(row=>row.digit===target);
+   if(!chosenForecast || chosenForecast.probability<.10){setEntryStatus('Locked digit forecast below 10% baseline');return;}
    const lockTick=settings.strategy==='MOMENTUM_LOCK'?selected!.elapsed:0;
    // When Momentum Lock first selects the live digit, send its first buy
    // immediately instead of skipping the qualifying tick. This is NOT a
@@ -451,6 +440,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       <label className="flex items-center gap-1.5"><input type="checkbox" checked={requireEvidence} disabled={active.current || pending.current || outstandingCount>0} onChange={e=>setRequireEvidence(e.target.checked)} />Require measured edge before purchases</label>
     </div>
     {intelligenceAudit && <div className="mt-1 text-[10px] text-cyan-200">All-10 digit audit: {intelligenceAudit.topHits}/{intelligenceAudit.trials} top-1 hits ({(intelligenceAudit.topHitRate*100).toFixed(1)}%) · Brier {intelligenceAudit.brier.toFixed(3)} vs uniform {intelligenceAudit.uniformBrier.toFixed(3)} · log loss {intelligenceAudit.logLoss.toFixed(3)} · leading probability {scores.length && 'probability' in scores[0] ? ((scores[0] as any).probability*100).toFixed(1)+'%' : '—'}. Online expert weights: {Object.entries(intelligenceAudit.weights).map(([k,v])=>`${k} ${(v*100).toFixed(0)}%`).join(' · ')}.</div>}
+    {intelligenceAudit && <div className="mt-1 text-[10px] text-amber-200">Forward validation: momentum-qualified {intelligenceAudit.eligibleHits}/{intelligenceAudit.eligibleTrials} ({intelligenceAudit.eligibleTrials?(100*intelligenceAudit.eligibleHits/intelligenceAudit.eligibleTrials).toFixed(1):'0.0'}%; lower 95% {(100*intelligenceAudit.eligibleLower95).toFixed(1)}%). Entropy regimes: {(['LOW','MID','HIGH'] as const).map(k=>`${k} ${intelligenceAudit.regimes[k].hits}/${intelligenceAudit.regimes[k].trials} (${(100*intelligenceAudit.regimes[k].rate).toFixed(1)}%)`).join(' · ')}. Lower log loss is better; uniform baseline {intelligenceAudit.uniformLogLoss.toFixed(3)}.</div>}
     <p className="mt-1 text-[10px] text-slate-400">Optional evidence gate: when enabled, the bot waits for 150 qualifying next-tick observations and a 95% lower confidence bound above 10%. This is not proof of profitability; quoted break-even may be much higher. Demo-test before any live trading.</p>
   </div>
   <div className="mt-2 flex items-center gap-2">

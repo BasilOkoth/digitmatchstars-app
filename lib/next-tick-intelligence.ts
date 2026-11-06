@@ -1,110 +1,91 @@
-/**
- * Causal, online all-ten-digit next-tick evaluator. No outcome is used before it arrives.
- * Relative V1 scores and estimated probabilities are NOT evidence of an edge.
- * Keep one engine per symbol + pip size; call observe once per distinct tick.
+/** Causal, online next-tick forecasting for all digits 0..9.
+ * A forecast is always frozen before the next observation is graded.
+ * These are research probabilities; no method here establishes market edge.
  */
 import {scoreDigits, type DigitScore} from './digitmatch-score';
 
-export type ExpertName = 'frequency'|'transition'|'gap'|'momentum'|'entropy';
-const EXPERTS:ExpertName[]=['frequency','transition','gap','momentum','entropy'];
-export type DigitForecast=DigitScore & {probability:number;momentum3:number;positiveSteps:number;entropy:number;sampleHits:number;sampleTrials:number};
-export type IntelligenceAudit={trials:number;topHits:number;topHitRate:number;brier:number;logLoss:number;uniformBrier:number;digitTrials:number[];digitHits:number[];digitObserved:number[];weights:Record<ExpertName,number>};
-const clip=(x:number,a:number,b:number)=>Math.min(b,Math.max(a,x));
-const normalize=(numbers:number[])=>{const sum=numbers.reduce((a,b)=>a+b,0);return sum>0?numbers.map(x=>x/sum):Array(10).fill(.1)};
-const softmax=(v:number[],temperature:number)=>{const m=Math.max(...v);return normalize(v.map(x=>Math.exp(clip((x-m)/temperature,-40,40))))};
-const win=(h:number[],n:number)=>h.slice(-n);
-const entropy=(h:number[])=>{if(!h.length)return 0;const cs=Array(10).fill(0);for(const d of h)cs[d]++;return -cs.reduce((a,c)=>c?a+(c/h.length)*Math.log2(c/h.length):a,0)/Math.log2(10)};
-const smoothed=(h:number[],d:number,alpha:number)=> (h.filter(x=>x===d).length+alpha)/(h.length+10*alpha);
-const wilsonLower=(hits:number,n:number)=>{if(n===0)return 0;const z=1.96,p=hits/n,z2=z*z;return (p+z2/(2*n)-z*Math.sqrt((p*(1-p)+z2/(4*n))/n))/(1+z2/n)};
+export type ExpertName='frequency'|'transition'|'gap'|'momentum'|'entropy';
+export type EntropyRegime='LOW'|'MID'|'HIGH';
+const NAMES:ExpertName[]=['frequency','transition','gap','momentum','entropy'];
+const clamp=(x:number,lo:number,hi:number)=>Math.max(lo,Math.min(hi,x));
+const norm=(xs:number[])=>{const total=xs.reduce((a,b)=>a+b,0);return total>0?xs.map(x=>x/total):Array(10).fill(.1)};
+const softmax=(xs:number[],temp:number)=>{const m=Math.max(...xs);return norm(xs.map(x=>Math.exp(clamp((x-m)/temp,-30,30))))};
+const entropy=(h:number[])=>{if(!h.length)return 1;const c=Array(10).fill(0);h.forEach(x=>c[x]++);return -c.reduce((s,n)=>n?s+(n/h.length)*Math.log2(n/h.length):s,0)/Math.log2(10)};
+const avg=(a:number[])=>a.length?a.reduce((s,x)=>s+x,0)/a.length:0;
+const wilson=(hits:number,n:number)=>{if(!n)return 0;const z=1.96,p=hits/n,z2=z*z;return (p+z2/(2*n)-z*Math.sqrt((p*(1-p)+z2/(4*n))/n))/(1+z2/n)};
+const regimeOf=(e:number):EntropyRegime=>e<.72?'LOW':e<.88?'MID':'HIGH';
+const f=(h:number[],d:number,n:number,a:number)=>{const w=h.slice(-n);return (w.filter(x=>x===d).length+a)/(w.length+10*a)};
 
+export type DigitForecast=DigitScore & {probability:number;momentum3:number;positiveSteps:number;entropy:number;regime:EntropyRegime;sampleHits:number;sampleTrials:number};
+type Frozen={probs:number[];expertProbs:Record<ExpertName,number[]>;top:number;momentumQualified:boolean;regime:EntropyRegime};
+type Result={actual:number;top:number;predictedProbability:number;brier:number;logLoss:number;uniformLogLoss:number;qualified:boolean;regime:EntropyRegime};
+export type IntelligenceAudit={trials:number;topHits:number;topHitRate:number;topLower95:number;brier:number;logLoss:number;uniformBrier:number;uniformLogLoss:number;digitTrials:number[];digitHits:number[];digitObserved:number[];weights:Record<ExpertName,number>;eligibleTrials:number;eligibleHits:number;eligibleLower95:number;regimes:Record<EntropyRegime,{trials:number;hits:number;rate:number}>};
 export class NextTickIntelligence {
- private history:number[]=[];
- private scoreTrail:Record<number,number>[]=[];
- private pending:{predicted:number;combined:number[];experts:Record<ExpertName,number[]>}|null=null;
- private expertLoss:Record<ExpertName,number>={frequency:0,transition:0,gap:0,momentum:0,entropy:0};
- private outcomes:{predicted:number;actual:number;probs:number[];brier:number;logLoss:number}[]=[];
- private counts=Array(10).fill(0);
- private latest:DigitForecast[]=[];
+ private h:number[]=[];
+ private trail:Record<number,number>[]=[];
+ private pending:Frozen|null=null;
+ private results:Result[]=[];
  private weights:Record<ExpertName,number>={frequency:.2,transition:.2,gap:.2,momentum:.2,entropy:.2};
- reset(){this.history=[];this.scoreTrail=[];this.pending=null;this.outcomes=[];this.counts=Array(10).fill(0);this.expertLoss={frequency:0,transition:0,gap:0,momentum:0,entropy:0};this.latest=[];this.weights={frequency:.2,transition:.2,gap:.2,momentum:.2,entropy:.2};}
- /** Grades the forecast frozen on the PREVIOUS tick before adding the current digit. */
+ private losses:Record<ExpertName,number>={frequency:Math.log(10),transition:Math.log(10),gap:Math.log(10),momentum:Math.log(10),entropy:Math.log(10)};
+ private latest:DigitForecast[]=[];
+ reset(){this.h=[];this.trail=[];this.pending=null;this.results=[];this.latest=[];this.weights={frequency:.2,transition:.2,gap:.2,momentum:.2,entropy:.2};this.losses={frequency:Math.log(10),transition:Math.log(10),gap:Math.log(10),momentum:Math.log(10),entropy:Math.log(10)}}
  observe(actual:number):DigitForecast[]{
   if(!Number.isInteger(actual)||actual<0||actual>9)return this.latest;
-  if(this.pending){
-   const p=this.pending;
-   const brier=p.combined.reduce((s,v,d)=>s+(v-Number(d===actual))**2,0);
-   this.outcomes.push({predicted:p.predicted,actual,probs:[...p.combined],brier,logLoss:-Math.log(Math.max(1e-8,p.combined[actual]))});
-   if(this.outcomes.length>1000)this.outcomes.shift();
-   for(const name of EXPERTS){const loss=-Math.log(Math.max(.0001,p.experts[name][actual]));this.expertLoss[name]=clip(.985*this.expertLoss[name]+.015*loss,0,10)};
-   this.counts[actual]++;
+  // IMPORTANT: all evaluation precedes recording the latest observed digit.
+  if(this.pending){const p=this.pending;
+   this.results.push({actual,top:p.top,predictedProbability:p.probs[actual],brier:p.probs.reduce((s,v,d)=>s+(v-Number(actual===d))**2,0),logLoss:-Math.log(Math.max(1e-8,p.probs[actual])),uniformLogLoss:Math.log(10),qualified:p.momentumQualified,regime:p.regime});
+   if(this.results.length>2000)this.results.shift();
+   for(const k of NAMES){const loss=-Math.log(Math.max(1e-8,p.expertProbs[k][actual]));this.losses[k]=.98*this.losses[k]+.02*loss;}
   }
-  this.history=[...this.history.slice(-199),actual];
-  const base=scoreDigits(this.history);
-  if(base.length!==10){this.pending=null;this.latest=[];return []}
-  const snapshot:Record<number,number>={};for(const row of base)snapshot[row.digit]=row.score;
-  this.scoreTrail=[...this.scoreTrail.slice(-3),snapshot];
-  const n=this.history.length, recent=win(this.history,25),current=this.history[n-1];
-  const e=entropy(recent);
-  const freq=normalize(Array.from({length:10},(_,d)=> .42*smoothed(win(this.history,10),d,3)+.35*smoothed(win(this.history,30),d,4)+.23*smoothed(win(this.history,100),d,7)));
-  const transition=normalize(Array.from({length:10},(_,d)=>{
-   let s1=0,c1=0,s2=0,c2=0;
-   for(let i=0;i<n-1;i++)if(this.history[i]===current){c1++;if(this.history[i+1]===d)s1++}
-   for(let i=0;i<n-2;i++)if(this.history[i]===this.history[n-2]&&this.history[i+1]===current){c2++;if(this.history[i+2]===d)s2++}
-   return .6*(s1+3)/(c1+30)+.4*(s2+2)/(c2+20);
+  this.h=[...this.h.slice(-199),actual];
+  const base=scoreDigits(this.h);if(base.length!==10){this.pending=null;this.latest=[];return []}
+  const snapshot:Record<number,number>={};base.forEach(r=>snapshot[r.digit]=r.score);
+  this.trail=[...this.trail.slice(-3),snapshot];
+  const n=this.h.length,prev=this.h[n-1],e=entropy(this.h.slice(-25)),regime=regimeOf(e);
+  const frequency=norm(Array.from({length:10},(_,d)=>.4*f(this.h,d,10,4)+.35*f(this.h,d,30,5)+.25*f(this.h,d,100,8)));
+  const transition=norm(Array.from({length:10},(_,d)=>{
+   let c1=0,s1=0,c2=0,s2=0;
+   for(let i=0;i<n-1;i++)if(this.h[i]===prev){c1++;if(this.h[i+1]===d)s1++}
+   for(let i=0;i<n-2;i++)if(this.h[i]===this.h[n-2]&&this.h[i+1]===prev){c2++;if(this.h[i+2]===d)s2++}
+   // Prior smoothing avoids assigning high certainty to rare transitions.
+   return .65*(s1+4)/(c1+40)+.35*(s2+3)/(c2+30);
   }));
-  const gap=normalize(Array.from({length:10},(_,d)=>{
-   let i=n-1;while(i>=0&&this.history[i]!==d)i--;
-   const g=i<0?50:n-1-i;
-   // Gap is contextual evidence only, NOT a gambler's fallacy or due-digit guarantee.
-   return Math.exp(-Math.abs(Math.min(g,25)-7)/12);
+  const gap=norm(Array.from({length:10},(_,d)=>{
+   const ix=this.h.lastIndexOf(d),g=ix<0?30:n-1-ix;
+   return .1+ .015*Math.exp(-Math.abs(Math.min(g,25)-6)/8);
   }));
-  const trail=this.scoreTrail;
   const momentum=Array.from({length:10},(_,d)=>{
-   if(trail.length<4)return {change:0,rises:0};
-   const vals=trail.map(x=>x[d]);return {change:vals[3]-vals[0],rises:vals.slice(1).filter((v,i)=>v>vals[i]).length};
+   if(this.trail.length!==4)return {change:0,rises:0};
+   const a=this.trail.map(x=>x[d]);return {change:a[3]-a[0],rises:[1,2,3].filter(i=>a[i]>a[i-1]).length};
   });
-  const mom=softmax(momentum.map(x=>clip(x.change,-12,12)+1.5*(x.rises-1.5)),8);
-  // Low entropy can indicate concentration but is not by itself predictability.
-  const lowEntropy=1-e;
-  const ent=normalize(Array.from({length:10},(_,d)=> .1 + lowEntropy*clip((smoothed(win(this.history,25),d,3)-.1),-.08,.15)));
-  const experts:Record<ExpertName,number[]>={frequency:freq,transition,gap,momentum:mom,entropy:ent};
-  // Online expert weights are based only on already-observed next-tick results.
-  // Shrink towards equal weights until enough observations accumulate.
-  const learned=softmax(EXPERTS.map(k=>-this.expertLoss[k]),.14);
-  const maturity=clip(this.outcomes.length/250,0,.65);
-  for(let i=0;i<EXPERTS.length;i++)this.weights[EXPERTS[i]]=(1-maturity)/5+maturity*learned[i];
-  const combined=normalize(Array.from({length:10},(_,d)=>{
-   const p=EXPERTS.reduce((sum,k)=>sum+this.weights[k]*experts[k][d],0);
-   // Entropy-sensitive shrinkage towards 10%: less empirical structure => less confidence.
-   const shrink=clip(.32+.42*e,.32,.74);
-   return shrink*.1+(1-shrink)*p;
-  }));
-  const perDigit=new Array(10).fill(0).map((_,d)=>{
-   const trials=this.outcomes.length;
-   const hits=this.outcomes.filter(o=>o.predicted===d&&o.actual===d).length;
-   const selections=this.outcomes.filter(o=>o.predicted===d).length;
-   return {hits,selections,trials};
-  });
-  this.latest=base.map(r=>{
-   const d=r.digit;
-   // Keep V1 score scale for existing Min Score control; probabilities act as
-   // a calibrated *ranking adjustment*, not a claimed percentage advantage.
-   const score=r.score+clip(55*(combined[d]-.1),-3,3);
-   return {...r,score,probability:combined[d],momentum3:momentum[d].change,positiveSteps:momentum[d].rises,entropy:e,sampleHits:perDigit[d].hits,sampleTrials:perDigit[d].selections};
-  }).sort((a,b)=>b.score-a.score||b.probability-a.probability||a.digit-b.digit);
-  this.pending={predicted:this.latest[0].digit,combined:[...combined],experts};
+  const mom=softmax(momentum.map(x=>clamp(x.change,-12,12)+1.2*(x.rises-1.5)),12);
+  // Entropy is a contextual feature, NOT evidence that any particular digit is due.
+  const ent=norm(Array.from({length:10},(_,d)=> .1 + (1-e)*.15*(f(this.h,d,25,5)-.1)));
+  const expertProbs:Record<ExpertName,number[]>={frequency,transition,gap,momentum:mom,entropy:ent};
+  // Online weights use ONLY past realized outcomes, with conservative shrinkage.
+  const adapted=softmax(NAMES.map(k=>-this.losses[k]),.12);
+  const maturity=clamp(this.results.length/1000,0,.5);
+  for(let i=0;i<NAMES.length;i++)this.weights[NAMES[i]]=(1-maturity)*.2+maturity*adapted[i];
+  const raw=norm(Array.from({length:10},(_,d)=>NAMES.reduce((s,k)=>s+this.weights[k]*expertProbs[k][d],0)));
+  // Shrink confidently toward the 10% null, preventing extreme noise-fit claims.
+  const shrink=clamp(.55+.3*e,.55,.85);
+  const probs=norm(raw.map(v=>shrink*.1+(1-shrink)*v));
+  const selectedCounts=Array(10).fill(0), selectedHits=Array(10).fill(0);
+  this.results.forEach(r=>{selectedCounts[r.top]++;if(r.top===r.actual)selectedHits[r.top]++});
+  // Make all-ten model probability ranking drive selection; original V1 score
+  // remains visible and usable as the user's threshold filter.
+  this.latest=base.map(r=>({...r,probability:probs[r.digit],momentum3:momentum[r.digit].change,positiveSteps:momentum[r.digit].rises,entropy:e,regime,sampleHits:selectedHits[r.digit],sampleTrials:selectedCounts[r.digit]}))
+   .sort((a,b)=>b.probability-a.probability||b.score-a.score||a.digit-b.digit);
+  const top=this.latest[0];
+  this.pending={probs:[...probs],expertProbs,top:top.digit,regime,momentumQualified:top.momentum3>0&&top.positiveSteps>=2};
   return this.latest;
  }
  getForecast(){return this.latest}
  getAudit():IntelligenceAudit{
-  const rows=this.outcomes,n=rows.length,topHits=rows.filter(o=>o.actual===o.predicted).length;
-  return {trials:n,topHits,topHitRate:n?topHits/n:0,
-   brier:n?rows.reduce((s,o)=>s+o.brier,0)/n:0,
-   logLoss:n?rows.reduce((s,o)=>s+o.logLoss,0)/n:0,
-   uniformBrier:.9,
-   digitTrials:Array.from({length:10},(_,d)=>rows.filter(o=>o.predicted===d).length),
-   digitHits:Array.from({length:10},(_,d)=>rows.filter(o=>o.predicted===d&&o.actual===d).length),
-   digitObserved:[...this.counts],weights:{...this.weights}};
+  const r=this.results,n=r.length,hits=r.filter(x=>x.top===x.actual).length,eligible=r.filter(x=>x.qualified),eh=eligible.filter(x=>x.top===x.actual).length;
+  const regimes={} as IntelligenceAudit['regimes'];
+  for(const key of ['LOW','MID','HIGH'] as const){const subset=r.filter(x=>x.regime===key),h=subset.filter(x=>x.top===x.actual).length;regimes[key]={trials:subset.length,hits:h,rate:subset.length?h/subset.length:0}}
+  return {trials:n,topHits:hits,topHitRate:n?hits/n:0,topLower95:wilson(hits,n),brier:n?avg(r.map(x=>x.brier)):0,logLoss:n?avg(r.map(x=>x.logLoss)):0,uniformBrier:.9,uniformLogLoss:Math.log(10),digitTrials:Array.from({length:10},(_,d)=>r.filter(x=>x.top===d).length),digitHits:Array.from({length:10},(_,d)=>r.filter(x=>x.top===d&&x.actual===d).length),digitObserved:Array.from({length:10},(_,d)=>r.filter(x=>x.actual===d).length),weights:{...this.weights},eligibleTrials:eligible.length,eligibleHits:eh,eligibleLower95:wilson(eh,eligible.length),regimes};
  }
- getLower95(){const a=this.getAudit();return wilsonLower(a.topHits,a.trials)}
+ getLower95(){return this.getAudit().topLower95}
 }
