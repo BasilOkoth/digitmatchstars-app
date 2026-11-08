@@ -13,12 +13,12 @@ export default function MultipliersPage(){
  const connected=!!ws&&isConnected&&!!auth.wsUrl&&!!account;
  const [symbol,setSymbol]=useState('1HZ100V');
  const [stake,setStake]=useState('1');
- const [multiplier,setMultiplier]=useState('20');
+ const [multiplier,setMultiplier]=useState('40');
  const [tp,setTp]=useState('1');
  const [sl,setSl]=useState('1');
  const [maxTrades,setMaxTrades]=useState('3');
  const [maxLoss,setMaxLoss]=useState('3');
- const [lookback,setLookback]=useState('20');
+ const [lookback,setLookback]=useState('40');
  const [minMomentum,setMinMomentum]=useState('0.03');
  const [maxVol,setMaxVol]=useState('0.15');
  const [cooldown,setCooldown]=useState('5');
@@ -102,6 +102,7 @@ export default function MultipliersPage(){
   busyRef.current=true;setPending(true);const epoch=session.current;
   const s=signalRef.current;const direction=s.direction as 'UP'|'DOWN';
   const startTick=tickNo.current;
+  let purchaseSubmitted=false;
   try{
    const proposalResponse=await ws.send<{proposal?:{id?:string;ask_price?:number|string}}>({proposal:1,amount:N(stake),basis:'stake',contract_type:direction==='UP'?'MULTUP':'MULTDOWN',currency:'USD',underlying_symbol:symbol,multiplier:N(multiplier),limit_order:{take_profit:N(tp),stop_loss:N(sl)}});
    const proposal=proposalResponse.proposal;
@@ -114,13 +115,14 @@ export default function MultipliersPage(){
    lastEntry.current=tickNo.current;
    log(`BUY ${direction}: ${symbol}, stake $${N(stake).toFixed(2)}, ×${multiplier}, momentum ${s.momentum.toFixed(4)}%, volatility ${s.vol.toFixed(4)}%.`);
    // Never retry an ambiguous purchase response; the order may have succeeded.
+   purchaseSubmitted=true;
    const result=await ws.send<{buy?:{contract_id?:number}}>({buy:proposal.id,price});
    const id=Number(result.buy?.contract_id);
    if(!Number.isSafeInteger(id)||id<=0)throw Error('Buy response missing contract ID. Verify open positions before restarting.');
    openRef.current=id;setOpenId(id);countRef.current++;setCount(countRef.current);
    entry.current={id,direction,stake:N(stake),multiplier:N(multiplier),entryMomentum:s.momentum,entryVol:s.vol};
    log(`Contract #${id} opened; monitoring settlement.`);
-  }catch(e){setError(String(e));stop('Order failed or status uncertain; verify Deriv positions.');}
+  }catch(e){setError(String(e));stop(purchaseSubmitted?'Purchase failed or status uncertain; verify Deriv positions.':'Proposal rejected; no purchase request was sent.');}
   finally{busyRef.current=false;setPending(false);}
  },[ws,stake,maxLoss,maxTrades,symbol,multiplier,tp,sl,log,stop]);
  useEffect(()=>{
@@ -133,7 +135,7 @@ export default function MultipliersPage(){
   setError('');
   if(!connected){setError('Sign in to Deriv through Digit Match first.');return;}
   if(openRef.current!==null||busyRef.current){setError('An order or contract is still pending.');return;}
-  if(![stake,multiplier,tp,sl,maxTrades,maxLoss,minMomentum,maxVol,lookback,cooldown].every(v=>Number.isFinite(N(v)))||N(stake)<=0||N(multiplier)<=0||N(tp)<=0||N(sl)<=0||N(maxLoss)<N(stake)||N(maxTrades)<1||!Number.isInteger(N(maxTrades))||N(lookback)<5||N(lookback)>199||N(maxVol)<=0||N(minMomentum)<=0||N(cooldown)<0){setError('Invalid trade settings. Maximum loss must cover at least one full stake.');return;}
+  if(![stake,multiplier,tp,sl,maxTrades,maxLoss,minMomentum,maxVol,lookback,cooldown].every(v=>Number.isFinite(N(v)))||N(stake)<=0||![40,100,200,300,400].includes(N(multiplier))||N(tp)<=0||N(sl)<=0||N(maxLoss)<N(stake)||N(maxTrades)<1||!Number.isInteger(N(maxTrades))||N(lookback)<5||N(lookback)>199||N(maxVol)<=0||N(minMomentum)<=0||N(cooldown)<0){setError('Invalid trade settings. Maximum loss must cover at least one full stake.');return;}
   if(account?.account_type!=='demo'&&!liveConfirm){setError('Confirm real-money trading before starting.');return;}
   countRef.current=0;pnlRef.current=0;setCount(0);setPnl(0);
   session.current++;runningRef.current=true;setRunning(true);lastAttempt.current=-1;
@@ -146,7 +148,8 @@ export default function MultipliersPage(){
   <header className="flex flex-wrap items-center justify-between gap-3"><div><div className="text-xs font-bold uppercase tracking-[.2em] text-cyan-300">DigitMatchStars / Trading Suite</div><h1 className="text-2xl font-black">Multipliers <span className="text-cyan-300">PRO</span></h1></div><div className="flex gap-2"><Link href="/" className="rounded-lg border border-white/20 px-3 py-2 text-sm">← Digit Match</Link><Link href="/accumulator" className="rounded-lg border border-white/20 px-3 py-2 text-sm">Accumulator</Link></div></header>
   <div className="grid grid-cols-2 gap-2 md:grid-cols-4">{[['ENGINE',running?'RUNNING':'STOPPED'],['ACCOUNT',account?.account_id??'LOGIN REQUIRED'],['OPEN CONTRACT',openId??'—']].map(([a,b])=><div key={String(a)} className={card}><div className="text-xs text-slate-400">{a}</div><div className="mt-1 text-base font-black text-cyan-300">{b}</div></div>)}<div className={card}><div className="text-xs text-slate-400">SESSION P/L</div><div className={`mt-1 text-xl font-black ${pnl>0?'text-green-400':pnl<0?'text-red-400':'text-white'}`}>{money(pnl)}</div></div></div>
   <div className="grid gap-3 lg:grid-cols-2"><section className={card}><h2 className="mb-2 font-bold">01 / Trade configuration</h2><p className="mb-2 text-xs text-slate-400">{connected?`● Connected to ${account?.account_type} ${account?.account_id}`:'○ Log in through Digit Match first'}</p><div className="grid grid-cols-2 gap-2">
-  {([['Symbol',symbol,setSymbol],['Stake (USD)',stake,setStake],['Multiplier',multiplier,setMultiplier],['Take-profit (USD)',tp,setTp],['Stop-loss (USD)',sl,setSl],['Max trades',maxTrades,setMaxTrades],['Max loss (USD)',maxLoss,setMaxLoss],['Momentum window (ticks)',lookback,setLookback],['Min momentum %',minMomentum,setMinMomentum],['Max volatility %',maxVol,setMaxVol],['Cooldown ticks',cooldown,setCooldown]] as const).map(([name,value,update])=><label key={name} className={label}>{name}<input className={field} value={value} onChange={e=>update(e.target.value)} disabled={running||pending} type={name==='Symbol'?'text':'number'} step="any"/></label>)}
+  {([['Symbol',symbol,setSymbol],['Stake (USD)',stake,setStake],['Take-profit (USD)',tp,setTp],['Stop-loss (USD)',sl,setSl],['Max trades',maxTrades,setMaxTrades],['Max loss (USD)',maxLoss,setMaxLoss],['Momentum window (ticks)',lookback,setLookback],['Min momentum %',minMomentum,setMinMomentum],['Max volatility %',maxVol,setMaxVol],['Cooldown ticks',cooldown,setCooldown]] as const).map(([name,value,update])=><label key={name} className={label}>{name}<input className={field} value={value} onChange={e=>update(e.target.value)} disabled={running||pending} type={name==='Symbol'?'text':'number'} step="any"/></label>)}
+  <label className={label}>Multiplier<select className={field} value={multiplier} onChange={e=>setMultiplier(e.target.value)} disabled={running||pending}>{[40,100,200,300,400].map(v=><option key={v} value={v}>{v}×</option>)}</select><span className="mt-1 block text-[10px] font-normal normal-case tracking-normal text-slate-500">Values reported by Deriv for 1HZ100V; other symbols may differ.</span></label>
   </div><div className="mt-3 rounded-lg bg-[#080e1b] p-2 text-xs"><span className={`font-black ${signal.ready?'text-green-400':'text-amber-300'}`}>{signal.direction}</span> · Momentum {signal.momentum.toFixed(4)}% · Vol {signal.vol.toFixed(4)}% · {signal.reason}</div>
   {account?.account_type!=='demo'&&<label className="mt-3 flex gap-2 text-xs text-amber-200"><input type="checkbox" checked={liveConfirm} onChange={e=>setLiveConfirm(e.target.checked)}/>I authorize real-money multiplier orders.</label>}
   <button className={`mt-3 w-full rounded-lg px-4 py-2.5 font-black ${running?'bg-rose-500/20 text-rose-300':'bg-emerald-400 text-slate-950'} disabled:opacity-40`} disabled={!running&&(!connected||pending||openId!==null)} onClick={()=>running?stop():start()}>{running?'■ STOP TRADING':`▶ START ${account?.account_type?.toUpperCase()??'TRADING'}`}</button>
