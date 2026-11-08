@@ -8,6 +8,18 @@ type Contract = { contract_id?: number; is_sold?: number | boolean; profit?: num
 type EntrySnapshot = {ticks:number; volatilityPct:number; efficiency:number; maxExcursionPct:number; p95ExcursionPct:number; expectedTicks:number; proxyBudgetPct:number; proxyCoverage:number; lowerBarrier?:number; upperBarrier?:number; barrierSource:string; entryQuote:number; capturedAt:string};
 type Audit = {entry?:EntrySnapshot; contractId:number; account:string; symbol:string; stake:number; growth:number; requestedTakeProfit:number; proposalAsk:number; proposalPayout?:number; buyPrice?:number; settledProfit?:number; sellPrice?:number; status?:string; acceptedTakeProfit?:number; verified:boolean};
 const num = (v: string) => Number(v);
+const ticksToTarget = (stake:number, target:number, rate:number) =>
+  stake>0 && target>0 && rate>0 ? Math.max(1,Math.ceil(Math.log1p(target/stake)/Math.log1p(rate))) : Infinity;
+const excursionPaths = (prices:number[], horizon:number) => {
+  const paths:number[]=[];
+  if(!Number.isSafeInteger(horizon) || horizon<1) return paths;
+  for(let i=0;i+horizon<prices.length;i++){
+    let maxMove=0;
+    for(let j=i+1;j<=i+horizon;j++)maxMove=Math.max(maxMove,Math.abs(prices[j]-prices[i])/prices[i]*100);
+    paths.push(maxMove);
+  }
+  return paths;
+};
 export default function AccumulatorPage() {
   const {ws,isConnected,auth} = useDerivWSContext();
   const account = auth.activeAccount;
@@ -27,7 +39,7 @@ export default function AccumulatorPage() {
   const [minCoverage,setMinCoverage] = useState('0.95');
   const [minBuffer,setMinBuffer] = useState('0.01');
   const [requireVerifiedBarriers,setRequireVerifiedBarriers] = useState(true);
-  const [marketStats,setMarketStats] = useState({samples:0,volatility:0,efficiency:0,excursion:0,coverage:0,ready:false,reason:'Collecting market ticks'});
+  const [marketStats,setMarketStats] = useState({samples:0,volatility:0,efficiency:0,excursion:0,coverage:0,paths:0,horizon:0,ready:false,reason:'Collecting market ticks',blockers:['Collecting market ticks'] as string[]});
   const pricesRef=useRef<number[]>([]);
   const marketStatsRef=useRef({ready:false});
   const entryRef=useRef<EntrySnapshot|null>(null);
@@ -81,7 +93,7 @@ export default function AccumulatorPage() {
     log(`Contract ${id} settled: ${profit>=0?'+':''}${profit.toFixed(2)} USD (${c.status ?? 'closed'})`);
     if(tradesRef.current>=num(maxTrades) || pnlRef.current<=-num(maxLoss)) stop('Session limit reached.');
   },[log,maxLoss,maxTrades,stop]);
-  useEffect(()=>{pricesRef.current=[];setMarketStats({samples:0,volatility:0,efficiency:0,excursion:0,coverage:0,ready:false,reason:'Collecting market ticks'});},[symbol]);
+  useEffect(()=>{pricesRef.current=[];setMarketStats({samples:0,volatility:0,efficiency:0,excursion:0,coverage:0,paths:0,horizon:0,ready:false,reason:'Collecting market ticks',blockers:['Collecting market ticks']});},[symbol]);
   useEffect(()=>{
     if(!ws || !isConnected || !auth.wsUrl) return;
     const remove=ws.onMessage(frame=>{
@@ -100,23 +112,25 @@ export default function AccumulatorPage() {
             const efficiency=movement>0?Math.abs(values[values.length-1]-values[0])/movement:0;
             // Rolling forward excursions over the estimated ticks needed to reach TP.
             // This is a historical price-path proxy, NOT Deriv's actual accumulator barriers.
-            const needed=Math.max(1,Math.ceil(Math.log(1+Number(takeProfit)/Math.max(Number(stake),0.01))/Math.log(1+Number(growth))));
-            const horizon=Math.min(needed,Math.max(1,values.length-2));
-            const excursions:number[]=[];
-            for(let i=0;i+horizon<values.length;i++){
-              let worst=0;
-              for(let j=i+1;j<=i+horizon;j++)worst=Math.max(worst,Math.abs(values[j]-values[i])/values[i]*100);
-              excursions.push(worst);
-            }
+            const needed=ticksToTarget(Number(stake),Number(takeProfit),Number(growth));
+            // Never shorten the horizon: partial paths would overstate coverage.
+            const excursions=excursionPaths(values,needed);
             const budget=Number(proxyBudget);
             const coverage=excursions.length?excursions.filter(v=>v<=budget).length/excursions.length:0;
             const maxExcursion=excursions.length?Math.max(...excursions):0;
             const enough=values.length>=Number(minTicks) && excursions.length>=10;
             const cooled=tickCount.current-lastEntryTickRef.current>=Number(cooldownTicks);
-            const ready=enough && vol<=Number(maxVolatility) && efficiency>=Number(minEfficiency) && coverage>=Number(minCoverage) && cooled;
-            const reason=!enough?'Collecting market paths':vol>Number(maxVolatility)?'Volatility too high':efficiency<Number(minEfficiency)?'Momentum efficiency too low':coverage<Number(minCoverage)?'Historical excursion coverage too low':!cooled?'Cooldown':'Entry conditions met (historical proxy)';
+            const blockers:string[]=[];
+            if(values.length<Number(minTicks))blockers.push(`Warm-up: ${values.length}/${minTicks} ticks`);
+            if(excursions.length<10)blockers.push(`Complete ${needed}-tick paths: ${excursions.length}/10`);
+            if(vol>Number(maxVolatility))blockers.push(`Volatility ${vol.toFixed(4)}% > ${maxVolatility}%`);
+            if(efficiency<Number(minEfficiency))blockers.push(`Efficiency ${efficiency.toFixed(2)} < ${minEfficiency}`);
+            if(excursions.length>=10 && coverage<Number(minCoverage))blockers.push(`Historical coverage ${(coverage*100).toFixed(1)}% < ${(Number(minCoverage)*100).toFixed(1)}%`);
+            if(!cooled)blockers.push(`Cooldown: ${Math.max(0,Number(cooldownTicks)-(tickCount.current-lastEntryTickRef.current))} ticks left`);
+            const ready=enough && blockers.length===0;
+            const reason=ready?'Entry conditions met':blockers[0]??'Waiting';
             marketStatsRef.current={ready};
-            setMarketStats({samples:values.length,volatility:vol,efficiency,excursion:maxExcursion,coverage,ready,reason});
+            setMarketStats({samples:values.length,volatility:vol,efficiency,excursion:maxExcursion,coverage,paths:excursions.length,horizon:needed,ready,reason,blockers});
           }
         }
       }
@@ -159,15 +173,11 @@ export default function AccumulatorPage() {
       const requestedTP=num(takeProfit);
       // Freeze the signal at the actual order attempt, not at settlement time.
       const snapshotPrices=pricesRef.current.slice();
-      const expectedTicks=Math.max(1,Math.ceil(Math.log(1+requestedTP/num(stake))/Math.log(1+num(growth))));
-      const excursionSeries:number[]=[];
-      for(let i=0;i+expectedTicks<snapshotPrices.length;i++){
-        let maxMove=0;
-        for(let j=i+1;j<=i+expectedTicks;j++) maxMove=Math.max(maxMove,Math.abs(snapshotPrices[j]-snapshotPrices[i])/snapshotPrices[i]*100);
-        excursionSeries.push(maxMove);
-      }
+      const expectedTicks=ticksToTarget(num(stake),requestedTP,num(growth));
+      const excursionSeries=excursionPaths(snapshotPrices,expectedTicks);
       const sorted=[...excursionSeries].sort((a,b)=>a-b);
       const captured:EntrySnapshot={ticks:snapshotPrices.length,volatilityPct:marketStats.volatility,efficiency:marketStats.efficiency,maxExcursionPct:sorted.at(-1)??0,p95ExcursionPct:sorted.length?sorted[Math.min(sorted.length-1,Math.floor(sorted.length*.95))]:0,expectedTicks,proxyBudgetPct:num(proxyBudget),proxyCoverage:excursionSeries.length?excursionSeries.filter(v=>v<=num(proxyBudget)).length/excursionSeries.length:0,barrierSource:'Historical excursion proxy only',entryQuote:snapshotPrices.at(-1)??0,capturedAt:new Date().toISOString()};
+      if(momentumEnabled && (excursionSeries.length<10 || captured.proxyCoverage<num(minCoverage))) {log('Entry rejected: insufficient full-horizon paths or historical coverage.');return;}
       entryRef.current=captured;
       log(`ENTRY SIGNAL: ticks ${captured.ticks}; volatility ${captured.volatilityPct.toFixed(4)}%; efficiency ${captured.efficiency.toFixed(3)}; historical excursion p95 ${captured.p95ExcursionPct.toFixed(4)}%; coverage ${(captured.proxyCoverage*100).toFixed(1)}%; estimated ${expectedTicks} ticks to TP.`);
       lastEntryTickRef.current=tickCount.current;
@@ -215,7 +225,7 @@ export default function AccumulatorPage() {
       if(epoch!==session.current)log('Bot stopped; open contract continues to settlement.');
     }catch(e){setError(String(e));stop('Order failed or status uncertain. Check Deriv positions before restarting.');}
     finally{busyRef.current=false;setPending(false);}
-  },[ws,stake,maxTrades,maxLoss,symbol,growth,takeProfit,log,stop,momentumEnabled,marketStats,proxyBudget,minBuffer,requireVerifiedBarriers,account?.account_type,tick]);
+  },[ws,stake,maxTrades,maxLoss,symbol,growth,takeProfit,log,stop,momentumEnabled,marketStats,proxyBudget,minCoverage,minBuffer,requireVerifiedBarriers,account?.account_type,tick]);
   // One attempt per fresh market tick. Never loop purchase requests on an idle state.
   useEffect(()=>{
     if(!running || !authorized || pending || openId!==null || trades>=num(maxTrades))return;
@@ -244,7 +254,7 @@ export default function AccumulatorPage() {
   const card='rounded-xl border border-white/10 bg-[#10192a] p-3';
   return <main className="min-h-screen bg-[#080e1b] px-3 py-4 text-slate-100"><div className="mx-auto max-w-6xl space-y-3">
     <header className="flex flex-wrap items-center justify-between gap-4"><div><div className="text-xs font-bold uppercase tracking-[.2em] text-cyan-300">DigitMatchStars / Trading Suite</div><h1 className="text-2xl font-black">Accumulator <span className="text-cyan-300">PRO</span></h1></div><Link href="/" className="rounded-xl border border-white/20 px-4 py-2">← Digit Match</Link></header>
-    <div className="grid grid-cols-2 gap-3 md:grid-cols-4">{[['ENGINE',running?'RUNNING':'STOPPED'],['ACCOUNT',account?.account_id??'LOGIN REQUIRED'],['OPEN CONTRACT',openId??'—'],['SESSION P/L',`${pnl.toFixed(2)} USD`]].map(([a,b])=><div key={String(a)} className={card}><div className="text-xs text-slate-400">{a}</div><div className="mt-2 break-all text-lg font-bold text-cyan-300">{b}</div></div>)}</div>
+    <div className="grid grid-cols-2 gap-3 md:grid-cols-4">{[['ENGINE',running?'RUNNING':'STOPPED'],['ACCOUNT',account?.account_id??'LOGIN REQUIRED'],['OPEN CONTRACT',openId??'—']].map(([a,b])=><div key={String(a)} className={card}><div className="text-xs text-slate-400">{a}</div><div className="mt-2 break-all text-lg font-bold text-cyan-300">{b}</div></div>)}<div className={card}><div className="text-xs text-slate-400">SESSION P/L</div><div className={`mt-2 text-xl font-black tabular-nums ${pnl>0?'text-green-400':pnl<0?'text-red-400':'text-white'}`}>{pnl>0?'+':pnl<0?'−':''}${Math.abs(pnl).toFixed(2)} USD</div></div></div>
     <div className="grid gap-3 lg:grid-cols-2"><section className={card}><h2 className="mb-2 text-base font-bold">01 / Trade configuration</h2><div className="mb-4 rounded-xl bg-slate-900 p-3 text-sm">{authorized?`● Connected to ${account?.account_type?.toUpperCase()} account ${account?.account_id}`:'○ Not connected — sign in through Digit Match first.'}</div><div className="grid gap-2 sm:grid-cols-2">
       <label className={label}>Symbol<input className={field} value={symbol} onChange={e=>setSymbol(e.target.value)} disabled={running||pending}/></label>
       <label className={label}>Stake (USD)<input className={field} type="number" min="0.01" step="0.01" value={stake} onChange={e=>setStake(e.target.value)} disabled={running||pending}/></label>
@@ -253,7 +263,7 @@ export default function AccumulatorPage() {
       <label className={label}>Max trades<input className={field} type="number" min="1" step="1" value={maxTrades} onChange={e=>setMaxTrades(e.target.value)} disabled={running||pending}/></label>
       <label className={label}>Max loss (USD)<input className={field} type="number" min="0.01" step="0.01" value={maxLoss} onChange={e=>setMaxLoss(e.target.value)} disabled={running||pending}/></label>
     </div>{account && account.account_type!=='demo' && <label className="mt-4 flex gap-2 rounded-xl border border-amber-400/30 p-3 text-sm text-amber-200"><input type="checkbox" checked={confirmLive} onChange={e=>setConfirmLive(e.target.checked)}/>I authorize real-money accumulator orders on this account.</label>}
-    <div className="mt-3 rounded-lg border border-white/10 p-2"><label className="flex items-center gap-2 text-xs font-bold"><input type="checkbox" checked={momentumEnabled} onChange={e=>setMomentumEnabled(e.target.checked)} disabled={running||pending}/> Momentum + historical barrier-survival proxy</label><div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4"><label className={label}>Min ticks<input className={field} type="number" min="10" max="120" value={minTicks} onChange={e=>setMinTicks(e.target.value)} disabled={running}/></label><label className={label}>Max vol %<input className={field} type="number" min="0.001" step="0.01" value={maxVolatility} onChange={e=>setMaxVolatility(e.target.value)} disabled={running}/></label><label className={label}>Min efficiency<input className={field} type="number" min="0" max="1" step="0.05" value={minEfficiency} onChange={e=>setMinEfficiency(e.target.value)} disabled={running}/></label><label className={label}>Cooldown ticks<input className={field} type="number" min="0" step="1" value={cooldownTicks} onChange={e=>setCooldownTicks(e.target.value)} disabled={running}/></label></div><div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3"><label className={label}>Excursion budget %<input className={field} type="number" min="0.0001" step="0.01" value={proxyBudget} onChange={e=>setProxyBudget(e.target.value)} disabled={running}/></label><label className={label}>Min historical coverage<input className={field} type="number" min="0" max="1" step="0.01" value={minCoverage} onChange={e=>setMinCoverage(e.target.value)} disabled={running}/></label><label className={label}>Actual barrier buffer %<input className={field} type="number" min="0" step="0.01" value={minBuffer} onChange={e=>setMinBuffer(e.target.value)} disabled={running}/></label></div><div className="mt-2 text-xs text-slate-300">{marketStats.samples} ticks · volatility {marketStats.volatility.toFixed(4)}% · efficiency {marketStats.efficiency.toFixed(2)} · max excursion {marketStats.excursion.toFixed(4)}% · historical coverage {(marketStats.coverage*100).toFixed(1)}% · <strong className={marketStats.ready?'text-emerald-400':'text-amber-300'}>{momentumEnabled?marketStats.reason:'Filter off'}</strong></div><p className="mt-1 text-[11px] text-slate-500">Historical excursions are a proxy, not Deriv contract barriers or a calibrated survival probability. The bot checks actual proposal bounds only when Deriv returns both. Profitability is unproven.</p></div>
+    <div className="mt-3 rounded-lg border border-white/10 p-2"><label className="flex items-center gap-2 text-xs font-bold"><input type="checkbox" checked={momentumEnabled} onChange={e=>setMomentumEnabled(e.target.checked)} disabled={running||pending}/> Momentum + historical barrier-survival proxy</label><div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4"><label className={label}>Min ticks<input className={field} type="number" min="10" max="120" value={minTicks} onChange={e=>setMinTicks(e.target.value)} disabled={running}/></label><label className={label}>Max vol %<input className={field} type="number" min="0.001" step="0.01" value={maxVolatility} onChange={e=>setMaxVolatility(e.target.value)} disabled={running}/></label><label className={label}>Min efficiency<input className={field} type="number" min="0" max="1" step="0.05" value={minEfficiency} onChange={e=>setMinEfficiency(e.target.value)} disabled={running}/></label><label className={label}>Cooldown ticks<input className={field} type="number" min="0" step="1" value={cooldownTicks} onChange={e=>setCooldownTicks(e.target.value)} disabled={running}/></label></div><div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3"><label className={label}>Excursion budget %<input className={field} type="number" min="0.0001" step="0.01" value={proxyBudget} onChange={e=>setProxyBudget(e.target.value)} disabled={running}/></label><label className={label}>Min historical coverage<input className={field} type="number" min="0" max="1" step="0.01" value={minCoverage} onChange={e=>setMinCoverage(e.target.value)} disabled={running}/></label><label className={label}>Actual barrier buffer %<input className={field} type="number" min="0" step="0.01" value={minBuffer} onChange={e=>setMinBuffer(e.target.value)} disabled={running}/></label></div><div className="mt-2 text-xs text-slate-300">{marketStats.samples} ticks · volatility {marketStats.volatility.toFixed(4)}% · efficiency {marketStats.efficiency.toFixed(2)} · max excursion {marketStats.excursion.toFixed(4)}% · {marketStats.paths} complete {marketStats.horizon}-tick paths · historical coverage {(marketStats.coverage*100).toFixed(1)}% · <strong className={marketStats.ready?'text-emerald-400':'text-amber-300'}>{momentumEnabled?marketStats.reason:'Filter off'}</strong></div><div className="mt-1 text-[11px] text-slate-500"><div className="mt-2 flex flex-wrap gap-1">{(momentumEnabled?marketStats.blockers:[]).map((reason,i)=><span key={`${reason}-${i}`} className="rounded border border-amber-400/30 bg-amber-400/10 px-2 py-1 text-[11px] font-semibold text-amber-200">{reason}</span>)}{momentumEnabled&&marketStats.ready&&<span className="rounded bg-emerald-500/15 px-2 py-1 text-[11px] font-bold text-emerald-400">ALL ENTRY FILTERS PASS</span>}</div><span>Historical excursions are a proxy, not Deriv contract barriers or a calibrated survival probability. The bot checks actual proposal bounds only when Deriv returns both. Profitability is unproven.</span></div></div>
     <div className="mt-2 flex items-center gap-2 text-xs text-amber-200"><input type="checkbox" checked={requireVerifiedBarriers} onChange={e=>setRequireVerifiedBarriers(e.target.checked)} disabled={running||pending||account?.account_type!=='demo'}/> Require actual Deriv proposal barriers before buying (recommended; mandatory on Live)</div>
     <div className="mt-3"><button onClick={()=>running?stop():start()} disabled={running?false:(!authorized||pending||openId!==null)} className={`w-full rounded-lg px-4 py-2.5 font-black disabled:opacity-40 ${running?'border border-rose-400/50 bg-rose-500/15 text-rose-300':'bg-emerald-400 text-slate-950'}`}>{running?'■ STOP TRADING':`▶ START ${account?.account_type?.toUpperCase()??'TRADING'}`}</button></div>{error && <div role="alert" className="mt-4 rounded-xl border border-rose-400/40 p-3 text-sm text-rose-200">{error}</div>}</section>
     <section className={card}><h2 className="mb-2 text-base font-bold">02 / Live execution</h2><div className="space-y-1">{[['Connection',authorized?'CONNECTED':'DISCONNECTED'],['Market',symbol],['Last quote',tick??'Waiting for ticks'],['Trades',`${trades} / ${maxTrades}`],['Order status',pending?'REQUEST IN FLIGHT':openId?'CONTRACT OPEN':running?'READY':'IDLE']].map(([a,b])=><div key={String(a)} className="flex justify-between gap-3 rounded-xl bg-[#080e1b] p-2"><span className="text-slate-400">{a}</span><strong className="break-all text-right">{b}</strong></div>)}</div><p className="mt-2 rounded-lg border border-amber-400/20 p-2 text-xs leading-5 text-amber-100">Stopping prevents new purchases; it does not sell an open accumulator. Closing this page or losing connection can interrupt contract monitoring. Check your Deriv open positions before restarting. Strategy profitability is not established.</p></section></div>
