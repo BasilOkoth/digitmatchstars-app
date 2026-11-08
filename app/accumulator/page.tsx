@@ -4,7 +4,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useDerivWSContext } from '@/components/custom/deriv-ws-provider';
 
 type Event = { time: string; message: string };
-type Contract = { contract_id?: number; is_sold?: number | boolean; profit?: number | string; status?: string; bid_price?: number; current_spot?: number };
+type Contract = { contract_id?: number; is_sold?: number | boolean; profit?: number | string; status?: string; bid_price?: number | string; buy_price?: number | string; sell_price?: number | string; payout?: number | string; current_spot?: number; limit_order?: {take_profit?: number | string}; transaction_ids?: {buy?: number; sell?: number} };
+type Audit = {contractId:number; account:string; symbol:string; stake:number; growth:number; requestedTakeProfit:number; proposalAsk:number; proposalPayout?:number; buyPrice?:number; settledProfit?:number; sellPrice?:number; status?:string; acceptedTakeProfit?:number; verified:boolean};
 const num = (v: string) => Number(v);
 export default function AccumulatorPage() {
   const {ws,isConnected,auth} = useDerivWSContext();
@@ -25,6 +26,10 @@ export default function AccumulatorPage() {
   const [tick,setTick] = useState<number|null>(null);
   const [events,setEvents] = useState<Event[]>([]);
   const [error,setError] = useState('');
+  const [audit,setAudit] = useState<Audit[]>([]);
+  const auditRef=useRef<Audit|null>(null);
+  const [lifetimePnl,setLifetimePnl] = useState(0);
+  const lifetimeRef=useRef(0);
   const runningRef=useRef(false);
   const busyRef=useRef(false);
   const openRef=useRef<number|null>(null);
@@ -42,6 +47,17 @@ export default function AccumulatorPage() {
     const profit=Number(c.profit);
     if(!Number.isFinite(profit)){stop('Settlement amount unavailable. Trading halted.');return;}
     pnlRef.current+=profit;setPnl(pnlRef.current);
+    lifetimeRef.current+=profit;setLifetimePnl(lifetimeRef.current);
+    const a=auditRef.current;
+    if(a && a.contractId===id){
+      const accepted=Number(c.limit_order?.take_profit);
+      const next:Audit={...a,settledProfit:profit,status:c.status ?? 'closed',sellPrice:Number.isFinite(Number(c.sell_price))?Number(c.sell_price):undefined,acceptedTakeProfit:c.limit_order?.take_profit!==undefined && Number.isFinite(accepted)?accepted:a.acceptedTakeProfit,verified:a.verified || (c.limit_order?.take_profit!==undefined && Math.abs(accepted-a.requestedTakeProfit)<0.005)};
+      setAudit(v=>[next,...v].slice(0,50));auditRef.current=null;
+      log(`AUDIT #${id}: requested TP $${a.requestedTakeProfit.toFixed(2)}; accepted TP ${next.acceptedTakeProfit===undefined?'not returned':`$${next.acceptedTakeProfit.toFixed(2)}`}; buy $${(next.buyPrice??a.proposalAsk).toFixed(2)}; exit ${next.sellPrice===undefined?'not returned':`$${next.sellPrice.toFixed(2)}`}; profit $${profit.toFixed(2)}; status ${next.status}.`);
+      if(next.acceptedTakeProfit!==undefined && Math.abs(next.acceptedTakeProfit-next.requestedTakeProfit)>0.005){stop('CRITICAL: Deriv contract take-profit differs from requested value. Trading halted.');}
+      // A winning settlement below the configured target needs manual inspection.
+      if(profit>0 && profit+0.005<a.requestedTakeProfit){stop('Unexpected early profitable settlement below requested take-profit. Trading halted for audit.');}
+    } else {stop('Settlement without matching purchase audit. Trading halted.');}
     log(`Contract ${id} settled: ${profit>=0?'+':''}${profit.toFixed(2)} USD (${c.status ?? 'closed'})`);
     if(tradesRef.current>=num(maxTrades) || pnlRef.current<=-num(maxLoss)) stop('Session limit reached.');
   },[log,maxLoss,maxTrades,stop]);
@@ -87,17 +103,23 @@ export default function AccumulatorPage() {
     busyRef.current=true;setPending(true);
     const epoch=session.current;
     try {
-      const response=await ws.send<{proposal?:{id?:string;ask_price?:number}} >({proposal:1,amount:num(stake),basis:'stake',contract_type:'ACCU',currency:'USD',underlying_symbol:symbol,growth_rate:num(growth),limit_order:{take_profit:num(takeProfit)}});
+      const requestedTP=num(takeProfit);
+      const requestedStake=num(stake);
+      log(`REQUEST: account ${accountRef.current}, ${symbol}, stake $${requestedStake.toFixed(2)}, growth ${(num(growth)*100).toFixed(0)}%, take-profit $${requestedTP.toFixed(2)}.`);
+      const response=await ws.send<{proposal?:{id?:string;ask_price?:number;payout?:number}} >({proposal:1,amount:num(stake),basis:'stake',contract_type:'ACCU',currency:'USD',underlying_symbol:symbol,growth_rate:num(growth),limit_order:{take_profit:num(takeProfit)}});
       const proposal=response.proposal;
       if(!proposal?.id || !Number.isFinite(Number(proposal.ask_price)))throw Error('Deriv returned an invalid proposal');
       if(epoch!==session.current || !runningRef.current)return;
       const price=Number(proposal.ask_price);
       if(price>num(stake)*1.02)throw Error('Proposal price exceeds configured stake tolerance');
-      log(`Buying ACCU at ${price.toFixed(2)} USD`);
+      log(`PROPOSAL: ask $${price.toFixed(2)}, id ${proposal.id}, payout ${proposal.payout??'not provided'}; buying ACCU.`);
       // Do not automatically retry an ambiguous buy response: it may have succeeded.
-      const result=await ws.send<{buy?:{contract_id?:number}}>({buy:proposal.id,price});
+      const result=await ws.send<{buy?:{contract_id?:number;buy_price?:number;price?:number}}>({buy:proposal.id,price});
       const id=Number(result.buy?.contract_id);
       if(!Number.isSafeInteger(id) || id<=0)throw Error('Buy response has no contract ID. Check positions before retrying.');
+      const actualBuy=Number(result.buy?.buy_price ?? result.buy?.price ?? price);
+      auditRef.current={contractId:id,account:accountRef.current,symbol,stake:requestedStake,growth:num(growth),requestedTakeProfit:requestedTP,proposalAsk:price,proposalPayout:proposal.payout,buyPrice:Number.isFinite(actualBuy)?actualBuy:undefined,verified:false};
+      log(`PURCHASE: contract #${id}; paid $${actualBuy.toFixed(2)}; requested take-profit $${requestedTP.toFixed(2)}. Awaiting Deriv contract details.`);
       openRef.current=id;setOpenId(id);
       tradesRef.current++;setTrades(tradesRef.current);
       log(`Contract ${id} opened; monitoring settlement.`);
@@ -116,6 +138,7 @@ export default function AccumulatorPage() {
     if(!authorized){setError('Log in to Deriv on Digit Match first.');return;}
     if(openRef.current!==null || busyRef.current){setError('A contract or order is still pending.');return;}
     if(![stake,takeProfit,maxTrades,maxLoss].every(v=>Number.isFinite(num(v))&&num(v)>0) || !Number.isInteger(num(maxTrades))){setError('Enter valid positive trade limits.');return;}
+    if(num(takeProfit)<0.01){setError('Take-profit must be a positive USD amount.');return;}
     if(num(maxLoss)<num(stake)){setError('Maximum loss must be at least one stake.');return;}
     if(account?.account_type!=='demo' && !confirmLive){setError('Confirm real-money trading before starting.');return;}
     tradesRef.current=0;pnlRef.current=0;setTrades(0);setPnl(0);
@@ -138,6 +161,7 @@ export default function AccumulatorPage() {
     </div>{account && account.account_type!=='demo' && <label className="mt-4 flex gap-2 rounded-xl border border-amber-400/30 p-3 text-sm text-amber-200"><input type="checkbox" checked={confirmLive} onChange={e=>setConfirmLive(e.target.checked)}/>I authorize real-money accumulator orders on this account.</label>}
     <div className="mt-5 flex gap-3"><button onClick={start} disabled={!authorized||running||pending||openId!==null} className="flex-1 rounded-xl bg-cyan-400 px-4 py-3 font-black text-slate-950 disabled:opacity-40">▶ START {account?.account_type?.toUpperCase()??'TRADING'}</button><button onClick={()=>stop()} disabled={!running} className="rounded-xl border border-rose-400/40 px-4 py-3 font-bold text-rose-300 disabled:opacity-40">■ STOP</button></div>{error && <div role="alert" className="mt-4 rounded-xl border border-rose-400/40 p-3 text-sm text-rose-200">{error}</div>}</section>
     <section className={card}><h2 className="mb-4 text-xl font-bold">02 / Live execution</h2><div className="space-y-3">{[['Connection',authorized?'CONNECTED':'DISCONNECTED'],['Market',symbol],['Last quote',tick??'Waiting for ticks'],['Trades',`${trades} / ${maxTrades}`],['Order status',pending?'REQUEST IN FLIGHT':openId?'CONTRACT OPEN':running?'READY':'IDLE']].map(([a,b])=><div key={String(a)} className="flex justify-between gap-3 rounded-xl bg-[#080e1b] p-4"><span className="text-slate-400">{a}</span><strong className="break-all text-right">{b}</strong></div>)}</div><p className="mt-5 rounded-xl border border-amber-400/20 p-4 text-sm leading-6 text-amber-100">Stopping prevents new purchases; it does not sell an open accumulator. Closing this page or losing connection can interrupt contract monitoring. Check your Deriv open positions before restarting. Strategy profitability is not established.</p></section></div>
-    <section className={card}><h2 className="mb-3 text-xl font-bold">03 / Execution events</h2><div className="max-h-80 min-h-32 space-y-2 overflow-auto font-mono text-xs">{events.length?events.slice().reverse().map((e,i)=><div key={i} className="rounded-lg bg-[#080e1b] p-3"><span className="text-cyan-300">{e.time}</span> {e.message}</div>):'No events yet.'}</div></section>
+    <section className={card}><h2 className="mb-3 text-xl font-bold">03 / Contract audit</h2><p className="mb-3 text-sm text-slate-400">Each order records the exact take-profit requested. Accepted values are shown only when returned by Deriv; an absent value is not confirmation. Cumulative P/L across starts this page: <strong className="text-cyan-300">${lifetimePnl.toFixed(2)}</strong>.</p><div className="overflow-x-auto"><table className="w-full min-w-[680px] text-left text-xs"><thead><tr className="text-slate-400">{['Contract','Requested TP','Deriv TP','Stake','Buy','Exit','Profit','Status'].map(h=><th key={h} className="p-2">{h}</th>)}</tr></thead><tbody>{audit.map(a=><tr key={a.contractId} className="border-t border-white/10"><td className="p-2">{a.contractId}</td><td className="p-2">${a.requestedTakeProfit.toFixed(2)}</td><td className="p-2">{a.acceptedTakeProfit===undefined?'Not returned':`$${a.acceptedTakeProfit.toFixed(2)}`}</td><td className="p-2">${a.stake.toFixed(2)}</td><td className="p-2">${(a.buyPrice??a.proposalAsk).toFixed(2)}</td><td className="p-2">{a.sellPrice===undefined?'—':`$${a.sellPrice.toFixed(2)}`}</td><td className="p-2">{a.settledProfit?.toFixed(2)??'—'}</td><td className="p-2">{a.status??'—'}</td></tr>)}</tbody></table></div>{!audit.length&&<p className="text-sm text-slate-400">No completed trades recorded on this page yet.</p>}</section>
+    <section className={card}><h2 className="mb-3 text-xl font-bold">04 / Execution events</h2><div className="max-h-80 min-h-32 space-y-2 overflow-auto font-mono text-xs">{events.length?events.slice().reverse().map((e,i)=><div key={i} className="rounded-lg bg-[#080e1b] p-3"><span className="text-cyan-300">{e.time}</span> {e.message}</div>):'No events yet.'}</div></section>
   </div></main>;
 }
