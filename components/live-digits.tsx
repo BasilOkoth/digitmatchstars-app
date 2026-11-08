@@ -7,6 +7,7 @@
  * (/edit) so the editor preview is fully live.
  */
 
+import Link from 'next/link';
 import { useDigitsTrading } from '../hooks/use-digits-trading';
 import { useDerivWSContext } from '@/components/custom/deriv-ws-provider';
 import { useLogoSrc } from '@/components/custom/logo-src-provider';
@@ -55,6 +56,7 @@ export function LiveDigits({
   return (
     <DigitScoreProvider tick={trading.currentTick} pipSize={trading.pipSize} symbol={trading.activeSymbol?.underlying_symbol ?? ''}>
     <>
+    {!editMode && <div className="mx-auto max-w-[1500px] px-3 pt-3"><Link href="/accumulator" className="inline-block rounded-md border px-4 py-2 text-sm font-semibold hover:bg-muted">Accumulator Mode · Demo / Live setup</Link></div>}
     <div className="mx-auto grid w-full max-w-[1500px] grid-cols-1 items-start gap-2 px-2 pt-2 xl:grid-cols-[minmax(0,1fr)_minmax(390px,0.8fr)] xl:gap-3 xl:px-4">
       <div className="min-w-0">
     <DigitsView
