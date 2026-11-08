@@ -24,6 +24,10 @@ class TestAccumulatorSafety(unittest.IsolatedAsyncioTestCase):
         self.bot.contract_update({'contract_id':123,'is_sold':1,'profit':-.5,'status':'lost'})
         self.assertEqual(self.bot.pnl,-.5)
         self.assertIsNone(self.bot.open_id)
+    async def test_unsolicited_contract_update_is_ignored(self):
+        self.bot.contract_update({'contract_id':999,'is_sold':1,'profit':-4,'status':'lost'})
+        self.assertEqual(self.bot.pnl,0)
+        self.assertIsNone(self.bot.open_id)
     async def test_stale_signal_does_not_purchase(self):
         self.bot.buy_in_flight=True;self.bot.entry_tick=1;self.bot.tick_no=5
         calls=[]

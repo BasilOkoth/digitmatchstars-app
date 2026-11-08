@@ -45,7 +45,7 @@ class Bot:
 
     def contract_update(self,p):
         cid=p.get('contract_id')
-        if not cid or (self.open_id is not None and str(cid)!=str(self.open_id)):return
+        if not cid or self.open_id is None or str(cid)!=str(self.open_id):return
         if p.get('is_sold') or p.get('is_expired') or p.get('status') in ('won','lost','sold'):
             profit=float(p.get('profit') or 0)
             if self.open_id is not None:
@@ -93,7 +93,12 @@ class Bot:
             bought=(await self.send({'buy':pid,'price':round(ask*1.001,2)}))['buy']
             self.open_id=bought['contract_id'];self.trades+=1;self.last_trade_tick=self.tick_no
             self.log('bought',contract_id=self.open_id,stake=self.c.stake,price=bought.get('buy_price'),growth=self.c.growth,trade_number=self.trades)
-            await self.send({'proposal_open_contract':1,'contract_id':self.open_id,'subscribe':1})
+            try:
+                await self.send({'proposal_open_contract':1,'contract_id':self.open_id,'subscribe':1})
+            except Exception as monitor_error:
+                self.stopped=True
+                self.log('monitor_subscription_failed',contract_id=self.open_id,error=str(monitor_error),note='Contract may remain open; inspect Deriv account immediately')
+                return
         except Exception as e:
             self.log('purchase_error',error=str(e))
             # An unknown buy outcome must not be treated as safely flat.
