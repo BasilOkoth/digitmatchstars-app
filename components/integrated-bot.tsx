@@ -578,25 +578,15 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       Momentum {topMomentum===null?'warming up':`${topMomentum>=0?'+':''}${topMomentum.toFixed(2)}`}
     </span>
     <span className="text-slate-300">{strategy==='MOMENTUM_LOCK' ? 'Locked target' : 'V1 target'} {winConfirmed.current ? '—' : (strategy==='MOMENTUM_LOCK' ? lockRef.current?.digit ?? '—' : scores[0]?.digit ?? '—')}</span>
-    <span className="text-cyan-300">Target V1 score {targetScore===null?'—':targetScore.toFixed(2)} / min {threshold}</span>
-    <span className="text-cyan-300">Target momentum {targetMomentum===null?'—':`${targetMomentum>=0?'+':''}${targetMomentum.toFixed(2)}`} · rises {targetRises??'—'}/3</span>
-    <span className="text-slate-300">Target forecast {targetProbability===null?'—':`${(targetProbability*100).toFixed(2)}%`}</span>
     <span className="text-slate-400">Open {outstandingCount} · ACK pending {inFlightCount} · At risk ${riskExposure.toFixed(2)}</span>
     {matchPaused && <strong className="text-yellow-300">MATCH HOLD · awaiting verified settlement</strong>}
-    {lastTiming && <span className="text-slate-300" title="Derived from the Deriv purchase acknowledgment and contract settlement; observed market ticks do not themselves prove contract expiry">Last contract #{lastTiming.contractId} · target {lastTiming.target} · signal #{lastTiming.signalSequence} · dispatch {lastTiming.submitMs} ms · ACK {lastTiming.buyMs} ms / {lastTiming.ackTicks} ticks · Deriv entry {lastTiming.entryDigit??'unknown'} · expiry {lastTiming.expiryDigit??'unknown'} · {lastTiming.result}</span>}
     {active.current && <span className={/awaiting settlement/i.test(entryStatus) ? "font-semibold text-yellow-400" : "text-slate-400"}>{entryStatus}</span>}
 
     {mode==='UNCERTAIN'&&<span className="font-bold text-amber-300">Settlement needs verification</span>}
   </div>
-  <div className="mt-2 rounded-md border border-slate-700/70 p-2 text-xs text-slate-300">
-    <div className="flex flex-wrap items-center justify-between gap-2">
-      <span>Eligible V1 NEXT-tick accuracy: <strong className="text-white">{accuracyAudit.trials ? `${(100*accuracyAudit.hits/accuracyAudit.trials).toFixed(1)}%` : '—'}</strong> ({accuracyAudit.hits}/{accuracyAudit.trials}) · 95% lower bound {(accuracyAudit.lower95*100).toFixed(1)}% · random benchmark 10%</span>
-      <label className="flex items-center gap-1.5"><input type="checkbox" checked={requireEvidence} disabled={active.current || pending.current || outstandingCount>0} onChange={e=>setRequireEvidence(e.target.checked)} />Require measured edge before purchases</label>
-    </div>
-    {intelligenceAudit && <div className="mt-1 text-[10px] text-cyan-200">All-10 digit audit: {intelligenceAudit.topHits}/{intelligenceAudit.trials} top-1 hits ({(intelligenceAudit.topHitRate*100).toFixed(1)}%) · Brier {intelligenceAudit.brier.toFixed(3)} vs uniform {intelligenceAudit.uniformBrier.toFixed(3)} · log loss {intelligenceAudit.logLoss.toFixed(3)} · leading probability {scores.length && 'probability' in scores[0] ? ((scores[0] as any).probability*100).toFixed(1)+'%' : '—'}. Online expert weights: {Object.entries(intelligenceAudit.weights).map(([k,v])=>`${k} ${(v*100).toFixed(0)}%`).join(' · ')}.</div>}
-    {executionAudit && <div className="mt-1 text-[10px] text-emerald-200">Execution-aware research (observed-tick horizons, NOT verified expiry timing): {executionAudit.horizons.map(h=>`+${h.horizon}: ${h.hits}/${h.trials} (${(h.hitRate*100).toFixed(1)}%, lower 95% ${(h.lower95*100).toFixed(1)}%)`).join(' · ')}. ACK samples {executionAudit.ackSamples} · verified contracts {executionAudit.verifiedTrades} ({executionAudit.verifiedWins} wins).</div>}
-    {intelligenceAudit && <div className="mt-1 text-[10px] text-amber-200">Forward validation: momentum-qualified {intelligenceAudit.eligibleHits}/{intelligenceAudit.eligibleTrials} ({intelligenceAudit.eligibleTrials?(100*intelligenceAudit.eligibleHits/intelligenceAudit.eligibleTrials).toFixed(1):'0.0'}%; lower 95% {(100*intelligenceAudit.eligibleLower95).toFixed(1)}%). Entropy regimes: {(['LOW','MID','HIGH'] as const).map(k=>`${k} ${intelligenceAudit.regimes[k].hits}/${intelligenceAudit.regimes[k].trials} (${(100*intelligenceAudit.regimes[k].rate).toFixed(1)}%)`).join(' · ')}. Lower log loss is better; uniform baseline {intelligenceAudit.uniformLogLoss.toFixed(3)}.</div>}
-    <p className="mt-1 text-[10px] text-slate-400">Optional evidence gate: when enabled, the bot waits for 150 eligible V1 next-tick observations and a 95% lower confidence bound above 10%. This is not proof of profitability; quoted break-even may be much higher. Demo-test before any live trading.</p>
+  <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-slate-700/70 p-2 text-xs text-slate-300">
+    <span>Measured next-tick accuracy: <strong className="text-white">{accuracyAudit.trials ? `${(100*accuracyAudit.hits/accuracyAudit.trials).toFixed(1)}%` : '—'}</strong> ({accuracyAudit.hits}/{accuracyAudit.trials})</span>
+    <label className="flex items-center gap-1.5"><input type="checkbox" checked={requireEvidence} disabled={active.current || pending.current || outstandingCount>0} onChange={e=>setRequireEvidence(e.target.checked)} />Require measured edge</label>
   </div>
   <div className="mt-2 flex items-center gap-2">
     <button
@@ -606,7 +596,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     >{active.current ? '■ STOP CYCLE' : '▶ START CYCLE'}</button>
     <button aria-label={sound?'Mute sounds':'Enable sounds'} title={sound?'Mute':'Unmute'} onClick={()=>{setSound(v=>!v);if(!sound)tone('buy')}} className="flex h-8 w-8 items-center justify-center rounded-md border border-slate-700 bg-slate-900 text-xs text-emerald-300">{sound?'🔊':'🔇'}</button>
   </div>
-  {lastOutcome&&<div className={`mt-3 rounded-lg border p-3 ${lastOutcome.outcome==='WIN'?'border-emerald-400 bg-emerald-500/20 text-emerald-300 shadow-lg shadow-emerald-950/30':'border-rose-500 bg-rose-500/10 text-rose-300'}`}><strong className="text-xl font-black tracking-wide">{lastOutcome.outcome==='WIN'?'🟢 WIN':'🔴 LOSS'} {lastOutcome.profit>=0?'+':''}${lastOutcome.profit.toFixed(2)}</strong><span className="ml-3 text-xs">Verified contract #{lastOutcome.id} · target {lastOutcome.digit} · expiry {lastOutcome.expiryDigit??'unavailable'} · signal tick {lastOutcome.signalEpoch} · buy {lastOutcome.purchaseEpoch??'unavailable'} · expiry time {lastOutcome.expiryEpoch??'unavailable'}</span></div>}
+  {lastOutcome&&<div className={`mt-3 rounded-lg border p-3 ${lastOutcome.outcome==='WIN'?'border-emerald-400 bg-emerald-500/20 text-emerald-300 shadow-lg shadow-emerald-950/30':'border-rose-500 bg-rose-500/10 text-rose-300'}`}><strong className="text-xl font-black tracking-wide">{lastOutcome.outcome==='WIN'?'🟢 WIN':'🔴 LOSS'} {lastOutcome.profit>=0?'+':''}${lastOutcome.profit.toFixed(2)}</strong><span className="ml-3 text-xs">Contract #{lastOutcome.id} · target {lastOutcome.digit}</span></div>}
   {err&&<div role="alert" className="mt-3 rounded-lg border border-amber-500 p-2 text-xs text-amber-300">{err}{mode==='UNCERTAIN'?' — Purchase outcome requires verification in Deriv before restarting.':''}</div>}
 
  </div></section>
