@@ -11,7 +11,8 @@ import type {Tick,DerivWS} from '@deriv/core';
 type Mode='IDLE'|'RUNNING'|'BUYING'|'SETTLING'|'WIN'|'MAX_TRADES'|'MAX_LOSS'|'UNCERTAIN'|'STOPPED';
 type Outcome={id:number;digit:number;stake:number;payout:number;profit:number;outcome:'WIN'|'LOSS';expiryDigit:number|null;expiryEpoch:number|null;signalEpoch:number;purchaseEpoch:number|null};
 type Strategy='DYNAMIC'|'MOMENTUM_LOCK';
-type MomentumTrade = {strategy?:Strategy;lockTick?:number;lockDuration?:number;signalEpoch?:number;purchaseEpoch?:number|null;expiryEpoch?:number|null;expiryDigit?:number|null;signalSequence?:number;signalToSubmitMs?:number;buyAcknowledgmentMs?:number;ticksDuringAcknowledgment?:number;signalAgeBudgetMs?:number;entryEpoch?:number|null;entryDigit?:number|null;entrySpot?:string|null;exitSpot?:string|null;recordType:'TRADE';contractId:number;accountId:string;symbol:string;timestamp:string;targetDigit:number;score:number;momentum3:number;positiveSteps:number;momentumRising:boolean;threshold:number;stake:number;payout:number;profit:number;outcome:'WIN'|'LOSS'};
+type EntryKind='NEXT'|'SOON';
+type MomentumTrade = {entryKind?:EntryKind;soonHorizon?:number;entryDelayTicks?:number|null;strategy?:Strategy;lockTick?:number;lockDuration?:number;signalEpoch?:number;purchaseEpoch?:number|null;expiryEpoch?:number|null;expiryDigit?:number|null;signalSequence?:number;signalToSubmitMs?:number;buyAcknowledgmentMs?:number;ticksDuringAcknowledgment?:number;signalAgeBudgetMs?:number;entryEpoch?:number|null;entryDigit?:number|null;entrySpot?:string|null;exitSpot?:string|null;recordType:'TRADE';contractId:number;accountId:string;symbol:string;timestamp:string;targetDigit:number;score:number;momentum3:number;positiveSteps:number;momentumRising:boolean;threshold:number;stake:number;payout:number;profit:number;outcome:'WIN'|'LOSS'};
 // Prefer the current Deriv spot fields. When Deriv returns a numeric spot,
 // the symbol's pip precision restores trailing zeroes consistently.
 const spotDigit=(spot:unknown,precision:number):number|null=>{
@@ -40,7 +41,12 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const intelligenceRef=useRef(new NextTickIntelligence());
  const soonAuditRef=useRef(new SoonForecastAudit());
  const [soonView,setSoonView]=useState<{digit:number;horizon:SoonHorizon;momentum:number;rate:number;trials:number}|null>(null);
- const [entrySignal,setEntrySignal]=useState<'NEXT'|'SOON'|null>(null);
+ const [entrySignal,setEntrySignal]=useState<EntryKind|null>(null);
+ // A SOON signal stays frozen for its measured arrival window. Refreshing a
+ // forecast cannot silently extend the window or change its target.
+ const soonLockRef=useRef<{digit:number;createdSequence:number;expiresSequence:number;horizon:SoonHorizon}|null>(null);
+ const [soonLockView,setSoonLockView]=useState<string|null>(null);
+ const [entryTimingView,setEntryTimingView]=useState<string|null>(null);
  const executionForecastRef=useRef(new ExecutionAwareForecast());
  const [executionAudit,setExecutionAudit]=useState<ReturnType<ExecutionAwareForecast['audit']>|null>(null);
  const [horizonTarget,setHorizonTarget]=useState<number|null>(null);
@@ -126,8 +132,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const soundRef=useRef(sound);useEffect(()=>{soundRef.current=sound},[sound]);
  const play=useCallback((kind:'buy'|'win'|'loss')=>{if(soundRef.current)tone(kind)},[]);
  const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;lockRef.current=null;setLockPosition(0);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
- useEffect(()=>{if(scope.current!==scopeKey){const unsettled=outstanding.current.size>0||pendingCount.current>0||uncertainPurchase.current;scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];intelligenceRef.current.reset();soonAuditRef.current.reset();setSoonView(null);setEntrySignal(null);executionForecastRef.current.reset();setLastTiming(null);setExecutionAudit(null);setHorizonTarget(null);setHorizonProbability(null);setIntelligenceAudit(null);nextTickPending.current=null;eligibleResults.current=[];setAccuracyAudit({trials:0,hits:0,lower95:0});if(!unsettled)confirmedLosses.current=0;lockRef.current=null;setLockPosition(0);setTopMomentum(null);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);lockedRef.current=null;if(!unsettled){countRef.current=0;setSentCount(0);lossBlockRef.current=0;pnlRef.current=0;}if(!unsettled){pending.current=false;pendingCount.current=0;inFlight.current.clear();matchPause.current=false;setMatchPaused(false);setInFlightCount(0);reservedStake.current=0;setRiskExposure(0);uncertainPurchase.current=false;}lastTickKey.current='';if(!unsettled)matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(unsettled?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(unsettled)setErr('Account/symbol changed with a pending or unsettled order. Reconcile on Deriv before restarting.');else setErr('')}},[scopeKey,setTarget]);
- const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,firstLockMatch:boolean)=>{
+ useEffect(()=>{if(scope.current!==scopeKey){const unsettled=outstanding.current.size>0||pendingCount.current>0||uncertainPurchase.current;scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];intelligenceRef.current.reset();soonAuditRef.current.reset();soonLockRef.current=null;setSoonLockView(null);setEntryTimingView(null);setSoonView(null);setEntrySignal(null);executionForecastRef.current.reset();setLastTiming(null);setExecutionAudit(null);setHorizonTarget(null);setHorizonProbability(null);setIntelligenceAudit(null);nextTickPending.current=null;eligibleResults.current=[];setAccuracyAudit({trials:0,hits:0,lower95:0});if(!unsettled)confirmedLosses.current=0;lockRef.current=null;setLockPosition(0);setTopMomentum(null);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);lockedRef.current=null;if(!unsettled){countRef.current=0;setSentCount(0);lossBlockRef.current=0;pnlRef.current=0;}if(!unsettled){pending.current=false;pendingCount.current=0;inFlight.current.clear();matchPause.current=false;setMatchPaused(false);setInFlightCount(0);reservedStake.current=0;setRiskExposure(0);uncertainPurchase.current=false;}lastTickKey.current='';if(!unsettled)matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(unsettled?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(unsettled)setErr('Account/symbol changed with a pending or unsettled order. Reconcile on Deriv before restarting.');else setErr('')}},[scopeKey,setTarget]);
+ const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,firstLockMatch:boolean,entryKind:EntryKind,soonHorizon:number|null)=>{
   if(!ws||!accountId||halt.current||!active.current||winConfirmed.current||uncertainPurchase.current||matchPause.current||countRef.current>=Number(limit))return;
   // Never replay ticks skipped while a previous buy was in flight.
   if(signalSequence<=lastBuySignalSequence.current)return;
@@ -198,6 +204,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const bought=await buyPromise;
    const buyMs=Math.round(performance.now()-buyStart);
    const ticksDuringAcknowledgment=Math.max(0,tickSequence.current-signalSequence);
+   setEntryTimingView(`${entryKind} target ${predicted} · dispatch ${signalToSubmitMs} ms · ACK ${buyMs} ms / ${ticksDuringAcknowledgment} observed ticks · entry pending verification`);
    executionForecastRef.current.observeAcknowledgment(ticksDuringAcknowledgment);
    const acknowledgedAt=performance.now();
    signalTimingRef.current={signalToSubmitMs,acknowledgmentMs:buyMs,ticksDuringAck:ticksDuringAcknowledgment};
@@ -267,6 +274,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      const entryDigit=spotDigit(entrySpot,pipSize);
      const expiryEpochRaw=Number(settle.exit_spot_time??settle.exit_tick_time);
      const expiryEpoch=Number.isFinite(expiryEpochRaw)&&expiryEpochRaw>0?expiryEpochRaw:null;
+     setEntryTimingView(`${entryKind} #${id} · dispatch ${signalToSubmitMs} ms · ACK ${buyMs} ms / ${ticksDuringAcknowledgment} ticks · entry ${entryDigit??'unknown'} · expiry ${expiryDigit??'unknown'} · ${win?'WIN':'LOSS'}`);
      setLastTiming({contractId:id,target:predicted,signalSequence,ackTicks:ticksDuringAcknowledgment,
        submitMs:signalToSubmitMs,buyMs:Math.round(acknowledgedAt-buyStart),entryDigit,expiryDigit,
        result:win?'WIN':'LOSS'});
@@ -281,7 +289,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
        : ` · ${alignedTicks.length>1?'multiple same-second ticks':'expiry tick not in browser buffer'} (no browser match inferred)`;
      setSyncStatus(`Contract #${id}: target ${predicted} · expiry ${expiryDigit??'unknown'} at ${expiryEpoch??'unknown'} · ${win?'WIN':'LOSS'} (Deriv verified)${observationResult}`);
      setLastOutcome(old=>old?.outcome==='WIN'&&!win?old:{id,digit:predicted,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS',expiryDigit,expiryEpoch,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch});play(win?'win':'loss');
-     const journalRow:MomentumTrade={signalSequence,signalToSubmitMs,ticksDuringAcknowledgment,signalAgeBudgetMs:Math.max(100,Math.min(350,(tickCadence.current.intervalMs??1000)*0.35)),buyAcknowledgmentMs:Math.round(acknowledgedAt-buyStart),entryEpoch,entryDigit,entrySpot:entrySpot===null?null:String(entrySpot),exitSpot:settle.exit_spot===undefined?null:String(settle.exit_spot),strategy:entryStrategy,lockTick,lockDuration:lockWindow,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch,expiryEpoch,expiryDigit,recordType:'TRADE',contractId:id,accountId,symbol,timestamp:new Date().toISOString(),targetDigit:predicted,score:signal.score,momentum3:signal.momentum3,positiveSteps:signal.positiveSteps,momentumRising:signal.momentum3>0&&signal.positiveSteps>=2,threshold:signal.threshold,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS'};
+     const journalRow:MomentumTrade={entryKind,soonHorizon:entryKind==='SOON'?soonHorizon??undefined:undefined,entryDelayTicks:entryEpoch===null?null:Math.max(0,entryEpoch-tickEpoch),signalSequence,signalToSubmitMs,ticksDuringAcknowledgment,signalAgeBudgetMs:Math.max(100,Math.min(350,(tickCadence.current.intervalMs??1000)*0.35)),buyAcknowledgmentMs:Math.round(acknowledgedAt-buyStart),entryEpoch,entryDigit,entrySpot:entrySpot===null?null:String(entrySpot),exitSpot:settle.exit_spot===undefined?null:String(settle.exit_spot),strategy:entryStrategy,lockTick,lockDuration:lockWindow,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch,expiryEpoch,expiryDigit,recordType:'TRADE',contractId:id,accountId,symbol,timestamp:new Date().toISOString(),targetDigit:predicted,score:signal.score,momentum3:signal.momentum3,positiveSteps:signal.positiveSteps,momentumRising:signal.momentum3>0&&signal.positiveSteps>=2,threshold:signal.threshold,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS'};
      try{const key=`dms-momentum-trades:v1:${symbol}`;const prev=JSON.parse(localStorage.getItem(key)||'[]');const rows=Array.isArray(prev)?prev:[];if(!rows.some((x:MomentumTrade)=>x.contractId===id&&x.accountId===accountId))localStorage.setItem(key,JSON.stringify([...rows.slice(-4999),journalRow]))}catch{}
      // Settlement runs in the background; only confirmed settlement frees the slot.
      if(matchPause.current)setEntryStatus('Matched tick observed · verifying all unsettled contracts');
@@ -499,9 +507,27 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // In lock mode, retain the existing lock until expiry; a new SOON signal
    // can initialize it when NEXT has no qualified candidate.
    const nextCandidate=top && qualified.some(row=>row.digit===top.digit)?top:null;
-   const choice=nextCandidate??soonCandidate;
-   const choiceKind:'NEXT'|'SOON'=nextCandidate?'NEXT':'SOON';
-   if(!choice){setEntryStatus('No NEXT or SOON momentum-qualified digit');return}
+   // Keep a SOON target for its ORIGINAL horizon; do not reset its expiry on
+   // every tick. A new target can only be created after expiry or invalidation.
+   let soonLock=soonLockRef.current;
+   if(soonLock && (sequence>soonLock.expiresSequence || digit===soonLock.digit)){
+     soonLock=null;soonLockRef.current=null;
+   }
+   if(!soonLock && soonCandidate && digit!==soonCandidate.digit){
+     soonLock={digit:soonCandidate.digit,createdSequence:sequence,expiresSequence:sequence+soonHorizon,horizon:soonHorizon};
+     soonLockRef.current=soonLock;
+   }
+   if(sequence%3===0){
+     const label=soonLock?`SOON lock ${soonLock.digit} · ${Math.max(0,soonLock.expiresSequence-sequence)} ticks left`:'No active SOON lock';
+     queueMicrotask(()=>setSoonLockView(label));
+   }
+   // NEXT has priority if qualified. Otherwise the still-valid SOON lock
+   // gets an opportunity on EACH fresh tick, subject to current momentum,
+   // exposure, stale-signal and match-hold safety gates.
+   const lockedSoonCandidate=soonLock?ranking.find(row=>row.digit===soonLock.digit)??null:null;
+   const choice=nextCandidate??lockedSoonCandidate;
+   const choiceKind:EntryKind=nextCandidate?'NEXT':'SOON';
+   if(!choice){setEntryStatus('No qualified NEXT or active SOON target');return}
    if(settings.strategy==='MOMENTUM_LOCK' && !selected){
      selected={digit:choice.digit,elapsed:1,signal:{score:choice.score,momentum3:choice.momentum3,positiveSteps:choice.positiveSteps,threshold:Number(settings.threshold)}};
      lockRef.current=selected;setLockPosition(1);
@@ -527,7 +553,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // Deliberately do not reject V1 purely for an uncalibrated 10% probability
    // estimate. Such thresholds are evaluated offline against actual outcomes.
    const signal={score:chosenForecast.score,momentum3:ownMomentum,positiveSteps:ownRises,threshold:Number(settings.threshold)};
-   const signalKind=target===choice.digit?choiceKind:'SOON';
+   const signalKind:EntryKind=target===choice.digit?choiceKind:'SOON';
    const lockTick=settings.strategy==='MOMENTUM_LOCK'?selected!.elapsed:0;
    // Never enter on a market tick whose observed last digit equals the target.
    // This is an ENTRY rule, not an assumption about a Deriv contract outcome.
@@ -550,7 +576,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    lastSignalDispatchMs.current=receivedAt;
    lockedRef.current=target;
    queueMicrotask(()=>setEntrySignal(signalKind));
-   void execRef.current(target,stake,signal,epoch,sequence,receivedAt,settings.strategy,lockTick,settings.strategy==='MOMENTUM_LOCK'?Number(settings.lockDuration):0,firstLockMatch);
+   void execRef.current(target,stake,signal,epoch,sequence,receivedAt,settings.strategy,lockTick,settings.strategy==='MOMENTUM_LOCK'?Number(settings.lockDuration):0,firstLockMatch,signalKind,signalKind==='SOON'?soonLockRef.current?.horizon??null:null);
    queueMicrotask(()=>{
      if(scope.current!==telemetryScope)return;
      setLockedDigit(target);setTarget(target);
@@ -601,7 +627,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     </span>
     <span className="text-slate-300">{strategy==='MOMENTUM_LOCK' ? 'Locked target (next tick)' : 'V1 next-tick target'} {winConfirmed.current ? '—' : (strategy==='MOMENTUM_LOCK' ? lockRef.current?.digit ?? '—' : scores[0]?.digit ?? '—')}</span>
     {soonView&&<span className="text-sky-300">SOON {soonView.digit} · within {soonView.horizon} ticks · momentum +{soonView.momentum.toFixed(2)} · observed {soonView.trials?`${(soonView.rate*100).toFixed(1)}% / ${soonView.trials}`:'warming up'} (appearance, not contract win)</span>}
+    {soonLockView&&<span className="text-cyan-300">{soonLockView}</span>}
     {entrySignal&&<span className="font-semibold text-white">Last entry signal: {entrySignal}</span>}
+    {entryTimingView&&<span className="text-amber-200">Timing: {entryTimingView}</span>}
     <span className="text-slate-400">Open {outstandingCount} · ACK pending {inFlightCount} · At risk ${riskExposure.toFixed(2)}</span>
     {matchPaused && <strong className="text-yellow-300">MATCH HOLD · awaiting verified settlement</strong>}
     {active.current && <span className={/awaiting settlement/i.test(entryStatus) ? "font-semibold text-yellow-400" : "text-slate-400"}>{entryStatus}</span>}
