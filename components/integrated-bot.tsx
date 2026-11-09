@@ -12,7 +12,7 @@ type Mode='IDLE'|'RUNNING'|'BUYING'|'SETTLING'|'WIN'|'MAX_TRADES'|'MAX_LOSS'|'UN
 type Outcome={id:number;digit:number;stake:number;payout:number;profit:number;outcome:'WIN'|'LOSS';expiryDigit:number|null;expiryEpoch:number|null;signalEpoch:number;purchaseEpoch:number|null};
 type Strategy='DYNAMIC'|'MOMENTUM_LOCK';
 type EntryKind='NEXT'|'SOON';
-type TickDecision={sequence:number;epoch:number;observedDigit:number;target:number|null;lockOriginSequence:number|null;status:'ELIGIBLE'|'SENT'|'ACCEPTED'|'SKIPPED'|'REJECTED'|'UNCERTAIN';reason:string;contractId:number|null;at:string};
+type TickDecision={sequence:number;epoch:number;observedDigit:number;target:number|null;lockOriginSequence:number|null;status:'ELIGIBLE'|'SENT'|'ACCEPTED'|'SETTLED'|'SKIPPED'|'REJECTED'|'UNCERTAIN';reason:string;contractId:number|null;entryDigit?:number|null;entryEpoch?:number|null;expiryDigit?:number|null;expiryEpoch?:number|null;result?:'WIN'|'LOSS';at:string};
 type FrozenEntryTrace={strategy:Strategy;lockSource:EntryKind|null;signalKind:EntryKind;target:number;nextDigit:number|null;soonDigit:number|null;soonLockedDigit:number|null;soonHorizon:number|null;signalSequence:number;signalEpoch:number;signalObservedDigit:number;signalReceivedAtIso:string;momentum:number;score:number;positiveSteps:number;forecastProbability:number|null;lockRemainingTicks:number|null;tradingLockOriginSequence:number|null;tradingLockOriginEpoch:number|null;tradingLockOriginDigit:number|null};
 type MomentumTrade = {frozenTrace?:FrozenEntryTrace;verifiedExpiryMatchesTarget?:boolean|null;entryVsSignalSeconds?:number|null;expiryVsSignalSeconds?:number|null;entryKind?:EntryKind;soonHorizon?:number;entryDelayTicks?:number|null;strategy?:Strategy;lockTick?:number;lockDuration?:number;signalEpoch?:number;purchaseEpoch?:number|null;expiryEpoch?:number|null;expiryDigit?:number|null;signalSequence?:number;signalToSubmitMs?:number;buyAcknowledgmentMs?:number;ticksDuringAcknowledgment?:number;signalAgeBudgetMs?:number;entryEpoch?:number|null;entryDigit?:number|null;entrySpot?:string|null;exitSpot?:string|null;recordType:'TRADE';contractId:number;accountId:string;symbol:string;timestamp:string;targetDigit:number;score:number;momentum3:number;positiveSteps:number;momentumRising:boolean;threshold:number;stake:number;payout:number;profit:number;outcome:'WIN'|'LOSS'};
 // Prefer the current Deriv spot fields. When Deriv returns a numeric spot,
@@ -98,7 +98,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const [paceView,setPaceView]=useState({eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—',lastDispatchSequence:0});
  const tickLedger=useRef(new Map<number,TickDecision>());
  const [ledgerView,setLedgerView]=useState<TickDecision[]>([]);
- const publishLedger=()=>setLedgerView([...tickLedger.current.values()].slice(-12).reverse());
+ const publishLedger=()=>setLedgerView([...tickLedger.current.values()].slice(-30).reverse());
  const recordTick=(sequence:number,epoch:number,observedDigit:number,status:TickDecision['status'],reason:string,target:number|null=null,lockOriginSequence:number|null=null,contractId:number|null=null)=>{
    const prior=tickLedger.current.get(sequence);
    tickLedger.current.set(sequence,{sequence,epoch,observedDigit,target:target??prior?.target??null,lockOriginSequence:lockOriginSequence??prior?.lockOriginSequence??null,status,reason,contractId:contractId??prior?.contractId??null,at:new Date().toISOString()});
@@ -106,7 +106,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    queueMicrotask(publishLedger);
  };
  const publishPace=()=>{const v=paceRef.current;setPaceView({...v})};
- const skipPace=(reason:string)=>{const seq=tickSequence.current;const prior=tickLedger.current.get(seq);if(prior&&prior.status==='SKIPPED')recordTick(seq,prior.epoch,prior.observedDigit,'SKIPPED',reason);paceRef.current.skipped++;paceRef.current.lastSkip=reason;if(paceRef.current.skipped%3===0)queueMicrotask(publishPace)};
+ const skipPace=(reason:string)=>{const seq=tickSequence.current;const prior=tickLedger.current.get(seq);if(prior&&prior.status==='SKIPPED')recordTick(seq,prior.epoch,prior.observedDigit,'SKIPPED',reason,lockRef.current?.digit??null,lockRef.current?.originSequence??null);paceRef.current.skipped++;paceRef.current.lastSkip=reason;queueMicrotask(publishPace)};
 
  // Enforce one submitted order per unique tick, not one contract at a time.
  const lastBuySignalSequence=useRef(0);
@@ -155,9 +155,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,firstLockMatch:boolean,entryKind:EntryKind,soonHorizon:number|null,frozenTrace:FrozenEntryTrace)=>{
   if(!ws||!accountId||halt.current||!active.current||winConfirmed.current||uncertainPurchase.current||matchPause.current||countRef.current>=Number(limit))return;
   // Never replay ticks skipped while a previous buy was in flight.
-  if(signalSequence<=lastBuySignalSequence.current)return;
+  if(signalSequence<=lastBuySignalSequence.current){recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'SKIPPED','Duplicate dispatch prevented',predicted,frozenTrace.tradingLockOriginSequence);return;}
   // Reserve a distinct slot for this tick. No waiting for previous settlement.
-  if(inFlight.current.has(signalSequence))return;
+  if(inFlight.current.has(signalSequence)){recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'SKIPPED','Purchase already pending for tick',predicted,frozenTrace.tradingLockOriginSequence);return;}
   pendingCount.current++;
   pending.current=true;
   inFlight.current.set(signalSequence,{digit:predicted,stake});
@@ -173,6 +173,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // never interpreted as an already-settled WIN.
    if(tickSequence.current!==signalSequence || signalSequence<=lastBuySignalSequence.current || halt.current || matchPause.current){
      tickStats.current.staleQuotes++;
+     recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'SKIPPED','Tick changed or match hold before send',predicted,frozenTrace.tradingLockOriginSequence);
      reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
      setMode(outstanding.current.size?'SETTLING':'RUNNING');
      return;
@@ -183,6 +184,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // The existing separate match-hold protects outstanding contracts.
    if(tickSequence.current!==signalSequence){
     reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
+    recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'SKIPPED','Newer tick arrived before send',predicted,frozenTrace.tradingLockOriginSequence);
     setEntryStatus('Newer tick arrived before dispatch · waiting for fresh signal');
     setMode('RUNNING');
     return;
@@ -194,6 +196,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(elapsedMs>freshnessBudgetMs){
     tickStats.current.staleQuotes++;
     reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
+    recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'SKIPPED','Signal exceeded freshness budget',predicted,frozenTrace.tradingLockOriginSequence);
     setEntryStatus('Signal expired before dispatch · awaiting fresh tick');
     setMode('RUNNING');
     return;
@@ -300,6 +303,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      const expiryEpochRaw=Number(settle.exit_spot_time??settle.exit_tick_time);
      const expiryEpoch=Number.isFinite(expiryEpochRaw)&&expiryEpochRaw>0?expiryEpochRaw:null;
      setLastTrace({trace:frozenTrace,contractId:id,entryDigit,expiryDigit,profit,outcome:win?'WIN':'LOSS',entryEpoch,expiryEpoch});
+     const ledgerRow=tickLedger.current.get(signalSequence);
+     if(ledgerRow){tickLedger.current.set(signalSequence,{...ledgerRow,status:'SETTLED',reason:`Deriv ${win?'WIN':'LOSS'} ${profit>=0?'+':''}$${profit.toFixed(2)}`,entryDigit,entryEpoch,expiryDigit,expiryEpoch,result:win?'WIN':'LOSS',contractId:id});queueMicrotask(publishLedger)}
      setEntryTimingView(`${entryKind} #${id} · dispatch ${signalToSubmitMs} ms · ACK ${buyMs} ms / ${ticksDuringAcknowledgment} ticks · entry ${entryDigit??'unknown'} · expiry ${expiryDigit??'unknown'} · ${win?'WIN':'LOSS'}`);
      setLastTiming({contractId:id,target:predicted,signalSequence,ackTicks:ticksDuringAcknowledgment,
        submitMs:signalToSubmitMs,buyMs:Math.round(acknowledgedAt-buyStart),entryDigit,expiryDigit,
@@ -526,10 +531,12 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
        lockedDigit:settings.strategy==='MOMENTUM_LOCK' ? lockRef.current?.digit??null : null,
      });
    });
-   if(!active.current||halt.current||uncertainPurchase.current||!settings.accountId||!settings.isConnected)return;
+   if(!active.current||halt.current||uncertainPurchase.current||!settings.accountId||!settings.isConnected){
+     recordTick(sequence,epoch,digit,'SKIPPED',!active.current?'Cycle inactive':halt.current?'Cycle halted':uncertainPurchase.current?'Uncertain purchase':!settings.accountId?'No account':'Disconnected',lockRef.current?.digit??null,lockRef.current?.originSequence??null);return;
+   }
    if(matchPause.current){skipPace('Match hold: awaiting Deriv settlement');setEntryStatus(`MATCH HOLD · ${outstanding.current.size} confirmed + ${pendingCount.current} pending contracts; await Deriv settlement`);return;}
    if(!ranking.length){skipPace('Forecast warming up');setEntryStatus('V1 warming up');return}
-   if(countRef.current>=Number(settings.limit)){halt.current=true;active.current=false;setMode('MAX_TRADES');setEntryStatus('Max trades reached');return}
+   if(countRef.current>=Number(settings.limit)){skipPace('Max trades reached');halt.current=true;active.current=false;setMode('MAX_TRADES');setEntryStatus('Max trades reached');return}
    // Both NEXT and SOON can qualify independently on EVERY fresh tick.
    // In Momentum Lock, NEXT and SOON only select the initial digit.
    // Once selected, every eligible purchase uses that frozen digit.
@@ -600,7 +607,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(sequence<=lastBuySignalSequence.current){skipPace('Already dispatched for tick');setEntryStatus('Awaiting new tick');return}
    const stake=amount(Number(settings.base)*Math.pow(Number(settings.factor),countRef.current));
    if(!Number.isFinite(stake)||stake<=0||stake+reservedStake.current+Math.max(0,-pnlRef.current)>Number(settings.maxLoss)){
-    stop();setMode('MAX_LOSS');return;
+    skipPace('Next stake would exceed loss limit');stop();setMode('MAX_LOSS');return;
    }
    // IMPORTANT: dispatch the request BEFORE any React state/context updates.
    // The executor reserves the tick and pending slot synchronously up to ws.send().
@@ -691,7 +698,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     <div className="text-slate-400">Last skipped: {paceView.lastSkip} · Last dispatched tick #{paceView.lastDispatchSequence||'—'} · {cadenceLabel}</div>
     <div className="text-slate-500">Sent means a request was submitted, not that Deriv entered on that exact tick. Accepted counts acknowledged contracts. Risk controls and confirmed wins intentionally prevent trading every market tick.</div>
     <div className="mt-1 font-semibold text-cyan-300">Recent tick-to-purchase ledger</div>
-    <div className="max-h-36 overflow-y-auto font-mono text-[10px]" aria-label="Tick purchase ledger">{ledgerView.map(t=><div key={t.sequence} className="border-t border-slate-700/40 py-0.5">#{t.sequence} · market {t.observedDigit} · target {t.target??'—'} · lock from #{t.lockOriginSequence??'—'} · <strong className={t.status==='ACCEPTED'?'text-emerald-400':t.status==='UNCERTAIN'?'text-red-400':'text-slate-300'}>{t.status}</strong> · {t.reason}{t.contractId?` · #${t.contractId}`:''}</div>)}</div>
+    <div className="max-h-60 overflow-y-auto font-mono text-[10px]" aria-label="Tick purchase ledger">{ledgerView.map(t=><div key={t.sequence} className="border-t border-slate-700/40 py-0.5">#{t.sequence} · market {t.observedDigit} · target {t.target??'—'} · lock from #{t.lockOriginSequence??'—'} · <strong className={t.status==='ACCEPTED'?'text-emerald-400':t.status==='UNCERTAIN'?'text-red-400':'text-slate-300'}>{t.status}</strong> · {t.reason}{t.contractId?` · #${t.contractId}`:''}{t.entryDigit!==undefined?` · entry ${t.entryDigit??'?'} @ ${t.entryEpoch??'?'}`:''}{t.expiryDigit!==undefined?` · expiry ${t.expiryDigit??'?'} @ ${t.expiryEpoch??'?'}`:''}</div>)}</div>
   </div>
   <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4">{[['Next-tick top',scores[0]?.digit??'—'],['Trade',`${count}/${limit}`],['Next stake',`$${next.toFixed(2)}`],['Cycle P/L',`${pnl>=0?'+':''}$${pnl.toFixed(2)}`]].map(([k,v])=><div key={String(k)} className="rounded-lg bg-[#0a1222] px-2 py-1.5"><div className="text-[11px] text-slate-400">{k}</div><div className={`font-extrabold ${k==='Cycle P/L' ? (pnl>0 ? 'text-green-400' : pnl<0 ? 'text-red-500' : 'text-slate-100') : 'text-slate-100'}`}>{v}</div></div>)}</div>
   <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs" aria-live="polite">
