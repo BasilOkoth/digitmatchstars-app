@@ -12,7 +12,7 @@ type Mode='IDLE'|'RUNNING'|'BUYING'|'SETTLING'|'WIN'|'MAX_TRADES'|'MAX_LOSS'|'UN
 type Outcome={id:number;digit:number;stake:number;payout:number;profit:number;outcome:'WIN'|'LOSS';expiryDigit:number|null;expiryEpoch:number|null;signalEpoch:number;purchaseEpoch:number|null};
 type Strategy='DYNAMIC'|'MOMENTUM_LOCK';
 type EntryKind='NEXT'|'SOON';
-type FrozenEntryTrace={signalKind:EntryKind;target:number;nextDigit:number|null;soonDigit:number|null;soonLockedDigit:number|null;soonHorizon:number|null;signalSequence:number;signalEpoch:number;signalObservedDigit:number;signalReceivedAtIso:string;momentum:number;score:number;positiveSteps:number;forecastProbability:number|null;lockRemainingTicks:number|null};
+type FrozenEntryTrace={strategy:Strategy;lockSource:EntryKind|null;signalKind:EntryKind;target:number;nextDigit:number|null;soonDigit:number|null;soonLockedDigit:number|null;soonHorizon:number|null;signalSequence:number;signalEpoch:number;signalObservedDigit:number;signalReceivedAtIso:string;momentum:number;score:number;positiveSteps:number;forecastProbability:number|null;lockRemainingTicks:number|null};
 type MomentumTrade = {frozenTrace?:FrozenEntryTrace;verifiedExpiryMatchesTarget?:boolean|null;entryVsSignalSeconds?:number|null;expiryVsSignalSeconds?:number|null;entryKind?:EntryKind;soonHorizon?:number;entryDelayTicks?:number|null;strategy?:Strategy;lockTick?:number;lockDuration?:number;signalEpoch?:number;purchaseEpoch?:number|null;expiryEpoch?:number|null;expiryDigit?:number|null;signalSequence?:number;signalToSubmitMs?:number;buyAcknowledgmentMs?:number;ticksDuringAcknowledgment?:number;signalAgeBudgetMs?:number;entryEpoch?:number|null;entryDigit?:number|null;entrySpot?:string|null;exitSpot?:string|null;recordType:'TRADE';contractId:number;accountId:string;symbol:string;timestamp:string;targetDigit:number;score:number;momentum3:number;positiveSteps:number;momentumRising:boolean;threshold:number;stake:number;payout:number;profit:number;outcome:'WIN'|'LOSS'};
 // Prefer the current Deriv spot fields. When Deriv returns a numeric spot,
 // the symbol's pip precision restores trailing zeroes consistently.
@@ -33,7 +33,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const {publishForecast} = useEngineForecast();
  const demo=Boolean(accountId)&&(/demo|virtual/i.test(accountType??'')||/^VRT/i.test(accountId??''));const real=Boolean(accountId)&&!demo;
  const [strategy,setStrategy]=useState<Strategy>('DYNAMIC');const [lockDuration,setLockDuration]=useState('5');
- const lockRef=useRef<{digit:number;elapsed:number;signal:{score:number;momentum3:number;positiveSteps:number;threshold:number}}|null>(null);
+ const lockRef=useRef<{digit:number;elapsed:number;source:EntryKind;signal:{score:number;momentum3:number;positiveSteps:number;threshold:number}}|null>(null);
  const [lockPosition,setLockPosition]=useState(0);
  const [base,setBase]=useState('1');const [factor,setFactor]=useState('1.15');const [limit,setLimit]=useState('20');const [maxLoss,setMaxLoss]=useState('40');const [threshold,setThreshold]=useState('6');const [minMomentum,setMinMomentum]=useState('0');
  const [mode,setMode]=useState<Mode>('IDLE');const [count,setCount]=useState(0);const [pnl,setPnl]=useState(0);const [lastOutcome,setLastOutcome]=useState<Outcome|null>(null);const [err,setErr]=useState('');const [sound,setSound]=useState(true);
@@ -507,8 +507,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(!ranking.length){setEntryStatus('V1 warming up');return}
    if(countRef.current>=Number(settings.limit)){halt.current=true;active.current=false;setMode('MAX_TRADES');setEntryStatus('Max trades reached');return}
    // Both NEXT and SOON can qualify independently on EVERY fresh tick.
-   // In lock mode, retain the existing lock until expiry; a new SOON signal
-   // can initialize it when NEXT has no qualified candidate.
+   // In Momentum Lock, NEXT and SOON only select the initial digit.
+   // Once selected, every eligible purchase uses that frozen digit.
    const nextCandidate=top && qualified.some(row=>row.digit===top.digit)?top:null;
    // Keep a SOON target for its ORIGINAL horizon; do not reset its expiry on
    // every tick. A new target can only be created after expiry or invalidation.
@@ -530,9 +530,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const lockedSoonCandidate=soonLock?ranking.find(row=>row.digit===soonLock.digit)??null:null;
    const choice=nextCandidate??lockedSoonCandidate;
    const choiceKind:EntryKind=nextCandidate?'NEXT':'SOON';
-   if(!choice){setEntryStatus('No qualified NEXT or active SOON target');return}
-   if(settings.strategy==='MOMENTUM_LOCK' && !selected){
-     selected={digit:choice.digit,elapsed:1,signal:{score:choice.score,momentum3:choice.momentum3,positiveSteps:choice.positiveSteps,threshold:Number(settings.threshold)}};
+   if(!choice && !(settings.strategy==='MOMENTUM_LOCK' && selected)){setEntryStatus('No qualified NEXT or active SOON target');return}
+   if(settings.strategy==='MOMENTUM_LOCK' && !selected && choice){
+     selected={digit:choice.digit,elapsed:1,source:choiceKind,signal:{score:choice.score,momentum3:choice.momentum3,positiveSteps:choice.positiveSteps,threshold:Number(settings.threshold)}};
      lockRef.current=selected;setLockPosition(1);
    }
    // Optional gate tests the actual V1 next-tick candidate, rather than a
@@ -543,7 +543,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      setEntryStatus(`V1 evidence gate: ${eligibleResults.current.length}/150; lower bound must exceed 10%`);
      return;
    }
-   const target=settings.strategy==='MOMENTUM_LOCK'?selected!.digit:choice.digit;
+   const target=settings.strategy==='MOMENTUM_LOCK'?selected!.digit:choice!.digit;
    const chosenForecast=ranking.find(row=>row.digit===target);
    if(!chosenForecast){setEntryStatus('V1 target unavailable');return}
    const ownMomentum=chosenForecast.momentum3;
@@ -556,7 +556,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // Deliberately do not reject V1 purely for an uncalibrated 10% probability
    // estimate. Such thresholds are evaluated offline against actual outcomes.
    const signal={score:chosenForecast.score,momentum3:ownMomentum,positiveSteps:ownRises,threshold:Number(settings.threshold)};
-   const signalKind:EntryKind=target===choice.digit?choiceKind:'SOON';
+   const signalKind:EntryKind=settings.strategy==='MOMENTUM_LOCK'?selected!.source:choiceKind;
    const lockTick=settings.strategy==='MOMENTUM_LOCK'?selected!.elapsed:0;
    // Never enter on a market tick whose observed last digit equals the target.
    // This is an ENTRY rule, not an assumption about a Deriv contract outcome.
@@ -582,6 +582,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // Freeze the exact model and lock state BEFORE sending the purchase.
    // Never reconstruct a past trade from the continuously changing dashboard.
    const frozenTrace:FrozenEntryTrace={
+     strategy:settings.strategy,lockSource:settings.strategy==='MOMENTUM_LOCK'?selected!.source:null,
      signalKind,target,nextDigit:top?.digit??null,soonDigit:soonCandidate?.digit??null,
      soonLockedDigit:soonLockRef.current?.digit??null,
      soonHorizon:signalKind==='SOON'?soonLockRef.current?.horizon??null:null,
@@ -632,7 +633,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       </select>
     </label>
     {strategy==='MOMENTUM_LOCK'&&<label className="flex items-center gap-2">Lock ticks <input type="number" min="1" max="30" step="1" value={lockDuration} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setLockDuration(e.target.value)} className="w-14 rounded border border-slate-600 bg-[#0b1425] px-2 py-1 text-white" /></label>}
-    {strategy==='MOMENTUM_LOCK'&&<span className="text-emerald-400">{lockRef.current?`Locked ${lockRef.current.digit} · tick ${lockPosition}/${lockDuration}`:'Waiting for rising momentum'}</span>}
+    {strategy==='MOMENTUM_LOCK'&&<span className="text-emerald-400">{lockRef.current?`Locked ${lockRef.current.digit} · selected by ${lockRef.current.source} · tick ${lockPosition}/${lockDuration}`:'Waiting for rising momentum'}</span>}
   </div>
   <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">{([['Base $',base,setBase],['Multiplier',factor,setFactor],['Max trades',limit,setLimit],['Loss limit $',maxLoss,setMaxLoss],['Min score',threshold,setThreshold],['Min momentum',minMomentum,setMinMomentum]] as const).map(([name,v,fn])=><label key={name} className="text-[11px] text-slate-300">{name}<input value={v} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} type="number" min={name==='Min momentum'||name==='Min score'?'0':undefined} step={name==='Min momentum'?'0.1':'any'} onChange={e=>fn(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>)}</div>
   <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4">{[['Next-tick top',scores[0]?.digit??'—'],['Trade',`${count}/${limit}`],['Next stake',`$${next.toFixed(2)}`],['Cycle P/L',`${pnl>=0?'+':''}$${pnl.toFixed(2)}`]].map(([k,v])=><div key={String(k)} className="rounded-lg bg-[#0a1222] px-2 py-1.5"><div className="text-[11px] text-slate-400">{k}</div><div className={`font-extrabold ${k==='Cycle P/L' ? (pnl>0 ? 'text-green-400' : pnl<0 ? 'text-red-500' : 'text-slate-100') : 'text-slate-100'}`}>{v}</div></div>)}</div>
@@ -643,12 +644,12 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     <span className="text-slate-300">{strategy==='MOMENTUM_LOCK' ? 'Locked target (next tick)' : 'V1 next-tick target'} {winConfirmed.current ? '—' : (strategy==='MOMENTUM_LOCK' ? lockRef.current?.digit ?? '—' : scores[0]?.digit ?? '—')}</span>
     {soonView&&<span className="text-sky-300">SOON {soonView.digit} · within {soonView.horizon} ticks · momentum +{soonView.momentum.toFixed(2)} · observed {soonView.trials?`${(soonView.rate*100).toFixed(1)}% / ${soonView.trials}`:'warming up'} (appearance, not contract win)</span>}
     {soonLockView&&<span className="text-cyan-300">{soonLockView}</span>}
-    {entrySignal&&<span className="font-semibold text-white">Last entry signal: {entrySignal}</span>}
+    {entrySignal&&<span className="font-semibold text-white">Last entry: {strategy==='MOMENTUM_LOCK'?'Momentum Lock':'Dynamic V1'} · {entrySignal} selection</span>}
     {entryTimingView&&<span className="text-amber-200">Timing: {entryTimingView}</span>}
     {lastTrace&&<div className="w-full rounded-md border border-slate-600 bg-[#0a1222] p-2 text-[11px]" aria-label="Frozen contract signal audit">
       <div className="font-bold text-cyan-300">Verified contract trace · #{lastTrace.contractId}</div>
       <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-slate-200">
-        <span>Signal {lastTrace.trace.signalKind} · target <strong>{lastTrace.trace.target}</strong></span>
+        <span>Method {lastTrace.trace.strategy==='MOMENTUM_LOCK'?'Momentum Lock':'Dynamic V1'} · selection {lastTrace.trace.lockSource??lastTrace.trace.signalKind} · target <strong>{lastTrace.trace.target}</strong></span>
         <span>At signal: NEXT {lastTrace.trace.nextDigit??'—'} · SOON {lastTrace.trace.soonDigit??'—'} · SOON lock {lastTrace.trace.soonLockedDigit??'—'}</span>
         <span>Momentum {lastTrace.trace.momentum.toFixed(2)} · score {lastTrace.trace.score.toFixed(2)} · rises {lastTrace.trace.positiveSteps}/3</span>
         <span>Signal tick #{lastTrace.trace.signalSequence} · observed {lastTrace.trace.signalObservedDigit} · epoch {lastTrace.trace.signalEpoch}</span>
