@@ -92,6 +92,12 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const tickStats=useRef({received:0,outOfOrder:0,duplicates:0,staleQuotes:0});
  // A monotonic local sequence is essential: multiple market ticks may share one epoch second.
  const tickSequence=useRef(0);
+ // Tick-paced execution telemetry is independent of React render timing.
+ const paceRef=useRef({eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—',lastDispatchSequence:0});
+ const [paceView,setPaceView]=useState({eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—',lastDispatchSequence:0});
+ const publishPace=()=>{const v=paceRef.current;setPaceView({...v})};
+ const skipPace=(reason:string)=>{paceRef.current.skipped++;paceRef.current.lastSkip=reason;if(paceRef.current.skipped%3===0)queueMicrotask(publishPace)};
+
  // Enforce one submitted order per unique tick, not one contract at a time.
  const lastBuySignalSequence=useRef(0);
  const lastBuyAcknowledgedAtSequence=useRef(0);
@@ -135,7 +141,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const soundRef=useRef(sound);useEffect(()=>{soundRef.current=sound},[sound]);
  const play=useCallback((kind:'buy'|'win'|'loss')=>{if(soundRef.current)tone(kind)},[]);
  const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
- useEffect(()=>{if(scope.current!==scopeKey){const unsettled=outstanding.current.size>0||pendingCount.current>0||uncertainPurchase.current;scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];intelligenceRef.current.reset();soonAuditRef.current.reset();soonLockRef.current=null;setSoonLockView(null);setEntryTimingView(null);setSoonView(null);setEntrySignal(null);setLastTrace(null);executionForecastRef.current.reset();setLastTiming(null);setExecutionAudit(null);setHorizonTarget(null);setHorizonProbability(null);setIntelligenceAudit(null);nextTickPending.current=null;eligibleResults.current=[];setAccuracyAudit({trials:0,hits:0,lower95:0});if(!unsettled)confirmedLosses.current=0;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setTopMomentum(null);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);lockedRef.current=null;if(!unsettled){countRef.current=0;setSentCount(0);lossBlockRef.current=0;pnlRef.current=0;}if(!unsettled){pending.current=false;pendingCount.current=0;inFlight.current.clear();matchPause.current=false;setMatchPaused(false);setInFlightCount(0);reservedStake.current=0;setRiskExposure(0);uncertainPurchase.current=false;}lastTickKey.current='';if(!unsettled)matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(unsettled?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(unsettled)setErr('Account/symbol changed with a pending or unsettled order. Reconcile on Deriv before restarting.');else setErr('')}},[scopeKey,setTarget]);
+ useEffect(()=>{if(scope.current!==scopeKey){const unsettled=outstanding.current.size>0||pendingCount.current>0||uncertainPurchase.current;scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];intelligenceRef.current.reset();soonAuditRef.current.reset();soonLockRef.current=null;setSoonLockView(null);setEntryTimingView(null);setSoonView(null);setEntrySignal(null);setLastTrace(null);executionForecastRef.current.reset();setLastTiming(null);setExecutionAudit(null);setHorizonTarget(null);setHorizonProbability(null);setIntelligenceAudit(null);nextTickPending.current=null;eligibleResults.current=[];setAccuracyAudit({trials:0,hits:0,lower95:0});if(!unsettled)confirmedLosses.current=0;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setTopMomentum(null);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);lockedRef.current=null;if(!unsettled){countRef.current=0;setSentCount(0);lossBlockRef.current=0;pnlRef.current=0;}if(!unsettled){pending.current=false;pendingCount.current=0;inFlight.current.clear();matchPause.current=false;setMatchPaused(false);setInFlightCount(0);reservedStake.current=0;setRiskExposure(0);uncertainPurchase.current=false;}lastTickKey.current='';if(!unsettled)matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');paceRef.current={eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—',lastDispatchSequence:0};setPaceView({...paceRef.current});tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');paceRef.current={eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—',lastDispatchSequence:0};setPaceView({...paceRef.current});setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(unsettled?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(unsettled)setErr('Account/symbol changed with a pending or unsettled order. Reconcile on Deriv before restarting.');else setErr('')}},[scopeKey,setTarget]);
  const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,firstLockMatch:boolean,entryKind:EntryKind,soonHorizon:number|null,frozenTrace:FrozenEntryTrace)=>{
   if(!ws||!accountId||halt.current||!active.current||winConfirmed.current||uncertainPurchase.current||matchPause.current||countRef.current>=Number(limit))return;
   // Never replay ticks skipped while a previous buy was in flight.
@@ -202,6 +208,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
        currency:'USD',duration:1,duration_unit:'t',underlying_symbol:symbol,
        barrier:String(predicted)},
    });
+   paceRef.current.dispatched++;
+   paceRef.current.lastDispatchSequence=signalSequence;
+   queueMicrotask(publishPace);
    setMode('BUYING');
    setDispatchTiming(old=>({signalToSubmitMs,acknowledgmentMs:old?.acknowledgmentMs??0,ticksDuringAck:old?.ticksDuringAck??0}));
    const bought=await buyPromise;
@@ -227,6 +236,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // Keep risk reserved and register the contract before releasing this ACK slot.
    reservedStake.current=amount(reservedStake.current-stake+ask);
    outstanding.current.set(contractId,{digit:predicted,stake:ask,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch});
+   paceRef.current.accepted++;queueMicrotask(publishPace);
    // An observed target digit while BUYING is not a contract win or an entry veto.
    // Only Deriv's proposal_open_contract response can settle this contract.
    setSyncStatus(`Bought #${contractId} · target ${predicted} · signal ${tickEpoch} · ${acknowledgedEpoch===null?'purchase time unavailable':`buy ${acknowledgedEpoch}`}`);
@@ -504,8 +514,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      });
    });
    if(!active.current||halt.current||uncertainPurchase.current||!settings.accountId||!settings.isConnected)return;
-   if(matchPause.current){setEntryStatus(`MATCH HOLD · ${outstanding.current.size} confirmed + ${pendingCount.current} pending contracts; await Deriv settlement`);return;}
-   if(!ranking.length){setEntryStatus('V1 warming up');return}
+   if(matchPause.current){skipPace('Match hold: awaiting Deriv settlement');setEntryStatus(`MATCH HOLD · ${outstanding.current.size} confirmed + ${pendingCount.current} pending contracts; await Deriv settlement`);return;}
+   if(!ranking.length){skipPace('Forecast warming up');setEntryStatus('V1 warming up');return}
    if(countRef.current>=Number(settings.limit)){halt.current=true;active.current=false;setMode('MAX_TRADES');setEntryStatus('Max trades reached');return}
    // Both NEXT and SOON can qualify independently on EVERY fresh tick.
    // In Momentum Lock, NEXT and SOON only select the initial digit.
@@ -531,7 +541,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const lockedSoonCandidate=soonLock?ranking.find(row=>row.digit===soonLock.digit)??null:null;
    const choice=nextCandidate??lockedSoonCandidate;
    const choiceKind:EntryKind=nextCandidate?'NEXT':'SOON';
-   if(!choice && !(settings.strategy==='MOMENTUM_LOCK' && selected)){setEntryStatus('No qualified NEXT or active SOON target');return}
+   if(!choice && !(settings.strategy==='MOMENTUM_LOCK' && selected)){skipPace('No qualifying signal');setEntryStatus('No qualified NEXT or active SOON target');return}
    if(settings.strategy==='MOMENTUM_LOCK' && !selected && choice){
      selected={digit:choice.digit,elapsed:1,source:choiceKind,signal:{score:choice.score,momentum3:choice.momentum3,positiveSteps:choice.positiveSteps,threshold:Number(settings.threshold)}};
      lockRef.current=selected;setLockPosition(1);setTradeLockView({digit:selected.digit,source:selected.source,elapsed:1});
@@ -541,17 +551,17 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // much higher than the 10% uniform random-digit baseline.
    if(requireEvidence && (eligibleResults.current.length<150 ||
        wilsonLower(eligibleResults.current.reduce((a,b)=>a+b,0),eligibleResults.current.length)<=0.1)){
-     setEntryStatus(`V1 evidence gate: ${eligibleResults.current.length}/150; lower bound must exceed 10%`);
+     skipPace('Evidence gate');setEntryStatus(`V1 evidence gate: ${eligibleResults.current.length}/150; lower bound must exceed 10%`);
      return;
    }
    const target=settings.strategy==='MOMENTUM_LOCK'?selected!.digit:choice!.digit;
    const chosenForecast=ranking.find(row=>row.digit===target);
-   if(!chosenForecast){setEntryStatus('V1 target unavailable');return}
+   if(!chosenForecast){skipPace('Target unavailable');setEntryStatus('V1 target unavailable');return}
    const ownMomentum=chosenForecast.momentum3;
    const ownRises=chosenForecast.positiveSteps;
    const ownRising=ownMomentum>0 && ownMomentum>=Number(settings.minMomentum) && ownRises>=2;
    if(chosenForecast.score<Number(settings.threshold) || !ownRising){
-     setEntryStatus(`Locked ${target}: score ${chosenForecast.score.toFixed(2)}/${settings.threshold} · momentum ${ownMomentum.toFixed(2)}/${settings.minMomentum} · rises ${ownRises}/3; awaiting qualification`);
+     skipPace('Score or rising momentum gate');setEntryStatus(`Locked ${target}: score ${chosenForecast.score.toFixed(2)}/${settings.threshold} · momentum ${ownMomentum.toFixed(2)}/${settings.minMomentum} · rises ${ownRises}/3; awaiting qualification`);
      return;
    }
    // Deliberately do not reject V1 purely for an uncalibrated 10% probability
@@ -562,7 +572,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // Never enter on a market tick whose observed last digit equals the target.
    // This is an ENTRY rule, not an assumption about a Deriv contract outcome.
    if(digit===target){
-     setEntryStatus(`Observed ${digit} = target ${target} · skip this tick`);
+     skipPace('Observed digit equals target');setEntryStatus(`Observed ${digit} = target ${target} · skip this tick`);
      return;
    }
    // Send only from a fresh, nonmatching observed tick. Settlement is
@@ -570,7 +580,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const firstLockMatch=false;
    // Do NOT wait for ACK/settlement: each fresh tick has its own dispatch.
    // Execute at most one purchase on a fresh signal; require settlement and then a new tick.
-   if(sequence<=lastBuySignalSequence.current){setEntryStatus('Awaiting new tick');return}
+   if(sequence<=lastBuySignalSequence.current){skipPace('Already dispatched for tick');setEntryStatus('Awaiting new tick');return}
    const stake=amount(Number(settings.base)*Math.pow(Number(settings.factor),countRef.current));
    if(!Number.isFinite(stake)||stake<=0||stake+reservedStake.current+Math.max(0,-pnlRef.current)>Number(settings.maxLoss)){
     stop();setMode('MAX_LOSS');return;
@@ -593,6 +603,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      forecastProbability:Number.isFinite(chosenForecast.probability)?chosenForecast.probability:null,
      lockRemainingTicks:soonLockRef.current?Math.max(0,soonLockRef.current.expiresSequence-sequence):null,
    };
+   paceRef.current.eligible++;
+   queueMicrotask(publishPace);
    void execRef.current(target,stake,signal,epoch,sequence,receivedAt,settings.strategy,lockTick,settings.strategy==='MOMENTUM_LOCK'?Number(settings.lockDuration):0,firstLockMatch,signalKind,signalKind==='SOON'?soonLockRef.current?.horizon??null:null,frozenTrace);
    queueMicrotask(()=>{
      if(scope.current!==telemetryScope)return;
@@ -648,6 +660,16 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     <div className="mt-1 text-slate-400">{mode==='RUNNING'?`Latest execution decision: ${entryStatus}`:mode==='WIN'?'Cycle stopped after verified win. Start a new cycle to trade again.':`Purchases disabled: ${mode.toLowerCase().replaceAll('_',' ')}.`}</div>
     <div className="mt-1 text-slate-500">SOON appearance lock below is research-only; it does not replace the active trading target. ACTIVE means eligible ticks are evaluated, not that every tick will be purchased.</div>
   </div>}
+  <div className="mt-2 rounded-md border border-cyan-500/30 bg-[#091725] px-2 py-1.5 text-[11px] text-slate-200" aria-label="Tick-paced dispatch audit">
+    <span className="font-semibold text-cyan-300">Tick-paced dispatch</span>
+    <span className="ml-2">Eligible <strong>{paceView.eligible}</strong></span>
+    <span className="ml-2">Sent <strong>{paceView.dispatched}</strong></span>
+    <span className="ml-2">Accepted <strong>{paceView.accepted}</strong></span>
+    <span className="ml-2">Skipped <strong>{paceView.skipped}</strong></span>
+    <span className="ml-2">Coverage <strong>{paceView.eligible?`${(100*paceView.dispatched/paceView.eligible).toFixed(1)}%`:'—'}</strong></span>
+    <div className="text-slate-400">Last skipped: {paceView.lastSkip} · Last dispatched tick #{paceView.lastDispatchSequence||'—'} · {cadenceLabel}</div>
+    <div className="text-slate-500">Sent means a request was submitted, not that Deriv entered on that exact tick. Accepted counts acknowledged contracts.</div>
+  </div>
   <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4">{[['Next-tick top',scores[0]?.digit??'—'],['Trade',`${count}/${limit}`],['Next stake',`$${next.toFixed(2)}`],['Cycle P/L',`${pnl>=0?'+':''}$${pnl.toFixed(2)}`]].map(([k,v])=><div key={String(k)} className="rounded-lg bg-[#0a1222] px-2 py-1.5"><div className="text-[11px] text-slate-400">{k}</div><div className={`font-extrabold ${k==='Cycle P/L' ? (pnl>0 ? 'text-green-400' : pnl<0 ? 'text-red-500' : 'text-slate-100') : 'text-slate-100'}`}>{v}</div></div>)}</div>
   <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs" aria-live="polite">
     <span className={topMomentum===null?'text-slate-400':topMomentum>0?'font-bold text-emerald-400':'font-bold text-rose-400'}>
