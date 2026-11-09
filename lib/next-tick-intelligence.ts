@@ -35,7 +35,7 @@ export class NextTickIntelligence {
   if(this.pending){const p=this.pending;
    this.results.push({actual,top:p.top,predictedProbability:p.probs[actual],brier:p.probs.reduce((s,v,d)=>s+(v-Number(actual===d))**2,0),logLoss:-Math.log(Math.max(1e-8,p.probs[actual])),uniformLogLoss:Math.log(10),qualified:p.momentumQualified,regime:p.regime});
    if(this.results.length>2000)this.results.shift();
-   for(const k of NAMES){const loss=-Math.log(Math.max(1e-8,p.expertProbs[k][actual]));this.losses[k]=.98*this.losses[k]+.02*loss;}
+   for(const k of NAMES){const loss=-Math.log(Math.max(1e-8,p.expertProbs[k][actual]));this.losses[k]=.95*this.losses[k]+.05*loss;}
   }
   this.h=[...this.h.slice(-199),actual];
   const base=scoreDigits(this.h);if(base.length!==10){this.pending=null;this.latest=[];return []}
@@ -58,13 +58,16 @@ export class NextTickIntelligence {
    if(this.trail.length!==4)return {change:0,rises:0};
    const a=this.trail.map(x=>x[d]);return {change:a[3]-a[0],rises:[1,2,3].filter(i=>a[i]>a[i-1]).length};
   });
-  const mom=softmax(momentum.map(x=>clamp(x.change,-12,12)+1.2*(x.rises-1.5)),12);
+  // Score acceleration is only a candidate feature, never an assumed edge.
+  // Conservative temperature prevents a transient three-tick surge from dominating.
+  const mom=softmax(momentum.map(x=>clamp(x.change,-12,12)+0.8*(x.rises-1.5)),16);
   // Entropy is a contextual feature, NOT evidence that any particular digit is due.
   const ent=norm(Array.from({length:10},(_,d)=> .1 + (1-e)*.15*(f(this.h,d,25,5)-.1)));
   const expertProbs:Record<ExpertName,number[]>={frequency,transition,gap,momentum:mom,entropy:ent};
   // Online weights use ONLY past realized outcomes, with conservative shrinkage.
   const adapted=softmax(NAMES.map(k=>-this.losses[k]),.12);
-  const maturity=clamp(this.results.length/1000,0,.5);
+  // Adapt only after sufficient forward-only samples; keep substantial uniform expert mixing.
+  const maturity=clamp((this.results.length-150)/800,0,.55);
   for(let i=0;i<NAMES.length;i++)this.weights[NAMES[i]]=(1-maturity)*.2+maturity*adapted[i];
   const raw=norm(Array.from({length:10},(_,d)=>NAMES.reduce((s,k)=>s+this.weights[k]*expertProbs[k][d],0)));
   // Shrink confidently toward the 10% null, preventing extreme noise-fit claims.

@@ -133,7 +133,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   pending.current=true;
   inFlight.current.set(signalSequence,{digit:predicted,stake});
   refreshExposure();
-  setMode('BUYING');let contractId:number|undefined;let purchaseAttempted=false;
+  // Defer visual state changes until after the irreversible request is sent.
+  let contractId:number|undefined;let purchaseAttempted=false;
   // Reserve this risk immediately so a later tick cannot exceed the cycle budget.
   reservedStake.current=amount(reservedStake.current+stake);refreshExposure();
   try{
@@ -149,15 +150,18 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    }
    // Re-check the most recent observed market digit immediately before BUY.
    // A newer tick may have arrived after the signal was selected.
+   // A signal is valid only on the very latest locally observed tick.
    const latestMarketTick=streamTicks.current[streamTicks.current.length-1];
-   if(latestMarketTick?.digit===predicted){
+   if(tickSequence.current!==signalSequence || latestMarketTick?.digit===predicted){
     reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
     setEntryStatus(`Latest digit ${predicted} matches target · no buy`);
     setMode('RUNNING');
     return;
    }
    const elapsedMs=performance.now()-signalReceivedAt;
-   const freshnessBudgetMs=Math.max(120,Math.min(1000,(tickCadence.current.intervalMs??1000)*0.65));
+   // Reject signals that are already a substantial fraction of a tick old.
+   // This is a latency guard, not a promise about Deriv's eventual entry tick.
+   const freshnessBudgetMs=Math.max(100,Math.min(350,(tickCadence.current.intervalMs??1000)*0.35));
    if(elapsedMs>freshnessBudgetMs){
     tickStats.current.staleQuotes++;
     reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
@@ -177,7 +181,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    setSentCount(countRef.current);
    const buyStart=performance.now();
    const signalToSubmitMs=Math.max(0,Math.round(buyStart-signalReceivedAt));
-   // Dispatch before touching React state. This returns a promise and normally
+   // Dispatch before updating React state. This returns a promise and normally
    // writes to the existing open WebSocket synchronously.
    const buyPromise=ws.send<any>({
      buy:'1', price:amount(stake*1.05),
@@ -273,7 +277,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
        : ` · ${alignedTicks.length>1?'multiple same-second ticks':'expiry tick not in browser buffer'} (no browser match inferred)`;
      setSyncStatus(`Contract #${id}: target ${predicted} · expiry ${expiryDigit??'unknown'} at ${expiryEpoch??'unknown'} · ${win?'WIN':'LOSS'} (Deriv verified)${observationResult}`);
      setLastOutcome(old=>old?.outcome==='WIN'&&!win?old:{id,digit:predicted,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS',expiryDigit,expiryEpoch,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch});play(win?'win':'loss');
-     const journalRow:MomentumTrade={signalSequence,signalToSubmitMs,ticksDuringAcknowledgment,signalAgeBudgetMs:Math.max(120,Math.min(1000,(tickCadence.current.intervalMs??1000)*0.65)),buyAcknowledgmentMs:Math.round(acknowledgedAt-buyStart),entryEpoch,entryDigit,entrySpot:entrySpot===null?null:String(entrySpot),exitSpot:settle.exit_spot===undefined?null:String(settle.exit_spot),strategy:entryStrategy,lockTick,lockDuration:lockWindow,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch,expiryEpoch,expiryDigit,recordType:'TRADE',contractId:id,accountId,symbol,timestamp:new Date().toISOString(),targetDigit:predicted,score:signal.score,momentum3:signal.momentum3,positiveSteps:signal.positiveSteps,momentumRising:signal.momentum3>0&&signal.positiveSteps>=2,threshold:signal.threshold,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS'};
+     const journalRow:MomentumTrade={signalSequence,signalToSubmitMs,ticksDuringAcknowledgment,signalAgeBudgetMs:Math.max(100,Math.min(350,(tickCadence.current.intervalMs??1000)*0.35)),buyAcknowledgmentMs:Math.round(acknowledgedAt-buyStart),entryEpoch,entryDigit,entrySpot:entrySpot===null?null:String(entrySpot),exitSpot:settle.exit_spot===undefined?null:String(settle.exit_spot),strategy:entryStrategy,lockTick,lockDuration:lockWindow,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch,expiryEpoch,expiryDigit,recordType:'TRADE',contractId:id,accountId,symbol,timestamp:new Date().toISOString(),targetDigit:predicted,score:signal.score,momentum3:signal.momentum3,positiveSteps:signal.positiveSteps,momentumRising:signal.momentum3>0&&signal.positiveSteps>=2,threshold:signal.threshold,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS'};
      try{const key=`dms-momentum-trades:v1:${symbol}`;const prev=JSON.parse(localStorage.getItem(key)||'[]');const rows=Array.isArray(prev)?prev:[];if(!rows.some((x:MomentumTrade)=>x.contractId===id&&x.accountId===accountId))localStorage.setItem(key,JSON.stringify([...rows.slice(-4999),journalRow]))}catch{}
      // Settlement runs in the background; only confirmed settlement frees the slot.
      if(matchPause.current)setEntryStatus('Matched tick observed · verifying all unsettled contracts');
