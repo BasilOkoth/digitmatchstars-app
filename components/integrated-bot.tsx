@@ -573,8 +573,14 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const ownMomentum=chosenForecast.momentum3;
    const ownRises=chosenForecast.positiveSteps;
    const ownRising=ownMomentum>0 && ownMomentum>=Number(settings.minMomentum) && ownRises>=2;
-   if(chosenForecast.score<Number(settings.threshold) || !ownRising){
-     skipPace('Score or rising momentum gate');setEntryStatus(`Locked ${target}: score ${chosenForecast.score.toFixed(2)}/${settings.threshold} · momentum ${ownMomentum.toFixed(2)}/${settings.minMomentum} · rises ${ownRises}/3; awaiting qualification`);
+   // Momentum Lock qualification occurs ONLY when acquiring the lock above.
+   // During the active lock, do not re-qualify its frozen digit on each tick:
+   // a later momentum change must not silently suppress tick-paced purchases.
+   // Dynamic V1 still applies the live score/rising-momentum gate per tick.
+   if(settings.strategy!=='MOMENTUM_LOCK' &&
+      (chosenForecast.score<Number(settings.threshold) || !ownRising)){
+     skipPace('Score or rising momentum gate');
+     setEntryStatus(`Dynamic V1 ${target}: score ${chosenForecast.score.toFixed(2)}/${settings.threshold} · momentum ${ownMomentum.toFixed(2)}/${settings.minMomentum} · rises ${ownRises}/3; awaiting qualification`);
      return;
    }
    // Deliberately do not reject V1 purely for an uncalibrated 10% probability
