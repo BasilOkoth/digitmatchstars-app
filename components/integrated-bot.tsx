@@ -177,13 +177,13 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      setMode(outstanding.current.size?'SETTLING':'RUNNING');
      return;
    }
-   // Re-check the most recent observed market digit immediately before BUY.
-   // A newer tick may have arrived after the signal was selected.
-   // A signal is valid only on the very latest locally observed tick.
-   const latestMarketTick=streamTicks.current[streamTicks.current.length-1];
-   if(tickSequence.current!==signalSequence || latestMarketTick?.digit===predicted){
+   // The observed tick is historical by the time a BUY reaches Deriv.
+   // Do not suppress a fresh purchase merely because that observed digit
+   // equals the target. It cannot retroactively win on the observed tick.
+   // The existing separate match-hold protects outstanding contracts.
+   if(tickSequence.current!==signalSequence){
     reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
-    setEntryStatus(`Latest digit ${predicted} matches target · no buy`);
+    setEntryStatus('Newer tick arrived before dispatch · waiting for fresh signal');
     setMode('RUNNING');
     return;
    }
@@ -582,12 +582,10 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const signal={score:chosenForecast.score,momentum3:ownMomentum,positiveSteps:ownRises,threshold:Number(settings.threshold)};
    const signalKind:EntryKind=settings.strategy==='MOMENTUM_LOCK'?selected!.source:choiceKind;
    const lockTick=settings.strategy==='MOMENTUM_LOCK'?selected!.elapsed:0;
-   // Never enter on a market tick whose observed last digit equals the target.
-   // This is an ENTRY rule, not an assumption about a Deriv contract outcome.
-   if(digit===target){
-     skipPace('Observed digit equals target');setEntryStatus(`Observed ${digit} = target ${target} · skip this tick`);
-     return;
-   }
+   // Do not skip just because the observed tick equals the target:
+   // that tick has already occurred and the new contract will enter later.
+   // An actual pending-contract match still activates the independent
+   // settlement-verification hold earlier in this callback.
    // Send only from a fresh, nonmatching observed tick. Settlement is
    // exclusively determined by Deriv, asynchronously after the BUY acknowledgment.
    const firstLockMatch=false;
