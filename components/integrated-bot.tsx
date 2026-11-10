@@ -153,6 +153,36 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const play=useCallback((kind:'buy'|'win'|'loss')=>{if(soundRef.current)tone(kind)},[]);
  const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
  useEffect(()=>{if(scope.current!==scopeKey){const unsettled=outstanding.current.size>0||pendingCount.current>0||uncertainPurchase.current;scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];intelligenceRef.current.reset();soonAuditRef.current.reset();soonLockRef.current=null;setSoonLockView(null);setEntryTimingView(null);setSoonView(null);setEntrySignal(null);setLastTrace(null);executionForecastRef.current.reset();setLastTiming(null);setExecutionAudit(null);setHorizonTarget(null);setHorizonProbability(null);setIntelligenceAudit(null);nextTickPending.current=null;eligibleResults.current=[];setAccuracyAudit({trials:0,hits:0,lower95:0});if(!unsettled)confirmedLosses.current=0;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setTopMomentum(null);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);lockedRef.current=null;if(!unsettled){countRef.current=0;setSentCount(0);lossBlockRef.current=0;pnlRef.current=0;}if(!unsettled){pending.current=false;pendingCount.current=0;inFlight.current.clear();matchPause.current=false;setMatchPaused(false);setInFlightCount(0);reservedStake.current=0;setRiskExposure(0);uncertainPurchase.current=false;}lastTickKey.current='';if(!unsettled)matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');paceRef.current={eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—',lastDispatchSequence:0};setPaceView({...paceRef.current});tickLedger.current.clear();setLedgerView([]);tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');paceRef.current={eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—',lastDispatchSequence:0};setPaceView({...paceRef.current});setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(unsettled?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(unsettled)setErr('Account/symbol changed with a pending or unsettled order. Reconcile on Deriv before restarting.');else setErr('')}},[scopeKey,setTarget]);
+ // Prepared Deriv quotes are advisory, NOT purchased contracts. Never reuse a quote.
+ const proposalCache=useRef(new Map<number,{id:string;ask:number;stake:number;symbol:string;at:number}>());
+ const proposalGeneration=useRef(0);
+ const proposalRefreshBusy=useRef(false);
+ useEffect(()=>{
+   proposalCache.current.clear();
+   proposalGeneration.current++;
+   if(!ws||!isConnected||!accountId||!symbol||!active.current||halt.current)return;
+   let cancelled=false;
+   const generation=proposalGeneration.current;
+   const refresh=async()=>{
+     if(cancelled||proposalRefreshBusy.current)return;
+     proposalRefreshBusy.current=true;
+     const stake=amount(Number(base)*Math.pow(Number(factor),countRef.current));
+     try{
+       await Promise.all(Array.from({length:10},async(_,digit)=>{
+         try{
+           const response=await ws.send<any>({proposal:1,amount:stake,basis:'stake',contract_type:'DIGITMATCH',currency:'USD',duration:1,duration_unit:'t',symbol,barrier:String(digit)});
+           const quote=response?.proposal;
+           const ask=Number(quote?.ask_price);
+           if(!cancelled && proposalGeneration.current===generation && typeof quote?.id==='string' && quote.id && Number.isFinite(ask) && ask>0 && ask<=stake*1.05+0.001)
+             proposalCache.current.set(digit,{id:quote.id,ask,stake,symbol,at:performance.now()});
+         }catch{/* Missing proposal: direct-buy fallback remains available. */}
+       }));
+     }finally{proposalRefreshBusy.current=false}
+   };
+   void refresh();
+   const timer=setInterval(()=>{void refresh()},4000);
+   return()=>{cancelled=true;clearInterval(timer);proposalGeneration.current++;proposalCache.current.clear();proposalRefreshBusy.current=false};
+ },[ws,isConnected,accountId,symbol,base,factor,mode]);
  const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,firstLockMatch:boolean,entryKind:EntryKind,soonHorizon:number|null,frozenTrace:FrozenEntryTrace)=>{
   if(!ws||!accountId||halt.current||!active.current||winConfirmed.current||uncertainPurchase.current||matchPause.current||countRef.current>=Number(limit))return;
   // Never replay ticks skipped while a previous buy was in flight.
@@ -231,12 +261,20 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const signalToSubmitMs=Math.max(0,Math.round(buyStart-signalReceivedAt));
    // Dispatch before updating React state. This returns a promise and normally
    // writes to the existing open WebSocket synchronously.
-   const buyPromise=ws.send<any>({
-     buy:'1', price:amount(stake*1.05),
-     parameters:{amount:stake,basis:'stake',contract_type:'DIGITMATCH',
-       currency:'USD',duration:1,duration_unit:'t',underlying_symbol:symbol,
-       barrier:String(predicted)},
-   });
+   // Consume an already prepared quote if fresh, for exactly this stake/symbol.
+   // A quote does not guarantee entry on the next market tick.
+   const cached=proposalCache.current.get(predicted);
+   const usable=Boolean(cached && cached.symbol===symbol && cached.stake===stake &&
+     performance.now()-cached.at<2500 && cached.ask<=stake*1.05+0.001);
+   if(usable)proposalCache.current.delete(predicted); // proposal ID is single-use
+   const buyPromise=usable
+     ? ws.send<any>({buy:cached!.id,price:amount(stake*1.05)})
+     : ws.send<any>({
+         buy:'1',price:amount(stake*1.05),
+         parameters:{amount:stake,basis:'stake',contract_type:'DIGITMATCH',
+           currency:'USD',duration:1,duration_unit:'t',underlying_symbol:symbol,
+           barrier:String(predicted)},
+       });
    paceRef.current.dispatched++;
    recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'SENT','Purchase request submitted',predicted,frozenTrace.tradingLockOriginSequence);
    paceRef.current.lastDispatchSequence=signalSequence;
