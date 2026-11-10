@@ -33,7 +33,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const {setTarget} = useExecutionTarget();
  const {publishForecast} = useEngineForecast();
  const demo=Boolean(accountId)&&(/demo|virtual/i.test(accountType??'')||/^VRT/i.test(accountId??''));const real=Boolean(accountId)&&!demo;
- const [strategy,setStrategy]=useState<Strategy>('DYNAMIC');const [lockDuration,setLockDuration]=useState('5');
+ const [strategy,setStrategy]=useState<Strategy>('DYNAMIC');const [lockDuration,setLockDuration]=useState('5');const [tradeTicks,setTradeTicks]=useState('5');
+ const lockPurchases=useRef(new Map<number,number>());
  const lockRef=useRef<{digit:number;elapsed:number;source:EntryKind;signal:{score:number;momentum3:number;positiveSteps:number;threshold:number};originSequence:number;originEpoch:number}|null>(null);
  const [lockPosition,setLockPosition]=useState(0);
  const [tradeLockView,setTradeLockView]=useState<{digit:number;source:EntryKind;elapsed:number}|null>(null);
@@ -429,7 +430,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       active.current && !halt.current && !uncertainPurchase.current &&
       !matchPause.current && settings.isConnected && settings.accountId &&
       countRef.current<Number(settings.limit) &&
-      sequence>lastBuySignalSequence.current){
+      sequence>lastBuySignalSequence.current &&
+      (lockPurchases.current.get(fastLock.originSequence)??0)<Math.min(30,Math.max(1,Number(tradeTicks)||1))){
      const stake=amount(Number(settings.base)*Math.pow(Number(settings.factor),countRef.current));
      const trials=eligibleResults.current.length;
      const hits=eligibleResults.current.reduce((sum,hit)=>sum+hit,0);
@@ -458,9 +460,11 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
        paceRef.current.eligible++;
        recordTick(sequence,epoch,digit,'ELIGIBLE','Fast path: active Momentum Lock',fastLock.digit,fastLock.originSequence);
        // execute() calls ws.send before its first await; settlements remain async.
+       const previousCount=countRef.current;
        void execRef.current(fastLock.digit,stake,fastLock.signal,epoch,sequence,
          receivedAt,'MOMENTUM_LOCK',fastLockTick,Number(settings.lockDuration),
          false,fastLock.source,null,frozenTrace);
+       if(countRef.current>previousCount)lockPurchases.current.set(fastLock.originSequence,(lockPurchases.current.get(fastLock.originSequence)??0)+1);
        queueMicrotask(publishPace);
      }
    }
@@ -650,6 +654,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // Do NOT wait for ACK/settlement: each fresh tick has its own dispatch.
    // Execute at most one purchase on a fresh signal; require settlement and then a new tick.
    if(sequence<=lastBuySignalSequence.current){return} // Fast path already submitted this tick.
+   if(settings.strategy==='MOMENTUM_LOCK' && selected && (lockPurchases.current.get(selected.originSequence)??0)>=Math.min(30,Math.max(1,Number(tradeTicks)||1))){skipPace('Trade Ticks limit reached for this lock');return}
    const stake=amount(Number(settings.base)*Math.pow(Number(settings.factor),countRef.current));
    if(!Number.isFinite(stake)||stake<=0||stake+reservedStake.current+Math.max(0,-pnlRef.current)>Number(settings.maxLoss)){
     skipPace('Next stake would exceed loss limit');stop();setMode('MAX_LOSS');return;
@@ -678,7 +683,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    paceRef.current.eligible++;
    recordTick(sequence,epoch,digit,'ELIGIBLE','Risk and signal gates passed',target,selected?.originSequence??null);
    queueMicrotask(publishPace);
+   const previousCount=countRef.current;
    void execRef.current(target,stake,signal,epoch,sequence,receivedAt,settings.strategy,lockTick,settings.strategy==='MOMENTUM_LOCK'?Number(settings.lockDuration):0,firstLockMatch,signalKind,signalKind==='SOON'?soonLockRef.current?.horizon??null:null,frozenTrace);
+   if(settings.strategy==='MOMENTUM_LOCK' && selected && countRef.current>previousCount)lockPurchases.current.set(selected.originSequence,(lockPurchases.current.get(selected.originSequence)??0)+1);
    queueMicrotask(()=>{
      if(scope.current!==telemetryScope)return;
      setLockedDigit(target);setTarget(target);
@@ -708,7 +715,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   if(!window.confirm(`Start ${acc} automatic cycle? Contract: 1-tick DigitMatch, one submission per eligible tick, overlapping contracts possible. Maximum loss: $${maxLoss}; up to ${limit} purchases. No guaranteed returns.`))return;
   // Must begin a fresh cycle. Uncertain purchases cannot be reset with this control.
   if(mode==='UNCERTAIN'||uncertainPurchase.current||pendingCount.current>0||outstanding.current.size>0)return;
-  matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');countRef.current=0;setSentCount(0);pnlRef.current=0;reservedStake.current=0;setRiskExposure(0);matchPause.current=false;setMatchPaused(false);confirmedLosses.current=0;lossBlockRef.current=0;lockedRef.current=null;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setCount(0);setPnl(0);setLossBlock(0);setLockedDigit(null);setTarget(null);setLastOutcome(null);setTargetScore(null);setTargetRises(null);setTargetMomentum(null);setTargetProbability(null);winConfirmed.current=false;setErr('');halt.current=false;active.current=true;setLastTiming(null);setMode('RUNNING');if(sound)tone('buy');
+  lockPurchases.current.clear();matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');countRef.current=0;setSentCount(0);pnlRef.current=0;reservedStake.current=0;setRiskExposure(0);matchPause.current=false;setMatchPaused(false);confirmedLosses.current=0;lossBlockRef.current=0;lockedRef.current=null;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setCount(0);setPnl(0);setLossBlock(0);setLockedDigit(null);setTarget(null);setLastOutcome(null);setTargetScore(null);setTargetRises(null);setTargetMomentum(null);setTargetProbability(null);winConfirmed.current=false;setErr('');halt.current=false;active.current=true;setLastTiming(null);setMode('RUNNING');if(sound)tone('buy');
  }
  return <section className="w-full min-w-0 px-0 pb-2 text-slate-100"><div className="rounded-xl border border-cyan-500/30 bg-[#101a2e] p-2.5 shadow-lg shadow-black/30">
   <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><h2 className="font-bold text-cyan-300">⚡ DigitMatchStars Tick-Synchronized Rapid Engine</h2><span className={`rounded-full px-2 py-1 text-xs font-bold ${real?'bg-rose-900 text-rose-200':'bg-sky-900 text-sky-200'}`}>{real?'REAL MONEY':demo?'DEMO':'LOG IN'} · {mode}</span></div>
@@ -719,6 +726,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       </select>
     </label>
     {strategy==='MOMENTUM_LOCK'&&<label className="flex items-center gap-2">Lock ticks <input type="number" min="1" max="30" step="1" value={lockDuration} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setLockDuration(e.target.value)} className="w-14 rounded border border-slate-600 bg-[#0b1425] px-2 py-1 text-white" /></label>}
+    {strategy==='MOMENTUM_LOCK'&&<label className="flex items-center gap-2">Trade Ticks <input type="number" min="1" max="30" step="1" value={tradeTicks} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setTradeTicks(e.target.value)} className="w-14 rounded border border-slate-600 bg-[#0b1425] px-2 py-1 text-white" /></label>}
     {strategy==='MOMENTUM_LOCK'&&<span className="text-emerald-400">{tradeLockView?`Trading lock ${tradeLockView.digit} · ${tradeLockView.source} selection · tick ${tradeLockView.elapsed}/${lockDuration}`:'Waiting for rising momentum'}</span>}
   </div>
   <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">{([['Base $',base,setBase],['Multiplier',factor,setFactor],['Max trades',limit,setLimit],['Loss limit $',maxLoss,setMaxLoss],['Min score',threshold,setThreshold],['Min momentum',minMomentum,setMinMomentum]] as const).map(([name,v,fn])=><label key={name} className="text-[11px] text-slate-300">{name}<input value={v} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} type="number" min={name==='Min momentum'||name==='Min score'?'0':undefined} step={name==='Min momentum'?'0.1':'any'} onChange={e=>fn(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>)}</div>
@@ -728,6 +736,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       <span>Active target <strong className="text-white">{tradeLockView?.digit??'—'}</strong></span>
       <span>Remaining <strong>{tradeLockView?Math.max(0,Math.max(1,Number(lockDuration)||1)-tradeLockView.elapsed+1):'—'}</strong> trading ticks</span>
       <span>Selected by <strong>{tradeLockView?.source??'—'}</strong></span>
+      <span>Purchases this lock <strong>{lockRef.current?(lockPurchases.current.get(lockRef.current.originSequence)??0):0}/{tradeTicks}</strong></span>
       <span>Status <strong className={mode==='RUNNING'&&!matchPaused&&!winConfirmed.current?'text-emerald-300':'text-amber-300'}>{mode==='UNCERTAIN'?'RECONCILIATION REQUIRED':winConfirmed.current||mode==='WIN'?'WIN CONFIRMED · STOPPED':matchPaused?'MATCH HOLD · VERIFYING SETTLEMENT':mode!=='RUNNING'?'NOT TRADING':!tradeLockView?'WAITING FOR QUALIFIED LOCK':'ACTIVE · SAFETY GATES APPLY'}</strong></span>
     </div>
     <div className="mt-1 text-slate-400">{mode==='RUNNING'?`Latest execution decision: ${entryStatus}`:mode==='WIN'?'Cycle stopped after verified win. Start a new cycle to trade again.':`Purchases disabled: ${mode.toLowerCase().replaceAll('_',' ')}.`}</div>
