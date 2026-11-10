@@ -71,9 +71,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const [lastTiming,setLastTiming]=useState<{contractId:number;target:number;signalSequence:number;ackTicks:number;submitMs:number;buyMs:number;entryDigit:number|null;expiryDigit:number|null;result:'WIN'|'LOSS'}|null>(null);
  const refreshExposure=()=>{setRiskExposure(reservedStake.current);setInFlightCount(pendingCount.current)};
  const releaseMatchPause=()=>{
-   if(matchPause.current && pendingCount.current===0 && outstanding.current.size===0 && !uncertainPurchase.current && !winConfirmed.current){
-     matchPause.current=false;setMatchPaused(false);
-     if(active.current && !halt.current && !winConfirmed.current){setMode('RUNNING');setEntryStatus('All contracts settled without WIN · awaiting fresh tick')}
+   if(matchPause.current && [...matchHoldIds.current].every(id=>!outstanding.current.has(id)) && !uncertainPurchase.current && !winConfirmed.current){
+     matchPause.current=false;matchHoldIds.current.clear();setMatchHoldCount(0);setMatchPaused(false);
+     if(active.current && !halt.current && !winConfirmed.current){setMode('RUNNING');setEntryStatus('Matching contracts settled without WIN · awaiting fresh tick')}
    }
  };
  // Uncertain purchase outcomes stop further purchases until reconciliation.
@@ -324,9 +324,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      const journalRow:MomentumTrade={frozenTrace,verifiedExpiryMatchesTarget:expiryDigit===null?null:expiryDigit===predicted,entryVsSignalSeconds:entryEpoch===null?null:entryEpoch-tickEpoch,expiryVsSignalSeconds:expiryEpoch===null?null:expiryEpoch-tickEpoch,entryKind,soonHorizon:entryKind==='SOON'?soonHorizon??undefined:undefined,entryDelayTicks:entryEpoch===null?null:Math.max(0,entryEpoch-tickEpoch),signalSequence,signalToSubmitMs,ticksDuringAcknowledgment,signalAgeBudgetMs:Math.max(100,Math.min(350,(tickCadence.current.intervalMs??1000)*0.35)),buyAcknowledgmentMs:Math.round(acknowledgedAt-buyStart),entryEpoch,entryDigit,entrySpot:entrySpot===null?null:String(entrySpot),exitSpot:settle.exit_spot===undefined?null:String(settle.exit_spot),strategy:entryStrategy,lockTick,lockDuration:lockWindow,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch,expiryEpoch,expiryDigit,recordType:'TRADE',contractId:id,accountId,symbol,timestamp:new Date().toISOString(),targetDigit:predicted,score:signal.score,momentum3:signal.momentum3,positiveSteps:signal.positiveSteps,momentumRising:signal.momentum3>0&&signal.positiveSteps>=2,threshold:signal.threshold,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS'};
      try{const key=`dms-momentum-trades:v1:${symbol}`;const prev=JSON.parse(localStorage.getItem(key)||'[]');const rows=Array.isArray(prev)?prev:[];if(!rows.some((x:MomentumTrade)=>x.contractId===id&&x.accountId===accountId))localStorage.setItem(key,JSON.stringify([...rows.slice(-4999),journalRow]))}catch{}
      // Settlement runs in the background; only confirmed settlement frees the slot.
-     if(matchPause.current)setEntryStatus('Matched tick observed · verifying all unsettled contracts');
-     outstanding.current.delete(id);reservedStake.current=Math.max(0,amount(reservedStake.current-ask));setOutstandingCount(outstanding.current.size);refreshExposure();
-     if(win){winConfirmed.current=true;halt.current=true;active.current=false;matchPause.current=false;setMatchPaused(false);lockedRef.current=null;lockRef.current=null;setLockedDigit(null);setLockPosition(0);setTradeLockView(null);setTarget(null);setTargetScore(null);setTargetMomentum(null);setTargetProbability(null);setTargetRises(null);setMode('WIN')}
+     if(matchPause.current && matchHoldIds.current.has(id))setEntryStatus('Matched target observed · verifying relevant contract settlement');
+     outstanding.current.delete(id);matchHoldIds.current.delete(id);setMatchHoldCount(matchHoldIds.current.size);reservedStake.current=Math.max(0,amount(reservedStake.current-ask));setOutstandingCount(outstanding.current.size);refreshExposure();
+     if(win){winConfirmed.current=true;halt.current=true;active.current=false;matchPause.current=false;matchHoldIds.current.clear();setMatchHoldCount(0);setMatchPaused(false);lockedRef.current=null;lockRef.current=null;setLockedDigit(null);setLockPosition(0);setTradeLockView(null);setTarget(null);setTargetScore(null);setTargetMomentum(null);setTargetProbability(null);setTargetRises(null);setMode('WIN')}
      else {
       confirmedLosses.current++;
       if(winConfirmed.current){setMode('WIN')}
@@ -407,13 +407,22 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // A market match while BUY is pending or contracts are open may correspond
    // to an outstanding order, but does not establish which expiry wins.
    // Deriv's authoritative contract settlement is the only source of WIN/LOSS.
-   const matchingPending=[...inFlight.current.values()].some(c=>c.digit===digit);
-   const matchingUnsettled=[...outstanding.current.values()].some(c=>c.digit===digit);
-   if(active.current && !matchPause.current && (matchingPending || matchingUnsettled)){
-     matchPause.current=true;
-     setMatchPaused(true);
-     setMode('SETTLING');
-     setEntryStatus(`Market digit ${digit} matches a purchased/pending target · PAUSED for Deriv verification (not a confirmed win)`);
+   // Only hold for ACCEPTED contracts with the matching target. A pending
+   // request has no confirmed contract yet; a market match alone is not a WIN.
+   // Track the specific contract IDs so unrelated settlements do not extend
+   // the pause. The authoritative Deriv result still decides when to stop.
+   const matchingContracts=[...outstanding.current.entries()]
+     .filter(([,contract])=>contract.digit===digit)
+     .map(([id])=>id);
+   if(active.current && matchingContracts.length>0){
+     matchingContracts.forEach(id=>matchHoldIds.current.add(id));
+     setMatchHoldCount(matchHoldIds.current.size);
+     if(!matchPause.current){
+       matchPause.current=true;
+       setMatchPaused(true);
+       setMode('SETTLING');
+     }
+     setEntryStatus(`Market digit ${digit} matches ${matchingContracts.length} accepted contract(s) · checking Deriv expiry (not a confirmed win)`);
    }
    if(tickStats.current.received%5===0){
      const ms=tickCadence.current.intervalMs;
@@ -423,6 +432,16 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // LOW-LATENCY LOCK PATH: a previously acquired Momentum Lock needs no
    // forecasting or score recalculation before submitting its next order.
    // Dispatch first, then run the normal analytics for this observed tick.
+   // Retire a lock once its configured purchase budget is used. Do not
+   // keep an exhausted target alive until the lock-duration timer runs out.
+   // The next qualifying signal can acquire a fresh lock on this tick.
+   const exhaustedLock=lockRef.current;
+   if(settings.strategy==='MOMENTUM_LOCK' && exhaustedLock &&
+      (lockPurchases.current.get(exhaustedLock.originSequence)??0)>=Math.min(30,Math.max(1,Number(tradeTicks)||1))){
+     lockRef.current=null;
+     setLockPosition(0);setTradeLockView(null);
+     lockPurchases.current.delete(exhaustedLock.originSequence);
+   }
    const fastLock=lockRef.current;
    const fastLockTick=fastLock?fastLock.elapsed+1:0;
    if(settings.strategy==='MOMENTUM_LOCK' && fastLock &&
@@ -583,7 +602,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(!active.current||halt.current||uncertainPurchase.current||!settings.accountId||!settings.isConnected){
      recordTick(sequence,epoch,digit,'SKIPPED',!active.current?'Cycle inactive':halt.current?'Cycle halted':uncertainPurchase.current?'Uncertain purchase':!settings.accountId?'No account':'Disconnected',lockRef.current?.digit??null,lockRef.current?.originSequence??null);return;
    }
-   if(matchPause.current){skipPace('Match hold: awaiting Deriv settlement');setEntryStatus(`MATCH HOLD · ${outstanding.current.size} confirmed + ${pendingCount.current} pending contracts; await Deriv settlement`);return;}
+   if(matchPause.current){skipPace('Match hold: verifying matching contracts');setEntryStatus(`MATCH HOLD · ${matchHoldIds.current.size} matching accepted contracts pending Deriv verification`);return;}
    if(!ranking.length){skipPace('Forecast warming up');setEntryStatus('V1 warming up');return}
    if(countRef.current>=Number(settings.limit)){skipPace('Max trades reached');halt.current=true;active.current=false;setMode('MAX_TRADES');setEntryStatus('Max trades reached');return}
    // Both NEXT and SOON can qualify independently on EVERY fresh tick.
@@ -646,7 +665,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const lockTick=settings.strategy==='MOMENTUM_LOCK'?selected!.elapsed:0;
    // Do not skip just because the observed tick equals the target:
    // that tick has already occurred and the new contract will enter later.
-   // An actual pending-contract match still activates the independent
+   // A match involving an accepted contract activates the targeted
    // settlement-verification hold earlier in this callback.
    // Send only from a fresh, nonmatching observed tick. Settlement is
    // exclusively determined by Deriv, asynchronously after the BUY acknowledgment.
