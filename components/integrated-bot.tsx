@@ -640,9 +640,12 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const choice=nextCandidate;
    const choiceKind:EntryKind='NEXT';
    if(!choice && !(settings.strategy==='MOMENTUM_LOCK' && selected)){skipPace('No qualifying signal');setEntryStatus('No qualified NEXT or active SOON target');return}
+   const instantLockEntry=settings.strategy==='MOMENTUM_LOCK' && !selected && Boolean(choice);
    if(settings.strategy==='MOMENTUM_LOCK' && !selected && choice){
      selected={digit:choice.digit,elapsed:1,source:choiceKind,originSequence:sequence,originEpoch:epoch,signal:{score:choice.score,momentum3:choice.momentum3,positiveSteps:choice.positiveSteps,threshold:Number(settings.threshold)}};
-     lockRef.current=selected;setLockPosition(1);setTradeLockView({digit:selected.digit,source:selected.source,elapsed:1});
+     lockRef.current=selected;
+     // UI updates occur after the immediate purchase submission, not before it.
+     queueMicrotask(()=>{setLockPosition(1);setTradeLockView({digit:selected!.digit,source:selected!.source,elapsed:1})});
    }
    // Optional gate tests the actual V1 next-tick candidate, rather than a
    // different, horizon-optimized digit. The contract break-even rate may be
@@ -710,9 +713,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      tradingLockOriginDigit:settings.strategy==='MOMENTUM_LOCK'?selected?.digit??null:null,
    };
    paceRef.current.eligible++;
-   recordTick(sequence,epoch,digit,'ELIGIBLE','Risk and signal gates passed',target,selected?.originSequence??null);
-   queueMicrotask(publishPace);
+   recordTick(sequence,epoch,digit,'ELIGIBLE',instantLockEntry?'INSTANT LOCK ENTRY: purchase on acquisition tick':'Risk and signal gates passed',target,selected?.originSequence??null);
    void execRef.current(target,stake,signal,epoch,sequence,receivedAt,settings.strategy,lockTick,settings.strategy==='MOMENTUM_LOCK'?Number(settings.lockDuration):0,firstLockMatch,signalKind,signalKind==='SOON'?soonLockRef.current?.horizon??null:null,frozenTrace);
+   queueMicrotask(publishPace);
    queueMicrotask(()=>{
      if(scope.current!==telemetryScope)return;
      setLockedDigit(target);setTarget(target);
