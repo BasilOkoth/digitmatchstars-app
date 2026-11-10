@@ -202,6 +202,21 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     setMode('RUNNING');
     return;
    }
+   // One atomic lock quota for BOTH fast and normal dispatch paths.
+   // Reserve only at the actual irreversible submission boundary.
+   const lockOrigin=frozenTrace.tradingLockOriginSequence;
+   if(entryStrategy==='MOMENTUM_LOCK'){
+     if(lockOrigin===null || lockRef.current?.originSequence!==lockOrigin){
+       recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'SKIPPED','Lock expired before purchase',predicted,lockOrigin);
+       return;
+     }
+     const quota=Math.min(30,Math.max(1,Number(tradeTicks)||1));
+     if((lockPurchases.current.get(lockOrigin)??0)>=quota){
+       recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'SKIPPED','Trade Ticks quota reached',predicted,lockOrigin);
+       return;
+     }
+     lockPurchases.current.set(lockOrigin,(lockPurchases.current.get(lockOrigin)??0)+1);
+   }
    // Reserve this tick before an irreversible buy request.
    // The next request must be driven by a *later tick*, not a queued signal.
    lastBuySignalSequence.current=signalSequence;
@@ -349,7 +364,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     refreshExposure();
     releaseMatchPause();
   }
- },[ws,accountId,symbol,limit,maxLoss,play,setTarget,pipSize]);
+ },[ws,accountId,symbol,limit,maxLoss,play,setTarget,pipSize,tradeTicks]);
  const execRef=useRef(execute);execRef.current=execute; // Keep callback current without waiting for a post-render effect.
  useEffect(()=>{if(!isConnected && active.current){halt.current=true;active.current=false;setMode('UNCERTAIN');setErr('Connection lost. Verify outstanding contracts on Deriv before a new cycle.');}},[isConnected]);
  // Process the live WebSocket frame synchronously, BEFORE React's render cycle.
@@ -440,7 +455,6 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       (lockPurchases.current.get(exhaustedLock.originSequence)??0)>=Math.min(30,Math.max(1,Number(tradeTicks)||1))){
      lockRef.current=null;
      setLockPosition(0);setTradeLockView(null);
-     lockPurchases.current.delete(exhaustedLock.originSequence);
    }
    const fastLock=lockRef.current;
    const fastLockTick=fastLock?fastLock.elapsed+1:0;
@@ -479,11 +493,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
        paceRef.current.eligible++;
        recordTick(sequence,epoch,digit,'ELIGIBLE','Fast path: active Momentum Lock',fastLock.digit,fastLock.originSequence);
        // execute() calls ws.send before its first await; settlements remain async.
-       const previousCount=countRef.current;
        void execRef.current(fastLock.digit,stake,fastLock.signal,epoch,sequence,
          receivedAt,'MOMENTUM_LOCK',fastLockTick,Number(settings.lockDuration),
          false,fastLock.source,null,frozenTrace);
-       if(countRef.current>previousCount)lockPurchases.current.set(fastLock.originSequence,(lockPurchases.current.get(fastLock.originSequence)??0)+1);
        queueMicrotask(publishPace);
      }
    }
@@ -581,7 +593,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    queueMicrotask(()=>{
      if(scope.current!==telemetryScope)return;
      setTargetMomentum(displayForecast?.momentum3??null);
-     setTargetProbability(displayForecast?.probability??null);
+     setTargetProbability(null);
      setTargetScore(displayForecast?.score??null);
      setTargetRises(displayForecast?.positiveSteps??null);
    });
@@ -623,12 +635,10 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      const label=soonLock?`SOON lock ${soonLock.digit} · ${Math.max(0,soonLock.expiresSequence-sequence)} ticks left`:'No active SOON lock';
      queueMicrotask(()=>setSoonLockView(label));
    }
-   // NEXT has priority if qualified. Otherwise the still-valid SOON lock
-   // gets an opportunity on EACH fresh tick, subject to current momentum,
-   // exposure, stale-signal and match-hold safety gates.
+   // Trade only on qualified NEXT signals. SOON is appearance telemetry, not a one-tick expiry forecast.
    const lockedSoonCandidate=soonLock?ranking.find(row=>row.digit===soonLock.digit)??null:null;
-   const choice=nextCandidate??lockedSoonCandidate;
-   const choiceKind:EntryKind=nextCandidate?'NEXT':'SOON';
+   const choice=nextCandidate;
+   const choiceKind:EntryKind='NEXT';
    if(!choice && !(settings.strategy==='MOMENTUM_LOCK' && selected)){skipPace('No qualifying signal');setEntryStatus('No qualified NEXT or active SOON target');return}
    if(settings.strategy==='MOMENTUM_LOCK' && !selected && choice){
      selected={digit:choice.digit,elapsed:1,source:choiceKind,originSequence:sequence,originEpoch:epoch,signal:{score:choice.score,momentum3:choice.momentum3,positiveSteps:choice.positiveSteps,threshold:Number(settings.threshold)}};
@@ -693,7 +703,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      signalSequence:sequence,signalEpoch:epoch,signalObservedDigit:digit,
      signalReceivedAtIso:new Date().toISOString(),momentum:ownMomentum,
      score:chosenForecast.score,positiveSteps:ownRises,
-     forecastProbability:Number.isFinite(chosenForecast.probability)?chosenForecast.probability:null,
+     forecastProbability:null,
      lockRemainingTicks:soonLockRef.current?Math.max(0,soonLockRef.current.expiresSequence-sequence):null,
      tradingLockOriginSequence:settings.strategy==='MOMENTUM_LOCK'?selected?.originSequence??null:null,
      tradingLockOriginEpoch:settings.strategy==='MOMENTUM_LOCK'?selected?.originEpoch??null:null,
@@ -702,9 +712,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    paceRef.current.eligible++;
    recordTick(sequence,epoch,digit,'ELIGIBLE','Risk and signal gates passed',target,selected?.originSequence??null);
    queueMicrotask(publishPace);
-   const previousCount=countRef.current;
    void execRef.current(target,stake,signal,epoch,sequence,receivedAt,settings.strategy,lockTick,settings.strategy==='MOMENTUM_LOCK'?Number(settings.lockDuration):0,firstLockMatch,signalKind,signalKind==='SOON'?soonLockRef.current?.horizon??null:null,frozenTrace);
-   if(settings.strategy==='MOMENTUM_LOCK' && selected && countRef.current>previousCount)lockPurchases.current.set(selected.originSequence,(lockPurchases.current.get(selected.originSequence)??0)+1);
    queueMicrotask(()=>{
      if(scope.current!==telemetryScope)return;
      setLockedDigit(target);setTarget(target);
