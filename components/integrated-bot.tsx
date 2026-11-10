@@ -183,6 +183,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       .catch(()=>{/* Quote unavailable: original direct-buy path remains available. */})
       .finally(()=>{if(firstLockProposalPending.current?.digit===digit && firstLockProposalPending.current?.stake===stake && firstLockProposalPending.current?.accountId===accountId)firstLockProposalPending.current=null});
   };
+ const prepareFirstLockProposalRef=useRef(prepareFirstLockProposal);
+ prepareFirstLockProposalRef.current=prepareFirstLockProposal;
  const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,firstLockMatch:boolean,entryKind:EntryKind,soonHorizon:number|null,frozenTrace:FrozenEntryTrace)=>{
   if(!ws||!accountId||halt.current||!active.current||winConfirmed.current||uncertainPurchase.current||matchPause.current||countRef.current>=Number(limit))return;
   // Never replay ticks skipped while a previous buy was in flight.
