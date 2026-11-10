@@ -419,6 +419,51 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      setCadenceLabel(ms===null?'Measuring tick interval':`${(ms/1000).toFixed(2)}s/tick · ${(1000/ms).toFixed(2)} ticks/s`);
      setStreamStatus(`Stream ${tickStats.current.received} ticks · duplicates ${tickStats.current.duplicates} · out of order ${tickStats.current.outOfOrder} · stale quotes ${tickStats.current.staleQuotes}`);
    }
+   // LOW-LATENCY LOCK PATH: a previously acquired Momentum Lock needs no
+   // forecasting or score recalculation before submitting its next order.
+   // Dispatch first, then run the normal analytics for this observed tick.
+   const fastLock=lockRef.current;
+   const fastLockTick=fastLock?fastLock.elapsed+1:0;
+   if(settings.strategy==='MOMENTUM_LOCK' && fastLock &&
+      fastLockTick<=Number(settings.lockDuration) &&
+      active.current && !halt.current && !uncertainPurchase.current &&
+      !matchPause.current && settings.isConnected && settings.accountId &&
+      countRef.current<Number(settings.limit) &&
+      sequence>lastBuySignalSequence.current){
+     const stake=amount(Number(settings.base)*Math.pow(Number(settings.factor),countRef.current));
+     const trials=eligibleResults.current.length;
+     const hits=eligibleResults.current.reduce((sum,hit)=>sum+hit,0);
+     const evidenceOK=!requireEvidence||(trials>=150&&wilsonLower(hits,trials)>0.1);
+     const riskOK=Number.isFinite(stake)&&stake>0 &&
+       stake+reservedStake.current+Math.max(0,-pnlRef.current)<=Number(settings.maxLoss);
+     if(evidenceOK&&riskOK){
+       const priorRanking=scoreRef.current;
+       const priorTarget=priorRanking.find(row=>row.digit===fastLock.digit)??null;
+       const frozenTrace:FrozenEntryTrace={
+         strategy:'MOMENTUM_LOCK',lockSource:fastLock.source,signalKind:fastLock.source,
+         target:fastLock.digit,nextDigit:priorRanking[0]?.digit??null,
+         soonDigit:soonLockRef.current?.digit??null,
+         soonLockedDigit:soonLockRef.current?.digit??null,
+         soonHorizon:soonLockRef.current?.horizon??null,
+         signalSequence:sequence,signalEpoch:epoch,signalObservedDigit:digit,
+         signalReceivedAtIso:new Date().toISOString(),
+         momentum:fastLock.signal.momentum3,score:fastLock.signal.score,
+         positiveSteps:fastLock.signal.positiveSteps,
+         forecastProbability:priorTarget?.probability??null,
+         lockRemainingTicks:null,
+         tradingLockOriginSequence:fastLock.originSequence,
+         tradingLockOriginEpoch:fastLock.originEpoch,
+         tradingLockOriginDigit:fastLock.digit,
+       };
+       paceRef.current.eligible++;
+       recordTick(sequence,epoch,digit,'ELIGIBLE','Fast path: active Momentum Lock',fastLock.digit,fastLock.originSequence);
+       // execute() calls ws.send before its first await; settlements remain async.
+       void execRef.current(fastLock.digit,stake,fastLock.signal,epoch,sequence,
+         receivedAt,'MOMENTUM_LOCK',fastLockTick,Number(settings.lockDuration),
+         false,fastLock.source,null,frozenTrace);
+       queueMicrotask(publishPace);
+     }
+   }
    // Grade the PREVIOUS tick's eligible forecast before computing today's scores.
    // This evaluates a single-digit next-tick prediction, not top-five coverage.
    if(nextTickPending.current!==null){
@@ -604,7 +649,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const firstLockMatch=false;
    // Do NOT wait for ACK/settlement: each fresh tick has its own dispatch.
    // Execute at most one purchase on a fresh signal; require settlement and then a new tick.
-   if(sequence<=lastBuySignalSequence.current){skipPace('Already dispatched for tick');setEntryStatus('Awaiting new tick');return}
+   if(sequence<=lastBuySignalSequence.current){return} // Fast path already submitted this tick.
    const stake=amount(Number(settings.base)*Math.pow(Number(settings.factor),countRef.current));
    if(!Number.isFinite(stake)||stake<=0||stake+reservedStake.current+Math.max(0,-pnlRef.current)>Number(settings.maxLoss)){
     skipPace('Next stake would exceed loss limit');stop();setMode('MAX_LOSS');return;
