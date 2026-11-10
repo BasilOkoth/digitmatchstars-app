@@ -154,6 +154,49 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
  useEffect(()=>{if(scope.current!==scopeKey){const unsettled=outstanding.current.size>0||pendingCount.current>0||uncertainPurchase.current;scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];intelligenceRef.current.reset();soonAuditRef.current.reset();soonLockRef.current=null;setSoonLockView(null);setEntryTimingView(null);setSoonView(null);setEntrySignal(null);setLastTrace(null);executionForecastRef.current.reset();setLastTiming(null);setExecutionAudit(null);setHorizonTarget(null);setHorizonProbability(null);setIntelligenceAudit(null);nextTickPending.current=null;eligibleResults.current=[];setAccuracyAudit({trials:0,hits:0,lower95:0});if(!unsettled)confirmedLosses.current=0;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setTopMomentum(null);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);lockedRef.current=null;if(!unsettled){countRef.current=0;setSentCount(0);lossBlockRef.current=0;pnlRef.current=0;}if(!unsettled){pending.current=false;pendingCount.current=0;inFlight.current.clear();matchPause.current=false;setMatchPaused(false);setInFlightCount(0);reservedStake.current=0;setRiskExposure(0);uncertainPurchase.current=false;}lastTickKey.current='';if(!unsettled)matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');paceRef.current={eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—',lastDispatchSequence:0};setPaceView({...paceRef.current});tickLedger.current.clear();setLedgerView([]);tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');paceRef.current={eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—',lastDispatchSequence:0};setPaceView({...paceRef.current});setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(unsettled?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(unsettled)setErr('Account/symbol changed with a pending or unsettled order. Reconcile on Deriv before restarting.');else setErr('')}},[scopeKey,setTarget]);
  // Prepared Deriv quotes are advisory, NOT purchased contracts. Never reuse a quote.
+ // One account-wide settlement stream, shared by every outstanding contract.
+ // Do not create a subscription or 1.2-second poll for each purchase.
+ const contractWaiters=useRef(new Map<number,{resolve:(c:any)=>void;reject:(e:Error)=>void}>());
+ const settledFrames=useRef(new Map<number,any>());
+ const monitorRef=useRef<{unsubscribe:()=>Promise<void>}|null>(null);
+ const monitorStartRef=useRef<Promise<void>|null>(null);
+ const monitorErrorRef=useRef<Error|null>(null);
+ const monitorWsRef=useRef<DerivWS|null>(null);
+ const onContractFrame=(frame:Record<string,unknown>)=>{
+   const c=(frame as any).proposal_open_contract;
+   const id=Number(c?.contract_id);
+   if(!Number.isSafeInteger(id)||id<=0||!(c?.is_sold||c?.status==='won'||c?.status==='lost'))return;
+   const waiter=contractWaiters.current.get(id);
+   if(waiter){contractWaiters.current.delete(id);waiter.resolve(c)}
+   else if(outstanding.current.has(id))settledFrames.current.set(id,c);
+ };
+ const ensureContractMonitor=async()=>{
+   if(!ws)throw new Error('Deriv connection unavailable for settlement monitor');
+   if(monitorWsRef.current!==ws){
+     if(monitorRef.current)void monitorRef.current.unsubscribe().catch(()=>{});
+     monitorRef.current=null;monitorStartRef.current=null;monitorErrorRef.current=null;monitorWsRef.current=ws;
+   }
+   if(monitorErrorRef.current)throw monitorErrorRef.current;
+   if(monitorRef.current)return;
+   if(!monitorStartRef.current){
+     monitorStartRef.current=ws.subscribe({proposal_open_contract:1,subscribe:1},onContractFrame)
+       .then(sub=>{monitorRef.current={unsubscribe:sub.unsubscribe}})
+       .catch(e=>{monitorErrorRef.current=new Error(`Shared contract stream unavailable: ${String(e)}`);throw monitorErrorRef.current})
+       .finally(()=>{monitorStartRef.current=null});
+   }
+   await monitorStartRef.current;
+ };
+ useEffect(()=>{
+   if(ws && isConnected && accountId && mode==='RUNNING')void ensureContractMonitor().catch(e=>{
+     halt.current=true;active.current=false;setMode('UNCERTAIN');setErr(`Settlement monitor unavailable: ${String(e)}`);
+   });
+ },[ws,isConnected,accountId,mode]);
+ useEffect(()=>()=>{
+   if(monitorRef.current)void monitorRef.current.unsubscribe().catch(()=>{});
+   monitorRef.current=null;
+   for(const waiter of contractWaiters.current.values())waiter.reject(new Error('Contract monitor disconnected; reconcile in Deriv'));
+   contractWaiters.current.clear();settledFrames.current.clear();monitorStartRef.current=null;
+ },[ws,accountId]);
  const proposalCache=useRef(new Map<number,{id:string;ask:number;stake:number;symbol:string;at:number}>());
  const proposalGeneration=useRef(0);
  const proposalRefreshBusy=useRef(false);
@@ -231,6 +274,11 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     setEntryStatus('Signal expired before dispatch · awaiting fresh tick');
     setMode('RUNNING');
     return;
+   }
+   if(!monitorRef.current){
+     recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'SKIPPED','Shared settlement monitor not ready',predicted,frozenTrace.tradingLockOriginSequence);
+     reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
+     return;
    }
    // One atomic lock quota for BOTH fast and normal dispatch paths.
    // Reserve only at the actual irreversible submission boundary.
@@ -314,33 +362,24 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const id=contractId;
    // Background settlement monitor; later ticks can dispatch overlapping contracts.
    void (async()=>{
-    let unsubscribe:(()=>Promise<void>)|undefined;
     const settlementStart=performance.now();
     try{
+     // Single subscription is shared by all outstanding contracts. Never poll each contract.
+     // Register the waiter before awaiting monitor setup, so quick settlements are not missed.
      const settle=await new Promise<any>((resolve,reject)=>{
-      let done=false;
-      let pollTimer:ReturnType<typeof setInterval>|undefined;
-      const timeout=setTimeout(()=>finish(null,new Error(`Unconfirmed contract ${id}; reconciliation required`)),45000);
-      function finish(c:any,error?:Error){
-       if(done)return;
-       done=true;clearTimeout(timeout);
-       if(pollTimer)clearInterval(pollTimer);
-       if(error)reject(error);else resolve(c);
-      }
-      const handle=(frame:Record<string,unknown>)=>{
-       const c=(frame as any).proposal_open_contract;
-       if(Number(c?.contract_id)!==id)return;
-       if(c.is_sold || c.status==='won' || c.status==='lost')finish(c);
-      };
-      void ws.subscribe({proposal_open_contract:1,contract_id:id},handle)
-       .then(sub=>{unsubscribe=sub.unsubscribe;if(done)void sub.unsubscribe()})
-       .catch(()=>{
-        if(done)return;
-        const poll=async()=>{
-         try{handle(await ws.send<any>({proposal_open_contract:1,contract_id:id}))}catch{/* retry until timeout */}
-        };
-        pollTimer=setInterval(()=>void poll(),1200);
-        void poll();
+       const cached=settledFrames.current.get(id);
+       if(cached){settledFrames.current.delete(id);resolve(cached);return}
+       const timeout=setTimeout(()=>{
+         contractWaiters.current.delete(id);
+         reject(new Error(`Unconfirmed contract ${id}; reconcile in Deriv`));
+       },45000);
+       contractWaiters.current.set(id,{
+         resolve:c=>{clearTimeout(timeout);resolve(c)},
+         reject:e=>{clearTimeout(timeout);reject(e)},
+       });
+       void ensureContractMonitor().catch(e=>{
+         const waiter=contractWaiters.current.get(id);
+         if(waiter){contractWaiters.current.delete(id);waiter.reject(e instanceof Error?e:new Error(String(e)))}
        });
      });
      const payout=Number(settle.sell_price??settle.payout); const buyPrice=Number(settle.buy_price??ask);
@@ -389,7 +428,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      }
      releaseMatchPause();
     }catch(e){halt.current=true;active.current=false;setMode('UNCERTAIN');setErr(`Contract ${id}: ${String(e)}. Reconcile in Deriv before restarting.`)}
-    finally{if(unsubscribe)void unsubscribe();setOutstandingCount(outstanding.current.size);releaseMatchPause()}
+    finally{contractWaiters.current.delete(id);setOutstandingCount(outstanding.current.size);releaseMatchPause()}
    })();
   }catch(e){halt.current=true;active.current=false;
    // Uncertain buy: retain reservation. Do not retry or initiate more purchases.
