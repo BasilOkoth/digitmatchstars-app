@@ -451,7 +451,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
          signalReceivedAtIso:new Date().toISOString(),
          momentum:fastLock.signal.momentum3,score:fastLock.signal.score,
          positiveSteps:fastLock.signal.positiveSteps,
-         forecastProbability:priorTarget?.probability??null,
+         forecastProbability:null, // DigitScore does not expose a calibrated probability
          lockRemainingTicks:null,
          tradingLockOriginSequence:fastLock.originSequence,
          tradingLockOriginEpoch:fastLock.originEpoch,
@@ -739,7 +739,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       <span>Purchases this lock <strong>{lockRef.current?(lockPurchases.current.get(lockRef.current.originSequence)??0):0}/{tradeTicks}</strong></span>
       <span>Status <strong className={mode==='RUNNING'&&!matchPaused&&!winConfirmed.current?'text-emerald-300':'text-amber-300'}>{mode==='UNCERTAIN'?'RECONCILIATION REQUIRED':winConfirmed.current||mode==='WIN'?'WIN CONFIRMED · STOPPED':matchPaused?'MATCH HOLD · VERIFYING SETTLEMENT':mode!=='RUNNING'?'NOT TRADING':!tradeLockView?'WAITING FOR QUALIFIED LOCK':'ACTIVE · SAFETY GATES APPLY'}</strong></span>
     </div>
-    <div className="mt-1 text-slate-400">{mode==='RUNNING'?`Latest execution decision: ${entryStatus}`:mode==='WIN'?'Cycle stopped after verified win. Start a new cycle to trade again.':`Purchases disabled: ${mode.toLowerCase().replaceAll('_',' ')}.`}</div>
+    <div className="mt-1 text-slate-400">{mode==='RUNNING'?`Latest execution decision: ${entryStatus}`:mode==='WIN'?'Cycle stopped after verified win. Start a new cycle to trade again.':`Purchases disabled: ${mode.toLowerCase().replace(/_/g,' ')}.`}</div>
     <div className="mt-1 text-slate-500">SOON appearance lock below is research-only; it does not replace the active trading target. ACTIVE means eligible ticks are evaluated, not that every tick will be purchased.</div>
   </div>}
   <div className="mt-2 rounded-md border border-cyan-500/30 bg-[#091725] px-2 py-1.5 text-[11px] text-slate-200" aria-label="Tick-paced dispatch audit">
