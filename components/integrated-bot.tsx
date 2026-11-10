@@ -742,10 +742,28 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     <div className="mt-1 text-slate-400">{mode==='RUNNING'?`Latest execution decision: ${entryStatus}`:mode==='WIN'?'Cycle stopped after verified win. Start a new cycle to trade again.':`Purchases disabled: ${mode.toLowerCase().replace(/_/g,' ')}.`}</div>
     <div className="mt-1 text-slate-500">SOON appearance lock below is research-only; it does not replace the active trading target. ACTIVE means eligible ticks are evaluated, not that every tick will be purchased.</div>
   </div>}
-  <div className="mt-2 rounded-md border border-slate-700/60 bg-[#091725] text-[11px] text-slate-200" aria-label="Advanced diagnostics">
-    <details className="group">
-      <summary className="cursor-pointer select-none px-2 py-1.5 font-semibold text-cyan-300">Advanced diagnostics <span className="font-normal text-slate-400">· contract trace, dispatch and tick ledger</span></summary>
-      <div className="space-y-2 border-t border-slate-700/60 px-2 py-2">
+  <div className="mt-2 rounded-md border border-cyan-500/30 bg-[#091725] px-2 py-1.5 text-[11px] text-slate-200" aria-label="Tick-paced dispatch audit">
+    <span className="font-semibold text-cyan-300">Tick-paced dispatch</span>
+    <span className="ml-2">Eligible <strong>{paceView.eligible}</strong></span>
+    <span className="ml-2">Sent <strong>{paceView.dispatched}</strong></span>
+    <span className="ml-2">Accepted <strong>{paceView.accepted}</strong></span>
+    <span className="ml-2">Skipped <strong>{paceView.skipped}</strong></span>
+    <span className="ml-2">Coverage <strong>{paceView.eligible?`${(100*paceView.dispatched/paceView.eligible).toFixed(1)}%`:'—'}</strong></span>
+    <div className="text-slate-400">Last skipped: {paceView.lastSkip} · Last dispatched tick #{paceView.lastDispatchSequence||'—'} · {cadenceLabel}</div>
+    <div className="text-slate-500">Sent means a request was submitted, not that Deriv entered on that exact tick. Accepted counts acknowledged contracts. Risk controls and confirmed wins intentionally prevent trading every market tick.</div>
+    <div className="mt-1 font-semibold text-cyan-300">Recent tick-to-purchase ledger</div>
+    <div className="max-h-60 overflow-y-auto font-mono text-[10px]" aria-label="Tick purchase ledger">{ledgerView.map(t=><div key={t.sequence} className="border-t border-slate-700/40 py-0.5">#{t.sequence} · market {t.observedDigit} · target {t.target??'—'} · lock from #{t.lockOriginSequence??'—'} · <strong className={t.status==='ACCEPTED'?'text-emerald-400':t.status==='UNCERTAIN'?'text-red-400':'text-slate-300'}>{t.status}</strong> · {t.reason}{t.contractId?` · #${t.contractId}`:''}{t.entryDigit!==undefined?` · entry ${t.entryDigit??'?'} @ ${t.entryEpoch??'?'}`:''}{t.expiryDigit!==undefined?` · expiry ${t.expiryDigit??'?'} @ ${t.expiryEpoch??'?'}`:''}</div>)}</div>
+  </div>
+  <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4">{[['Next-tick top',scores[0]?.digit??'—'],['Trade',`${count}/${limit}`],['Next stake',`$${next.toFixed(2)}`],['Cycle P/L',`${pnl>=0?'+':''}$${pnl.toFixed(2)}`]].map(([k,v])=><div key={String(k)} className="rounded-lg bg-[#0a1222] px-2 py-1.5"><div className="text-[11px] text-slate-400">{k}</div><div className={`font-extrabold ${k==='Cycle P/L' ? (pnl>0 ? 'text-green-400' : pnl<0 ? 'text-red-500' : 'text-slate-100') : 'text-slate-100'}`}>{v}</div></div>)}</div>
+  <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs" aria-live="polite">
+    <span className={topMomentum===null?'text-slate-400':topMomentum>0?'font-bold text-emerald-400':'font-bold text-rose-400'}>
+      Momentum {topMomentum===null?'warming up':`${topMomentum>=0?'+':''}${topMomentum.toFixed(2)}`}
+    </span>
+    <span className="text-slate-300">{strategy==='MOMENTUM_LOCK' ? 'Locked target (next tick)' : 'V1 next-tick target'} {winConfirmed.current ? '—' : (strategy==='MOMENTUM_LOCK' ? tradeLockView?.digit ?? '—' : scores[0]?.digit ?? '—')}</span>
+    {soonView&&<span className="text-sky-300">SOON {soonView.digit} · within {soonView.horizon} ticks · momentum +{soonView.momentum.toFixed(2)} · observed {soonView.trials?`${(soonView.rate*100).toFixed(1)}% / ${soonView.trials}`:'warming up'} (appearance, not contract win)</span>}
+    {soonLockView&&<span className="text-cyan-300">{soonLockView}</span>}
+    {entrySignal&&<span className="font-semibold text-white">Last entry: {strategy==='MOMENTUM_LOCK'?'Momentum Lock':'Dynamic V1'} · {entrySignal} selection</span>}
+    {entryTimingView&&<span className="text-amber-200">Timing: {entryTimingView}</span>}
     {lastTrace&&<div className="w-full rounded-md border border-slate-600 bg-[#0a1222] p-2 text-[11px]" aria-label="Frozen contract signal audit">
       <div className="font-bold text-cyan-300">Verified contract trace · #{lastTrace.contractId}</div>
       <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-slate-200">
@@ -759,31 +777,6 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       </div>
       <div className="mt-1 text-slate-400">Frozen at dispatch. Deriv settlement determines WIN/LOSS; matching digits alone do not prove tick-level execution alignment.</div>
     </div>}
-      <div>
-    <span className="font-semibold text-cyan-300">Tick-paced dispatch</span>
-    <span className="ml-2">Eligible <strong>{paceView.eligible}</strong></span>
-    <span className="ml-2">Sent <strong>{paceView.dispatched}</strong></span>
-    <span className="ml-2">Accepted <strong>{paceView.accepted}</strong></span>
-    <span className="ml-2">Skipped <strong>{paceView.skipped}</strong></span>
-    <span className="ml-2">Coverage <strong>{paceView.eligible?`${(100*paceView.dispatched/paceView.eligible).toFixed(1)}%`:'—'}</strong></span>
-    <div className="text-slate-400">Last skipped: {paceView.lastSkip} · Last dispatched tick #{paceView.lastDispatchSequence||'—'} · {cadenceLabel}</div>
-    <div className="text-slate-500">Sent means a request was submitted, not that Deriv entered on that exact tick. Accepted counts acknowledged contracts. Risk controls and confirmed wins intentionally prevent trading every market tick.</div>
-    <div className="mt-1 font-semibold text-cyan-300">Recent tick-to-purchase ledger</div>
-    <div className="max-h-60 overflow-y-auto font-mono text-[10px]" aria-label="Tick purchase ledger">{ledgerView.map(t=><div key={t.sequence} className="border-t border-slate-700/40 py-0.5">#{t.sequence} · market {t.observedDigit} · target {t.target??'—'} · lock from #{t.lockOriginSequence??'—'} · <strong className={t.status==='ACCEPTED'?'text-emerald-400':t.status==='UNCERTAIN'?'text-red-400':'text-slate-300'}>{t.status}</strong> · {t.reason}{t.contractId?` · #${t.contractId}`:''}{t.entryDigit!==undefined?` · entry ${t.entryDigit??'?'} @ ${t.entryEpoch??'?'}`:''}{t.expiryDigit!==undefined?` · expiry ${t.expiryDigit??'?'} @ ${t.expiryEpoch??'?'}`:''}</div>)}</div>
-      </div>
-      </div>
-    </details>
-  </div>
-  <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4">{[['Next-tick top',scores[0]?.digit??'—'],['Trade',`${count}/${limit}`],['Next stake',`$${next.toFixed(2)}`],['Cycle P/L',`${pnl>=0?'+':''}$${pnl.toFixed(2)}`]].map(([k,v])=><div key={String(k)} className="rounded-lg bg-[#0a1222] px-2 py-1.5"><div className="text-[11px] text-slate-400">{k}</div><div className={`font-extrabold ${k==='Cycle P/L' ? (pnl>0 ? 'text-green-400' : pnl<0 ? 'text-red-500' : 'text-slate-100') : 'text-slate-100'}`}>{v}</div></div>)}</div>
-  <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs" aria-live="polite">
-    <span className={topMomentum===null?'text-slate-400':topMomentum>0?'font-bold text-emerald-400':'font-bold text-rose-400'}>
-      Momentum {topMomentum===null?'warming up':`${topMomentum>=0?'+':''}${topMomentum.toFixed(2)}`}
-    </span>
-    <span className="text-slate-300">{strategy==='MOMENTUM_LOCK' ? 'Locked target (next tick)' : 'V1 next-tick target'} {winConfirmed.current ? '—' : (strategy==='MOMENTUM_LOCK' ? tradeLockView?.digit ?? '—' : scores[0]?.digit ?? '—')}</span>
-    {soonView&&<span className="text-sky-300">SOON {soonView.digit} · within {soonView.horizon} ticks · momentum +{soonView.momentum.toFixed(2)} · observed {soonView.trials?`${(soonView.rate*100).toFixed(1)}% / ${soonView.trials}`:'warming up'} (appearance, not contract win)</span>}
-    {soonLockView&&<span className="text-cyan-300">{soonLockView}</span>}
-    {entrySignal&&<span className="font-semibold text-white">Last entry: {strategy==='MOMENTUM_LOCK'?'Momentum Lock':'Dynamic V1'} · {entrySignal} selection</span>}
-    {entryTimingView&&<span className="text-amber-200">Timing: {entryTimingView}</span>}
     <span className="text-slate-400">Open {outstandingCount} · ACK pending {inFlightCount} · At risk ${riskExposure.toFixed(2)}</span>
     {matchPaused && <strong className="text-yellow-300">MATCH HOLD · awaiting verified settlement</strong>}
     {active.current && <span className={/awaiting settlement/i.test(entryStatus) ? "font-semibold text-yellow-400" : "text-slate-400"}>{entryStatus}</span>}
