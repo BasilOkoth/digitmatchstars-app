@@ -71,9 +71,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const [lastTiming,setLastTiming]=useState<{contractId:number;target:number;signalSequence:number;ackTicks:number;submitMs:number;buyMs:number;entryDigit:number|null;expiryDigit:number|null;result:'WIN'|'LOSS'}|null>(null);
  const refreshExposure=()=>{setRiskExposure(reservedStake.current);setInFlightCount(pendingCount.current)};
  const releaseMatchPause=()=>{
-   if(matchPause.current && [...matchHoldIds.current].every(id=>!outstanding.current.has(id)) && !uncertainPurchase.current && !winConfirmed.current){
-     matchPause.current=false;matchHoldIds.current.clear();setMatchHoldCount(0);setMatchPaused(false);
-     if(active.current && !halt.current && !winConfirmed.current){setMode('RUNNING');setEntryStatus('Matching contracts settled without WIN · awaiting fresh tick')}
+   if(matchPause.current && pendingCount.current===0 && outstanding.current.size===0 && !uncertainPurchase.current && !winConfirmed.current){
+     matchPause.current=false;setMatchPaused(false);
+     if(active.current && !halt.current && !winConfirmed.current){setMode('RUNNING');setEntryStatus('All contracts settled without WIN · awaiting fresh tick')}
    }
  };
  // Uncertain purchase outcomes stop further purchases until reconciliation.
@@ -153,79 +153,6 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const play=useCallback((kind:'buy'|'win'|'loss')=>{if(soundRef.current)tone(kind)},[]);
  const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
  useEffect(()=>{if(scope.current!==scopeKey){const unsettled=outstanding.current.size>0||pendingCount.current>0||uncertainPurchase.current;scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];intelligenceRef.current.reset();soonAuditRef.current.reset();soonLockRef.current=null;setSoonLockView(null);setEntryTimingView(null);setSoonView(null);setEntrySignal(null);setLastTrace(null);executionForecastRef.current.reset();setLastTiming(null);setExecutionAudit(null);setHorizonTarget(null);setHorizonProbability(null);setIntelligenceAudit(null);nextTickPending.current=null;eligibleResults.current=[];setAccuracyAudit({trials:0,hits:0,lower95:0});if(!unsettled)confirmedLosses.current=0;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setTopMomentum(null);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);lockedRef.current=null;if(!unsettled){countRef.current=0;setSentCount(0);lossBlockRef.current=0;pnlRef.current=0;}if(!unsettled){pending.current=false;pendingCount.current=0;inFlight.current.clear();matchPause.current=false;setMatchPaused(false);setInFlightCount(0);reservedStake.current=0;setRiskExposure(0);uncertainPurchase.current=false;}lastTickKey.current='';if(!unsettled)matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');paceRef.current={eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—',lastDispatchSequence:0};setPaceView({...paceRef.current});tickLedger.current.clear();setLedgerView([]);tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');paceRef.current={eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—',lastDispatchSequence:0};setPaceView({...paceRef.current});setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(unsettled?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(unsettled)setErr('Account/symbol changed with a pending or unsettled order. Reconcile on Deriv before restarting.');else setErr('')}},[scopeKey,setTarget]);
- // Prepared Deriv quotes are advisory, NOT purchased contracts. Never reuse a quote.
- // One account-wide settlement stream, shared by every outstanding contract.
- // Do not create a subscription or 1.2-second poll for each purchase.
- const contractWaiters=useRef(new Map<number,{resolve:(c:any)=>void;reject:(e:Error)=>void}>());
- const settledFrames=useRef(new Map<number,any>());
- const monitorRef=useRef<{unsubscribe:()=>Promise<void>}|null>(null);
- const monitorStartRef=useRef<Promise<void>|null>(null);
- const monitorErrorRef=useRef<Error|null>(null);
- const monitorWsRef=useRef<DerivWS|null>(null);
- const onContractFrame=(frame:Record<string,unknown>)=>{
-   const c=(frame as any).proposal_open_contract;
-   const id=Number(c?.contract_id);
-   if(!Number.isSafeInteger(id)||id<=0||!(c?.is_sold||c?.status==='won'||c?.status==='lost'))return;
-   const waiter=contractWaiters.current.get(id);
-   if(waiter){contractWaiters.current.delete(id);waiter.resolve(c)}
-   else if(outstanding.current.has(id))settledFrames.current.set(id,c);
- };
- const ensureContractMonitor=async()=>{
-   if(!ws)throw new Error('Deriv connection unavailable for settlement monitor');
-   if(monitorWsRef.current!==ws){
-     if(monitorRef.current)void monitorRef.current.unsubscribe().catch(()=>{});
-     monitorRef.current=null;monitorStartRef.current=null;monitorErrorRef.current=null;monitorWsRef.current=ws;
-   }
-   if(monitorErrorRef.current)throw monitorErrorRef.current;
-   if(monitorRef.current)return;
-   if(!monitorStartRef.current){
-     monitorStartRef.current=ws.subscribe({proposal_open_contract:1,subscribe:1},onContractFrame)
-       .then(sub=>{monitorRef.current={unsubscribe:sub.unsubscribe}})
-       .catch(e=>{monitorErrorRef.current=new Error(`Shared contract stream unavailable: ${String(e)}`);throw monitorErrorRef.current})
-       .finally(()=>{monitorStartRef.current=null});
-   }
-   await monitorStartRef.current;
- };
- useEffect(()=>{
-   if(ws && isConnected && accountId && mode==='RUNNING')void ensureContractMonitor().catch(e=>{
-     halt.current=true;active.current=false;setMode('UNCERTAIN');setErr(`Settlement monitor unavailable: ${String(e)}`);
-   });
- },[ws,isConnected,accountId,mode]);
- useEffect(()=>()=>{
-   if(monitorRef.current)void monitorRef.current.unsubscribe().catch(()=>{});
-   monitorRef.current=null;
-   for(const waiter of contractWaiters.current.values())waiter.reject(new Error('Contract monitor disconnected; reconcile in Deriv'));
-   contractWaiters.current.clear();settledFrames.current.clear();monitorStartRef.current=null;
- },[ws,accountId]);
- const proposalCache=useRef(new Map<number,{id:string;ask:number;stake:number;symbol:string;at:number}>());
- const proposalGeneration=useRef(0);
- const proposalRefreshBusy=useRef(false);
- useEffect(()=>{
-   proposalCache.current.clear();
-   proposalGeneration.current++;
-   if(!ws||!isConnected||!accountId||!symbol||!active.current||halt.current)return;
-   let cancelled=false;
-   const generation=proposalGeneration.current;
-   const refresh=async()=>{
-     if(cancelled||proposalRefreshBusy.current)return;
-     proposalRefreshBusy.current=true;
-     const stake=amount(Number(base)*Math.pow(Number(factor),countRef.current));
-     try{
-       await Promise.all(Array.from({length:10},async(_,digit)=>{
-         try{
-           const response=await ws.send<any>({proposal:1,amount:stake,basis:'stake',contract_type:'DIGITMATCH',currency:'USD',duration:1,duration_unit:'t',symbol,barrier:String(digit)});
-           const quote=response?.proposal;
-           const ask=Number(quote?.ask_price);
-           if(!cancelled && proposalGeneration.current===generation && typeof quote?.id==='string' && quote.id && Number.isFinite(ask) && ask>0 && ask<=stake*1.05+0.001)
-             proposalCache.current.set(digit,{id:quote.id,ask,stake,symbol,at:performance.now()});
-         }catch{/* Missing proposal: direct-buy fallback remains available. */}
-       }));
-     }finally{proposalRefreshBusy.current=false}
-   };
-   void refresh();
-   const timer=setInterval(()=>{void refresh()},4000);
-   return()=>{cancelled=true;clearInterval(timer);proposalGeneration.current++;proposalCache.current.clear();proposalRefreshBusy.current=false};
- },[ws,isConnected,accountId,symbol,base,factor,mode]);
  const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,firstLockMatch:boolean,entryKind:EntryKind,soonHorizon:number|null,frozenTrace:FrozenEntryTrace)=>{
   if(!ws||!accountId||halt.current||!active.current||winConfirmed.current||uncertainPurchase.current||matchPause.current||countRef.current>=Number(limit))return;
   // Never replay ticks skipped while a previous buy was in flight.
@@ -275,26 +202,6 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     setMode('RUNNING');
     return;
    }
-   if(!monitorRef.current){
-     recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'SKIPPED','Shared settlement monitor not ready',predicted,frozenTrace.tradingLockOriginSequence);
-     reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
-     return;
-   }
-   // One atomic lock quota for BOTH fast and normal dispatch paths.
-   // Reserve only at the actual irreversible submission boundary.
-   const lockOrigin=frozenTrace.tradingLockOriginSequence;
-   if(entryStrategy==='MOMENTUM_LOCK'){
-     if(lockOrigin===null || lockRef.current?.originSequence!==lockOrigin){
-       recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'SKIPPED','Lock expired before purchase',predicted,lockOrigin);
-       return;
-     }
-     const quota=Math.min(30,Math.max(1,Number(tradeTicks)||1));
-     if((lockPurchases.current.get(lockOrigin)??0)>=quota){
-       recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'SKIPPED','Trade Ticks quota reached',predicted,lockOrigin);
-       return;
-     }
-     lockPurchases.current.set(lockOrigin,(lockPurchases.current.get(lockOrigin)??0)+1);
-   }
    // Reserve this tick before an irreversible buy request.
    // The next request must be driven by a *later tick*, not a queued signal.
    lastBuySignalSequence.current=signalSequence;
@@ -309,20 +216,12 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const signalToSubmitMs=Math.max(0,Math.round(buyStart-signalReceivedAt));
    // Dispatch before updating React state. This returns a promise and normally
    // writes to the existing open WebSocket synchronously.
-   // Consume an already prepared quote if fresh, for exactly this stake/symbol.
-   // A quote does not guarantee entry on the next market tick.
-   const cached=proposalCache.current.get(predicted);
-   const usable=Boolean(cached && cached.symbol===symbol && cached.stake===stake &&
-     performance.now()-cached.at<2500 && cached.ask<=stake*1.05+0.001);
-   if(usable)proposalCache.current.delete(predicted); // proposal ID is single-use
-   const buyPromise=usable
-     ? ws.send<any>({buy:cached!.id,price:amount(stake*1.05)})
-     : ws.send<any>({
-         buy:'1',price:amount(stake*1.05),
-         parameters:{amount:stake,basis:'stake',contract_type:'DIGITMATCH',
-           currency:'USD',duration:1,duration_unit:'t',underlying_symbol:symbol,
-           barrier:String(predicted)},
-       });
+   const buyPromise=ws.send<any>({
+     buy:'1', price:amount(stake*1.05),
+     parameters:{amount:stake,basis:'stake',contract_type:'DIGITMATCH',
+       currency:'USD',duration:1,duration_unit:'t',underlying_symbol:symbol,
+       barrier:String(predicted)},
+   });
    paceRef.current.dispatched++;
    recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'SENT','Purchase request submitted',predicted,frozenTrace.tradingLockOriginSequence);
    paceRef.current.lastDispatchSequence=signalSequence;
@@ -362,24 +261,33 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const id=contractId;
    // Background settlement monitor; later ticks can dispatch overlapping contracts.
    void (async()=>{
+    let unsubscribe:(()=>Promise<void>)|undefined;
     const settlementStart=performance.now();
     try{
-     // Single subscription is shared by all outstanding contracts. Never poll each contract.
-     // Register the waiter before awaiting monitor setup, so quick settlements are not missed.
      const settle=await new Promise<any>((resolve,reject)=>{
-       const cached=settledFrames.current.get(id);
-       if(cached){settledFrames.current.delete(id);resolve(cached);return}
-       const timeout=setTimeout(()=>{
-         contractWaiters.current.delete(id);
-         reject(new Error(`Unconfirmed contract ${id}; reconcile in Deriv`));
-       },45000);
-       contractWaiters.current.set(id,{
-         resolve:c=>{clearTimeout(timeout);resolve(c)},
-         reject:e=>{clearTimeout(timeout);reject(e)},
-       });
-       void ensureContractMonitor().catch(e=>{
-         const waiter=contractWaiters.current.get(id);
-         if(waiter){contractWaiters.current.delete(id);waiter.reject(e instanceof Error?e:new Error(String(e)))}
+      let done=false;
+      let pollTimer:ReturnType<typeof setInterval>|undefined;
+      const timeout=setTimeout(()=>finish(null,new Error(`Unconfirmed contract ${id}; reconciliation required`)),45000);
+      function finish(c:any,error?:Error){
+       if(done)return;
+       done=true;clearTimeout(timeout);
+       if(pollTimer)clearInterval(pollTimer);
+       if(error)reject(error);else resolve(c);
+      }
+      const handle=(frame:Record<string,unknown>)=>{
+       const c=(frame as any).proposal_open_contract;
+       if(Number(c?.contract_id)!==id)return;
+       if(c.is_sold || c.status==='won' || c.status==='lost')finish(c);
+      };
+      void ws.subscribe({proposal_open_contract:1,contract_id:id},handle)
+       .then(sub=>{unsubscribe=sub.unsubscribe;if(done)void sub.unsubscribe()})
+       .catch(()=>{
+        if(done)return;
+        const poll=async()=>{
+         try{handle(await ws.send<any>({proposal_open_contract:1,contract_id:id}))}catch{/* retry until timeout */}
+        };
+        pollTimer=setInterval(()=>void poll(),1200);
+        void poll();
        });
      });
      const payout=Number(settle.sell_price??settle.payout); const buyPrice=Number(settle.buy_price??ask);
@@ -416,9 +324,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      const journalRow:MomentumTrade={frozenTrace,verifiedExpiryMatchesTarget:expiryDigit===null?null:expiryDigit===predicted,entryVsSignalSeconds:entryEpoch===null?null:entryEpoch-tickEpoch,expiryVsSignalSeconds:expiryEpoch===null?null:expiryEpoch-tickEpoch,entryKind,soonHorizon:entryKind==='SOON'?soonHorizon??undefined:undefined,entryDelayTicks:entryEpoch===null?null:Math.max(0,entryEpoch-tickEpoch),signalSequence,signalToSubmitMs,ticksDuringAcknowledgment,signalAgeBudgetMs:Math.max(100,Math.min(350,(tickCadence.current.intervalMs??1000)*0.35)),buyAcknowledgmentMs:Math.round(acknowledgedAt-buyStart),entryEpoch,entryDigit,entrySpot:entrySpot===null?null:String(entrySpot),exitSpot:settle.exit_spot===undefined?null:String(settle.exit_spot),strategy:entryStrategy,lockTick,lockDuration:lockWindow,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch,expiryEpoch,expiryDigit,recordType:'TRADE',contractId:id,accountId,symbol,timestamp:new Date().toISOString(),targetDigit:predicted,score:signal.score,momentum3:signal.momentum3,positiveSteps:signal.positiveSteps,momentumRising:signal.momentum3>0&&signal.positiveSteps>=2,threshold:signal.threshold,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS'};
      try{const key=`dms-momentum-trades:v1:${symbol}`;const prev=JSON.parse(localStorage.getItem(key)||'[]');const rows=Array.isArray(prev)?prev:[];if(!rows.some((x:MomentumTrade)=>x.contractId===id&&x.accountId===accountId))localStorage.setItem(key,JSON.stringify([...rows.slice(-4999),journalRow]))}catch{}
      // Settlement runs in the background; only confirmed settlement frees the slot.
-     if(matchPause.current && matchHoldIds.current.has(id))setEntryStatus('Matched target observed · verifying relevant contract settlement');
-     outstanding.current.delete(id);matchHoldIds.current.delete(id);setMatchHoldCount(matchHoldIds.current.size);reservedStake.current=Math.max(0,amount(reservedStake.current-ask));setOutstandingCount(outstanding.current.size);refreshExposure();
-     if(win){winConfirmed.current=true;halt.current=true;active.current=false;matchPause.current=false;matchHoldIds.current.clear();setMatchHoldCount(0);setMatchPaused(false);lockedRef.current=null;lockRef.current=null;setLockedDigit(null);setLockPosition(0);setTradeLockView(null);setTarget(null);setTargetScore(null);setTargetMomentum(null);setTargetProbability(null);setTargetRises(null);setMode('WIN')}
+     if(matchPause.current)setEntryStatus('Matched tick observed · verifying all unsettled contracts');
+     outstanding.current.delete(id);reservedStake.current=Math.max(0,amount(reservedStake.current-ask));setOutstandingCount(outstanding.current.size);refreshExposure();
+     if(win){winConfirmed.current=true;halt.current=true;active.current=false;matchPause.current=false;setMatchPaused(false);lockedRef.current=null;lockRef.current=null;setLockedDigit(null);setLockPosition(0);setTradeLockView(null);setTarget(null);setTargetScore(null);setTargetMomentum(null);setTargetProbability(null);setTargetRises(null);setMode('WIN')}
      else {
       confirmedLosses.current++;
       if(winConfirmed.current){setMode('WIN')}
@@ -428,7 +336,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      }
      releaseMatchPause();
     }catch(e){halt.current=true;active.current=false;setMode('UNCERTAIN');setErr(`Contract ${id}: ${String(e)}. Reconcile in Deriv before restarting.`)}
-    finally{contractWaiters.current.delete(id);setOutstandingCount(outstanding.current.size);releaseMatchPause()}
+    finally{if(unsubscribe)void unsubscribe();setOutstandingCount(outstanding.current.size);releaseMatchPause()}
    })();
   }catch(e){halt.current=true;active.current=false;
    // Uncertain buy: retain reservation. Do not retry or initiate more purchases.
@@ -441,7 +349,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     refreshExposure();
     releaseMatchPause();
   }
- },[ws,accountId,symbol,limit,maxLoss,play,setTarget,pipSize,tradeTicks]);
+ },[ws,accountId,symbol,limit,maxLoss,play,setTarget,pipSize]);
  const execRef=useRef(execute);execRef.current=execute; // Keep callback current without waiting for a post-render effect.
  useEffect(()=>{if(!isConnected && active.current){halt.current=true;active.current=false;setMode('UNCERTAIN');setErr('Connection lost. Verify outstanding contracts on Deriv before a new cycle.');}},[isConnected]);
  // Process the live WebSocket frame synchronously, BEFORE React's render cycle.
@@ -499,22 +407,13 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // A market match while BUY is pending or contracts are open may correspond
    // to an outstanding order, but does not establish which expiry wins.
    // Deriv's authoritative contract settlement is the only source of WIN/LOSS.
-   // Only hold for ACCEPTED contracts with the matching target. A pending
-   // request has no confirmed contract yet; a market match alone is not a WIN.
-   // Track the specific contract IDs so unrelated settlements do not extend
-   // the pause. The authoritative Deriv result still decides when to stop.
-   const matchingContracts=[...outstanding.current.entries()]
-     .filter(([,contract])=>contract.digit===digit)
-     .map(([id])=>id);
-   if(active.current && matchingContracts.length>0){
-     matchingContracts.forEach(id=>matchHoldIds.current.add(id));
-     setMatchHoldCount(matchHoldIds.current.size);
-     if(!matchPause.current){
-       matchPause.current=true;
-       setMatchPaused(true);
-       setMode('SETTLING');
-     }
-     setEntryStatus(`Market digit ${digit} matches ${matchingContracts.length} accepted contract(s) · checking Deriv expiry (not a confirmed win)`);
+   const matchingPending=[...inFlight.current.values()].some(c=>c.digit===digit);
+   const matchingUnsettled=[...outstanding.current.values()].some(c=>c.digit===digit);
+   if(active.current && !matchPause.current && (matchingPending || matchingUnsettled)){
+     matchPause.current=true;
+     setMatchPaused(true);
+     setMode('SETTLING');
+     setEntryStatus(`Market digit ${digit} matches a purchased/pending target · PAUSED for Deriv verification (not a confirmed win)`);
    }
    if(tickStats.current.received%5===0){
      const ms=tickCadence.current.intervalMs;
@@ -524,15 +423,6 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // LOW-LATENCY LOCK PATH: a previously acquired Momentum Lock needs no
    // forecasting or score recalculation before submitting its next order.
    // Dispatch first, then run the normal analytics for this observed tick.
-   // Retire a lock once its configured purchase budget is used. Do not
-   // keep an exhausted target alive until the lock-duration timer runs out.
-   // The next qualifying signal can acquire a fresh lock on this tick.
-   const exhaustedLock=lockRef.current;
-   if(settings.strategy==='MOMENTUM_LOCK' && exhaustedLock &&
-      (lockPurchases.current.get(exhaustedLock.originSequence)??0)>=Math.min(30,Math.max(1,Number(tradeTicks)||1))){
-     lockRef.current=null;
-     setLockPosition(0);setTradeLockView(null);
-   }
    const fastLock=lockRef.current;
    const fastLockTick=fastLock?fastLock.elapsed+1:0;
    if(settings.strategy==='MOMENTUM_LOCK' && fastLock &&
@@ -570,9 +460,11 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
        paceRef.current.eligible++;
        recordTick(sequence,epoch,digit,'ELIGIBLE','Fast path: active Momentum Lock',fastLock.digit,fastLock.originSequence);
        // execute() calls ws.send before its first await; settlements remain async.
+       const previousCount=countRef.current;
        void execRef.current(fastLock.digit,stake,fastLock.signal,epoch,sequence,
          receivedAt,'MOMENTUM_LOCK',fastLockTick,Number(settings.lockDuration),
          false,fastLock.source,null,frozenTrace);
+       if(countRef.current>previousCount)lockPurchases.current.set(fastLock.originSequence,(lockPurchases.current.get(fastLock.originSequence)??0)+1);
        queueMicrotask(publishPace);
      }
    }
@@ -670,7 +562,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    queueMicrotask(()=>{
      if(scope.current!==telemetryScope)return;
      setTargetMomentum(displayForecast?.momentum3??null);
-     setTargetProbability(null);
+     setTargetProbability(displayForecast?.probability??null);
      setTargetScore(displayForecast?.score??null);
      setTargetRises(displayForecast?.positiveSteps??null);
    });
@@ -691,7 +583,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(!active.current||halt.current||uncertainPurchase.current||!settings.accountId||!settings.isConnected){
      recordTick(sequence,epoch,digit,'SKIPPED',!active.current?'Cycle inactive':halt.current?'Cycle halted':uncertainPurchase.current?'Uncertain purchase':!settings.accountId?'No account':'Disconnected',lockRef.current?.digit??null,lockRef.current?.originSequence??null);return;
    }
-   if(matchPause.current){skipPace('Match hold: verifying matching contracts');setEntryStatus(`MATCH HOLD · ${matchHoldIds.current.size} matching accepted contracts pending Deriv verification`);return;}
+   if(matchPause.current){skipPace('Match hold: awaiting Deriv settlement');setEntryStatus(`MATCH HOLD · ${outstanding.current.size} confirmed + ${pendingCount.current} pending contracts; await Deriv settlement`);return;}
    if(!ranking.length){skipPace('Forecast warming up');setEntryStatus('V1 warming up');return}
    if(countRef.current>=Number(settings.limit)){skipPace('Max trades reached');halt.current=true;active.current=false;setMode('MAX_TRADES');setEntryStatus('Max trades reached');return}
    // Both NEXT and SOON can qualify independently on EVERY fresh tick.
@@ -712,17 +604,16 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      const label=soonLock?`SOON lock ${soonLock.digit} · ${Math.max(0,soonLock.expiresSequence-sequence)} ticks left`:'No active SOON lock';
      queueMicrotask(()=>setSoonLockView(label));
    }
-   // Trade only on qualified NEXT signals. SOON is appearance telemetry, not a one-tick expiry forecast.
+   // NEXT has priority if qualified. Otherwise the still-valid SOON lock
+   // gets an opportunity on EACH fresh tick, subject to current momentum,
+   // exposure, stale-signal and match-hold safety gates.
    const lockedSoonCandidate=soonLock?ranking.find(row=>row.digit===soonLock.digit)??null:null;
-   const choice=nextCandidate;
-   const choiceKind:EntryKind='NEXT';
+   const choice=nextCandidate??lockedSoonCandidate;
+   const choiceKind:EntryKind=nextCandidate?'NEXT':'SOON';
    if(!choice && !(settings.strategy==='MOMENTUM_LOCK' && selected)){skipPace('No qualifying signal');setEntryStatus('No qualified NEXT or active SOON target');return}
-   const instantLockEntry=settings.strategy==='MOMENTUM_LOCK' && !selected && Boolean(choice);
    if(settings.strategy==='MOMENTUM_LOCK' && !selected && choice){
      selected={digit:choice.digit,elapsed:1,source:choiceKind,originSequence:sequence,originEpoch:epoch,signal:{score:choice.score,momentum3:choice.momentum3,positiveSteps:choice.positiveSteps,threshold:Number(settings.threshold)}};
-     lockRef.current=selected;
-     // UI updates occur after the immediate purchase submission, not before it.
-     queueMicrotask(()=>{setLockPosition(1);setTradeLockView({digit:selected!.digit,source:selected!.source,elapsed:1})});
+     lockRef.current=selected;setLockPosition(1);setTradeLockView({digit:selected.digit,source:selected.source,elapsed:1});
    }
    // Optional gate tests the actual V1 next-tick candidate, rather than a
    // different, horizon-optimized digit. The contract break-even rate may be
@@ -755,7 +646,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    const lockTick=settings.strategy==='MOMENTUM_LOCK'?selected!.elapsed:0;
    // Do not skip just because the observed tick equals the target:
    // that tick has already occurred and the new contract will enter later.
-   // A match involving an accepted contract activates the targeted
+   // An actual pending-contract match still activates the independent
    // settlement-verification hold earlier in this callback.
    // Send only from a fresh, nonmatching observed tick. Settlement is
    // exclusively determined by Deriv, asynchronously after the BUY acknowledgment.
@@ -783,16 +674,18 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      signalSequence:sequence,signalEpoch:epoch,signalObservedDigit:digit,
      signalReceivedAtIso:new Date().toISOString(),momentum:ownMomentum,
      score:chosenForecast.score,positiveSteps:ownRises,
-     forecastProbability:null,
+     forecastProbability:Number.isFinite(chosenForecast.probability)?chosenForecast.probability:null,
      lockRemainingTicks:soonLockRef.current?Math.max(0,soonLockRef.current.expiresSequence-sequence):null,
      tradingLockOriginSequence:settings.strategy==='MOMENTUM_LOCK'?selected?.originSequence??null:null,
      tradingLockOriginEpoch:settings.strategy==='MOMENTUM_LOCK'?selected?.originEpoch??null:null,
      tradingLockOriginDigit:settings.strategy==='MOMENTUM_LOCK'?selected?.digit??null:null,
    };
    paceRef.current.eligible++;
-   recordTick(sequence,epoch,digit,'ELIGIBLE',instantLockEntry?'INSTANT LOCK ENTRY: purchase on acquisition tick':'Risk and signal gates passed',target,selected?.originSequence??null);
-   void execRef.current(target,stake,signal,epoch,sequence,receivedAt,settings.strategy,lockTick,settings.strategy==='MOMENTUM_LOCK'?Number(settings.lockDuration):0,firstLockMatch,signalKind,signalKind==='SOON'?soonLockRef.current?.horizon??null:null,frozenTrace);
+   recordTick(sequence,epoch,digit,'ELIGIBLE','Risk and signal gates passed',target,selected?.originSequence??null);
    queueMicrotask(publishPace);
+   const previousCount=countRef.current;
+   void execRef.current(target,stake,signal,epoch,sequence,receivedAt,settings.strategy,lockTick,settings.strategy==='MOMENTUM_LOCK'?Number(settings.lockDuration):0,firstLockMatch,signalKind,signalKind==='SOON'?soonLockRef.current?.horizon??null:null,frozenTrace);
+   if(settings.strategy==='MOMENTUM_LOCK' && selected && countRef.current>previousCount)lockPurchases.current.set(selected.originSequence,(lockPurchases.current.get(selected.originSequence)??0)+1);
    queueMicrotask(()=>{
      if(scope.current!==telemetryScope)return;
      setLockedDigit(target);setTarget(target);
