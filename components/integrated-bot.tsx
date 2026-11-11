@@ -425,7 +425,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // Dispatch first, then run the normal analytics for this observed tick.
    const fastLock=lockRef.current;
    const fastLockTick=fastLock?fastLock.elapsed+1:0;
-   if(settings.strategy==='MOMENTUM_LOCK' && fastLock &&
+   if(settings.strategy==='MOMENTUM_LOCK' && fastLock && fastLock.source==='NEXT' &&
       fastLockTick<=Number(settings.lockDuration) &&
       active.current && !halt.current && !uncertainPurchase.current &&
       !matchPause.current && settings.isConnected && settings.accountId &&
@@ -548,6 +548,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // tick re-evaluates the LOCKED digit's own forecast. Other digits becoming
    // top-ranked cannot silently alter an open lock or its trade target.
    let selected=lockRef.current;
+   if(settings.strategy==='MOMENTUM_LOCK' && selected?.source==='SOON'){
+     selected=null;lockRef.current=null;setLockPosition(0);setTradeLockView(null);
+   }
    if(settings.strategy==='MOMENTUM_LOCK' && selected){
      selected={...selected,elapsed:selected.elapsed+1};
      if(selected.elapsed>Number(settings.lockDuration)){
@@ -586,9 +589,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(matchPause.current){skipPace('Match hold: awaiting Deriv settlement');setEntryStatus(`MATCH HOLD · ${outstanding.current.size} confirmed + ${pendingCount.current} pending contracts; await Deriv settlement`);return;}
    if(!ranking.length){skipPace('Forecast warming up');setEntryStatus('V1 warming up');return}
    if(countRef.current>=Number(settings.limit)){skipPace('Max trades reached');halt.current=true;active.current=false;setMode('MAX_TRADES');setEntryStatus('Max trades reached');return}
-   // Both NEXT and SOON can qualify independently on EVERY fresh tick.
-   // In Momentum Lock, NEXT and SOON only select the initial digit.
-   // Once selected, every eligible purchase uses that frozen digit.
+   // Only qualified NEXT can select a trading target in either strategy.
+   // SOON remains research-only. A NEXT-selected Momentum Lock remains frozen.
    const nextCandidate=top && qualified.some(row=>row.digit===top.digit)?top:null;
    // Keep a SOON target for its ORIGINAL horizon; do not reset its expiry on
    // every tick. A new target can only be created after expiry or invalidation.
@@ -604,13 +606,12 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      const label=soonLock?`SOON lock ${soonLock.digit} · ${Math.max(0,soonLock.expiresSequence-sequence)} ticks left`:'No active SOON lock';
      queueMicrotask(()=>setSoonLockView(label));
    }
-   // NEXT has priority if qualified. Otherwise the still-valid SOON lock
-   // gets an opportunity on EACH fresh tick, subject to current momentum,
-   // exposure, stale-signal and match-hold safety gates.
-   const lockedSoonCandidate=soonLock?ranking.find(row=>row.digit===soonLock.digit)??null:null;
-   const choice=nextCandidate??lockedSoonCandidate;
-   const choiceKind:EntryKind=nextCandidate?'NEXT':'SOON';
-   if(!choice && !(settings.strategy==='MOMENTUM_LOCK' && selected)){skipPace('No qualifying signal');setEntryStatus('No qualified NEXT or active SOON target');return}
+    // Trading targets are selected EXCLUSIVELY from the qualified NEXT-tick
+    // top prediction. SOON locks and forecasts are research-only and cannot
+    // initiate or replace a trading target in either strategy.
+    const choice=nextCandidate;
+    const choiceKind:EntryKind='NEXT';
+    if(!choice && !(settings.strategy==='MOMENTUM_LOCK' && selected)){skipPace('No qualifying NEXT signal');setEntryStatus('No qualified NEXT target');return}
    if(settings.strategy==='MOMENTUM_LOCK' && !selected && choice){
      selected={digit:choice.digit,elapsed:1,source:choiceKind,originSequence:sequence,originEpoch:epoch,signal:{score:choice.score,momentum3:choice.momentum3,positiveSteps:choice.positiveSteps,threshold:Number(settings.threshold)}};
      lockRef.current=selected;setLockPosition(1);setTradeLockView({digit:selected.digit,source:selected.source,elapsed:1});
