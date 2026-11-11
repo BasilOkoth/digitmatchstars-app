@@ -36,6 +36,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
  const [strategy,setStrategy]=useState<Strategy>('DYNAMIC');const [lockDuration,setLockDuration]=useState('5');const [tradeTicks,setTradeTicks]=useState('5');
  const lockPurchases=useRef(new Map<number,number>());
  const lockRef=useRef<{digit:number;elapsed:number;source:EntryKind;signal:{score:number;momentum3:number;positiveSteps:number;threshold:number};originSequence:number;originEpoch:number}|null>(null);
+ const lockHealth=useRef<{origin:number;paused:boolean;recovery:number}>({origin:0,paused:false,recovery:0});
+ const [lockHealthView,setLockHealthView]=useState('WAITING FOR NEXT LOCK');
  const [lockPosition,setLockPosition]=useState(0);
  const [tradeLockView,setTradeLockView]=useState<{digit:number;source:EntryKind;elapsed:number}|null>(null);
  const [base,setBase]=useState('1');const [factor,setFactor]=useState('1.15');const [limit,setLimit]=useState('20');const [maxLoss,setMaxLoss]=useState('40');const [threshold,setThreshold]=useState('6');const [minMomentum,setMinMomentum]=useState('0');
@@ -610,10 +612,8 @@ if(!choice && !(settings.strategy==='MOMENTUM_LOCK' && selected)){skipPace('No q
       setLockHealthView(`ACTIVE · NEXT ${(chosenForecast.probability*100).toFixed(1)}% · momentum +${ownMomentum.toFixed(2)}`);
     }
 
-   // Momentum Lock qualification occurs ONLY when acquiring the lock above.
-   // During the active lock, do not re-qualify its frozen digit on each tick:
-   // a later momentum change must not silently suppress tick-paced purchases.
-   // Dynamic V1 still applies the live score/rising-momentum gate per tick.
+   // Active Momentum Lock is re-qualified above on every tick.
+   // Dynamic V1 uses its separate score and rising-momentum gate below.
    if(settings.strategy!=='MOMENTUM_LOCK' &&
       (chosenForecast.score<Number(settings.threshold) || !ownRising)){
      skipPace('Score or rising momentum gate');
