@@ -443,7 +443,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
        const priorTarget=priorRanking.find(row=>row.digit===fastLock.digit)??null;
        const frozenTrace:FrozenEntryTrace={
          strategy:'MOMENTUM_LOCK',lockSource:fastLock.source,signalKind:fastLock.source,
-         target:fastLock.digit,nextDigit:priorRanking[0]?.digit??null,
+         target:fastLock.digit,nextDigit:fastLock.digit,
          soonDigit:soonLockRef.current?.digit??null,
          soonLockedDigit:soonLockRef.current?.digit??null,
          soonHorizon:soonLockRef.current?.horizon??null,
@@ -521,15 +521,15 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      return bb.chance-aa.chance || b.probability-a.probability || a.digit-b.digit;
    });
    const hotTop=hotRanked[0]??null;
-   if(sequence%5===0 && hotTop){
+   if(hotTop){
      const v=appearanceScores[hotTop.digit];
      queueMicrotask(()=>setHotDigitView({digit:hotTop.digit,chance:v.chance,observations:v.windows}));
    }
    const top=ranking[0];
    // Derive momentum from the SAME all-ten forecast used for prediction.
    // Do not recompute it from a separately modified score ranking.
-   const momentum=top?.momentum3 ?? null;
-   const rises=top?.positiveSteps ?? 0;
+   const momentum=hotTop?.momentum3 ?? null;
+   const rises=hotTop?.positiveSteps ?? 0;
    const rising=momentum!==null && momentum>0 && momentum>=Number(settings.minMomentum) && rises>=2;
    const supported=Boolean(top && top.probability>=.10);
    // NEXT is the highest one-tick probability candidate. SOON is independently
@@ -615,8 +615,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // Only qualified NEXT can select a trading target in either strategy.
    // SOON remains research-only. A NEXT-selected Momentum Lock remains frozen.
    // Select the hottest digit by empirical H-tick appearance rate.
-   // Pick the hottest currently qualified digit; SOON never enters the execution path.
-   const nextCandidate=hotRanked.find(row=>qualified.some(q=>q.digit===row.digit))??null;
+   // ONLY the absolute hottest digit may become NEXT. Never fall back to a cooler digit.
+   // If the hottest digit fails eligibility gates, skip this tick.
+   const nextCandidate=hotTop && qualified.some(q=>q.digit===hotTop.digit)?hotTop:null;
    // Keep a SOON target for its ORIGINAL horizon; do not reset its expiry on
    // every tick. A new target can only be created after expiry or invalidation.
    let soonLock=soonLockRef.current;
@@ -636,7 +637,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     // initiate or replace a trading target in either strategy.
     const choice=nextCandidate;
     const choiceKind:EntryKind='NEXT';
-    if(!choice && !(settings.strategy==='MOMENTUM_LOCK' && selected)){skipPace('No qualifying NEXT signal');setEntryStatus('No qualified NEXT target');return}
+    if(!choice && !(settings.strategy==='MOMENTUM_LOCK' && selected)){skipPace('No qualifying NEXT signal');setEntryStatus('Hottest digit does not meet NEXT eligibility; waiting for fresh tick');return}
    if(settings.strategy==='MOMENTUM_LOCK' && !selected && choice){
      selected={digit:choice.digit,elapsed:1,source:choiceKind,originSequence:sequence,originEpoch:epoch,signal:{score:choice.score,momentum3:choice.momentum3,positiveSteps:choice.positiveSteps,threshold:Number(settings.threshold)}};
      lockRef.current=selected;setLockPosition(1);setTradeLockView({digit:selected.digit,source:selected.source,elapsed:1});
@@ -694,7 +695,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    // Never reconstruct a past trade from the continuously changing dashboard.
    const frozenTrace:FrozenEntryTrace={
      strategy:settings.strategy,lockSource:settings.strategy==='MOMENTUM_LOCK'?selected!.source:null,
-     signalKind,target,nextDigit:top?.digit??null,soonDigit:soonCandidate?.digit??null,
+     signalKind,target,nextDigit:hotTop?.digit??null,soonDigit:soonCandidate?.digit??null,
      soonLockedDigit:soonLockRef.current?.digit??null,
      soonHorizon:signalKind==='SOON'?soonLockRef.current?.horizon??null:null,
      signalSequence:sequence,signalEpoch:epoch,signalObservedDigit:digit,
