@@ -18,8 +18,8 @@ const f=(h:number[],d:number,n:number,a:number)=>{const w=h.slice(-n);return (w.
 
 export type DigitForecast=DigitScore & {probability:number;momentum3:number;positiveSteps:number;entropy:number;regime:EntropyRegime;sampleHits:number;sampleTrials:number};
 type Frozen={probs:number[];expertProbs:Record<ExpertName,number[]>;top:number;momentumQualified:boolean;regime:EntropyRegime};
-type Result={actual:number;top:number;predictedProbability:number;brier:number;logLoss:number;uniformLogLoss:number;qualified:boolean;regime:EntropyRegime};
-export type IntelligenceAudit={trials:number;topHits:number;topHitRate:number;topLower95:number;brier:number;logLoss:number;uniformBrier:number;uniformLogLoss:number;digitTrials:number[];digitHits:number[];digitObserved:number[];weights:Record<ExpertName,number>;eligibleTrials:number;eligibleHits:number;eligibleLower95:number;regimes:Record<EntropyRegime,{trials:number;hits:number;rate:number}>};
+type Result={actual:number;top:number;predictedProbability:number;brier:number;logLoss:number;uniformLogLoss:number;qualified:boolean;regime:EntropyRegime;topProbability:number;expertLosses:Record<ExpertName,number>};
+export type IntelligenceAudit={trials:number;topHits:number;topHitRate:number;topLower95:number;brier:number;logLoss:number;uniformBrier:number;uniformLogLoss:number;digitTrials:number[];digitHits:number[];digitObserved:number[];weights:Record<ExpertName,number>;eligibleTrials:number;eligibleHits:number;eligibleLower95:number;recentTrials:number;recentTopHits:number;recentTopRate:number;recentLogLoss:number;recentUniformLogLoss:number;recentBrier:number;currentMissStreak:number;longestMissStreak:number;missStreaksAtLeast5:number;missStreaksAtLeast10:number;selectedDigitMissStreaks:number[];calibrationBuckets:Array<{min:number;max:number;trials:number;meanForecast:number;hitRate:number}>;regimes:Record<EntropyRegime,{trials:number;hits:number;rate:number}>};
 export class NextTickIntelligence {
  private h:number[]=[];
  private trail:Record<number,number>[]=[];
@@ -28,14 +28,16 @@ export class NextTickIntelligence {
  private weights:Record<ExpertName,number>={frequency:.2,transition:.2,gap:.2,momentum:.2,entropy:.2};
  private losses:Record<ExpertName,number>={frequency:Math.log(10),transition:Math.log(10),gap:Math.log(10),momentum:Math.log(10),entropy:Math.log(10)};
  private latest:DigitForecast[]=[];
+ // Out-of-sample expert evaluation is recorded before observing each new digit.
+ // This is monitoring, not evidence that losing streaks can be predicted away.
  reset(){this.h=[];this.trail=[];this.pending=null;this.results=[];this.latest=[];this.weights={frequency:.2,transition:.2,gap:.2,momentum:.2,entropy:.2};this.losses={frequency:Math.log(10),transition:Math.log(10),gap:Math.log(10),momentum:Math.log(10),entropy:Math.log(10)}}
  observe(actual:number):DigitForecast[]{
   if(!Number.isInteger(actual)||actual<0||actual>9)return this.latest;
   // IMPORTANT: all evaluation precedes recording the latest observed digit.
   if(this.pending){const p=this.pending;
-   this.results.push({actual,top:p.top,predictedProbability:p.probs[actual],brier:p.probs.reduce((s,v,d)=>s+(v-Number(actual===d))**2,0),logLoss:-Math.log(Math.max(1e-8,p.probs[actual])),uniformLogLoss:Math.log(10),qualified:p.momentumQualified,regime:p.regime});
+   this.results.push({actual,top:p.top,predictedProbability:p.probs[actual],brier:p.probs.reduce((s,v,d)=>s+(v-Number(actual===d))**2,0),logLoss:-Math.log(Math.max(1e-8,p.probs[actual])),uniformLogLoss:Math.log(10),qualified:p.momentumQualified,regime:p.regime,topProbability:p.probs[p.top],expertLosses:Object.fromEntries(NAMES.map(k=>[k,-Math.log(Math.max(1e-8,p.expertProbs[k][actual]))])) as Record<ExpertName,number>});
    if(this.results.length>2000)this.results.shift();
-   for(const k of NAMES){const loss=-Math.log(Math.max(1e-8,p.expertProbs[k][actual]));this.losses[k]=.95*this.losses[k]+.05*loss;}
+   for(const k of NAMES){const loss=-Math.log(Math.max(1e-8,p.expertProbs[k][actual]));this.losses[k]=.98*this.losses[k]+.02*loss;}
   }
   this.h=[...this.h.slice(-199),actual];
   const base=scoreDigits(this.h);if(base.length!==10){this.pending=null;this.latest=[];return []}
@@ -58,16 +60,18 @@ export class NextTickIntelligence {
    if(this.trail.length!==4)return {change:0,rises:0};
    const a=this.trail.map(x=>x[d]);return {change:a[3]-a[0],rises:[1,2,3].filter(i=>a[i]>a[i-1]).length};
   });
-  // Score acceleration is only a candidate feature, never an assumed edge.
-  // Conservative temperature prevents a transient three-tick surge from dominating.
-  const mom=softmax(momentum.map(x=>clamp(x.change,-12,12)+0.8*(x.rises-1.5)),16);
+  const mom=softmax(momentum.map(x=>clamp(x.change,-12,12)+1.2*(x.rises-1.5)),12);
   // Entropy is a contextual feature, NOT evidence that any particular digit is due.
   const ent=norm(Array.from({length:10},(_,d)=> .1 + (1-e)*.15*(f(this.h,d,25,5)-.1)));
   const expertProbs:Record<ExpertName,number[]>={frequency,transition,gap,momentum:mom,entropy:ent};
-  // Online weights use ONLY past realized outcomes, with conservative shrinkage.
-  const adapted=softmax(NAMES.map(k=>-this.losses[k]),.12);
-  // Adapt only after sufficient forward-only samples; keep substantial uniform expert mixing.
-  const maturity=clamp((this.results.length-150)/800,0,.55);
+  // Choose expert weights using only PREVIOUSLY graded forecasts. Compare
+  // recent rolling log loss against a uniform 10% predictor; otherwise retain
+  // the baseline ensemble. Avoid chasing a short lucky streak.
+  const recent=this.results.slice(-300);
+  const adapted=softmax(NAMES.map(k=>-avg(recent.map(r=>r.expertLosses[k]))),.12);
+  const bestLoss=Math.min(...NAMES.map(k=>avg(recent.map(r=>r.expertLosses[k]))));
+  const hasEvidence=recent.length>=150 && bestLoss<Math.log(10)-.005;
+  const maturity=hasEvidence?clamp((recent.length-150)/600,0,.35):0;
   for(let i=0;i<NAMES.length;i++)this.weights[NAMES[i]]=(1-maturity)*.2+maturity*adapted[i];
   const raw=norm(Array.from({length:10},(_,d)=>NAMES.reduce((s,k)=>s+this.weights[k]*expertProbs[k][d],0)));
   // Shrink confidently toward the 10% null, preventing extreme noise-fit claims.
@@ -88,7 +92,19 @@ export class NextTickIntelligence {
   const r=this.results,n=r.length,hits=r.filter(x=>x.top===x.actual).length,eligible=r.filter(x=>x.qualified),eh=eligible.filter(x=>x.top===x.actual).length;
   const regimes={} as IntelligenceAudit['regimes'];
   for(const key of ['LOW','MID','HIGH'] as const){const subset=r.filter(x=>x.regime===key),h=subset.filter(x=>x.top===x.actual).length;regimes[key]={trials:subset.length,hits:h,rate:subset.length?h/subset.length:0}}
-  return {trials:n,topHits:hits,topHitRate:n?hits/n:0,topLower95:wilson(hits,n),brier:n?avg(r.map(x=>x.brier)):0,logLoss:n?avg(r.map(x=>x.logLoss)):0,uniformBrier:.9,uniformLogLoss:Math.log(10),digitTrials:Array.from({length:10},(_,d)=>r.filter(x=>x.top===d).length),digitHits:Array.from({length:10},(_,d)=>r.filter(x=>x.top===d&&x.actual===d).length),digitObserved:Array.from({length:10},(_,d)=>r.filter(x=>x.actual===d).length),weights:{...this.weights},eligibleTrials:eligible.length,eligibleHits:eh,eligibleLower95:wilson(eh,eligible.length),regimes};
+  const recent=r.slice(-200),recentHits=recent.filter(x=>x.top===x.actual).length;
+  let streak=0,longest=0,at5=0,at10=0;
+  const perDigit=Array(10).fill(0);
+  for(const row of r){
+   if(row.top===row.actual){streak=0;perDigit[row.top]=0;}
+   else {streak++;perDigit[row.top]++;longest=Math.max(longest,streak);if(streak===5)at5++;if(streak===10)at10++;}
+  }
+  const calibrationBuckets=Array.from({length:6},(_,i)=>{
+   const min=.08+i*.02,max=min+.02;
+   const rows=r.filter(x=>x.topProbability>=min&&(i===5?x.topProbability<=max:x.topProbability<max));
+   return {min,max,trials:rows.length,meanForecast:rows.length?avg(rows.map(x=>x.topProbability)):0,hitRate:rows.length?rows.filter(x=>x.top===x.actual).length/rows.length:0};
+  });
+  return {recentTrials:recent.length,recentTopHits:recentHits,recentTopRate:recent.length?recentHits/recent.length:0,recentLogLoss:recent.length?avg(recent.map(x=>x.logLoss)):0,recentUniformLogLoss:Math.log(10),recentBrier:recent.length?avg(recent.map(x=>x.brier)):0,currentMissStreak:streak,longestMissStreak:longest,missStreaksAtLeast5:at5,missStreaksAtLeast10:at10,selectedDigitMissStreaks:perDigit,calibrationBuckets,trials:n,topHits:hits,topHitRate:n?hits/n:0,topLower95:wilson(hits,n),brier:n?avg(r.map(x=>x.brier)):0,logLoss:n?avg(r.map(x=>x.logLoss)):0,uniformBrier:.9,uniformLogLoss:Math.log(10),digitTrials:Array.from({length:10},(_,d)=>r.filter(x=>x.top===d).length),digitHits:Array.from({length:10},(_,d)=>r.filter(x=>x.top===d&&x.actual===d).length),digitObserved:Array.from({length:10},(_,d)=>r.filter(x=>x.actual===d).length),weights:{...this.weights},eligibleTrials:eligible.length,eligibleHits:eh,eligibleLower95:wilson(eh,eligible.length),regimes};
  }
  getLower95(){return this.getAudit().topLower95}
 }
