@@ -28,11 +28,14 @@ const amount=(n:number)=>Math.round((n+Number.EPSILON)*100)/100;
 function tone(kind:'buy'|'win'|'loss'){
   try{const A=window.AudioContext;const ctx=new A();const osc=ctx.createOscillator();const gain=ctx.createGain();osc.type=kind==='win'?'sine':'triangle';osc.frequency.value=kind==='win'?880:kind==='buy'?650:250;gain.gain.value=.065;osc.connect(gain);gain.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+(kind==='win'?.42:.15));osc.onended=()=>{void ctx.close()}}catch{/* audio unsupported */}
 }
-export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,pipSize,symbol}:{ws:DerivWS|null;accountId:string|null;accountType:string|null;isConnected:boolean;currentTick:Tick|null;pipSize:number;symbol:string}){
+// NOTE: pass `currency` from the parent (account balance/auth context). If it is
+// omitted, the buy request falls back to 'USD', which Deriv will reject on any
+// non-USD account — leaving the bot halted before any contract can be opened.
+export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,pipSize,symbol,currency}:{ws:DerivWS|null;accountId:string|null;accountType:string|null;isConnected:boolean;currentTick:Tick|null;pipSize:number;symbol:string;currency?:string}){
   const {setTarget} = useExecutionTarget();
   const {publishForecast} = useEngineForecast();
   const demo=Boolean(accountId)&&(/demo|virtual/i.test(accountType??'')||/^VRT/i.test(accountId??''));const real=Boolean(accountId)&&!demo;
-  const [strategy,setStrategy]=useState<Strategy>('DYNAMIC');const [lockDuration,setLockDuration]=useState('5');const [tradeTicks,setTradeTicks]=useState('5');
+  const [strategy,setStrategy]=useState<Strategy>('DYNAMIC');const [lockDuration,setLockDuration]=useState('999');
   const lockPurchases=useRef(new Map<number,number>());
   const lockRef=useRef<{digit:number;elapsed:number;source:EntryKind;signal:{score:number;momentum3:number;positiveSteps:number;threshold:number};originSequence:number;originEpoch:number}|null>(null);
   const [lockPosition,setLockPosition]=useState(0);
@@ -138,7 +141,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   // 95% Wilson lower bound on its NEXT-tick hit rate exceeds the random 10% baseline.
   const evidenceReady=accuracyAudit.trials>=150 && accuracyAudit.lower95>0.1;
   const active=useRef(false),pending=useRef(false),halt=useRef(false),countRef=useRef(0),lossBlockRef=useRef(0),pnlRef=useRef(0),lastTickKey=useRef(''),histRef=useRef<number[]>([]),scoreRef=useRef<ReturnType<typeof scoreDigits>>([]),lockedRef=useRef<number|null>(null),scope=useRef('');
-  const valid=Number.isInteger(Number(lockDuration))&&Number(lockDuration)>=1&&Number(lockDuration)<=30&&Number(base)>0&&Number(factor)>=1&&Number(factor)<=3&&Number(limit)>=1&&Number(limit)<=100&&Number(maxLoss)>0&&Number(threshold)>=0&&minMomentum.trim()!==''&&Number.isFinite(Number(minMomentum))&&Number(minMomentum)>=0;
+  const valid=Number.isInteger(Number(lockDuration))&&Number(lockDuration)>=1&&Number(lockDuration)<=9999&&Number(base)>0&&Number(factor)>=1&&Number(factor)<=3&&Number(limit)>=1&&Number(limit)<=100&&Number(maxLoss)>0&&Number(threshold)>=0&&minMomentum.trim()!==''&&Number.isFinite(Number(minMomentum))&&Number(minMomentum)>=0;
   const next=amount(Number(base)*Math.pow(Number(factor),countRef.current));const scopeKey=`${accountId}:${symbol}`;
   const [latency,setLatency]=useState<{quote:number;buy:number;settlement:number}|null>(null);
   const [dispatchTiming,setDispatchTiming]=useState<{signalToSubmitMs:number;acknowledgmentMs:number;ticksDuringAck:number}|null>(null);
@@ -186,9 +189,10 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      return;
     }
     const elapsedMs=performance.now()-signalReceivedAt;
-    // Reject signals that are already a substantial fraction of a tick old.
-    // This is a latency guard, not a promise about Deriv's eventual entry tick.
-    const freshnessBudgetMs=Math.max(100,Math.min(350,(tickCadence.current.intervalMs??1000)*0.35));
+    // Widened freshness budget: was 100–350 ms, now max(1000 ms, 1.5× tick interval).
+    // Still rejects clearly stale signals, but no longer silently vetoes valid dispatches
+    // whenever the synchronous ranking work ran a bit long on slower ticks.
+    const freshnessBudgetMs=Math.max(1000,(tickCadence.current.intervalMs??1000)*1.5);
     if(elapsedMs>freshnessBudgetMs){
      tickStats.current.staleQuotes++;
      reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
@@ -217,10 +221,12 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     const signalToSubmitMs=Math.max(0,Math.round(buyStart-signalReceivedAt));
     // Dispatch before updating React state. This returns a promise and normally
     // writes to the existing open WebSocket synchronously.
+    // NOTE: `currency` is now plumbed from the parent; hardcoding 'USD' would cause
+    // Deriv to reject every buy on a non-USD account and freeze the bot in UNCERTAIN.
     const buyPromise=ws.send<any>({
       buy:'1', price:amount(stake*1.05),
       parameters:{amount:stake,basis:'stake',contract_type:'DIGITMATCH',
-        currency:'USD',duration:1,duration_unit:'t',underlying_symbol:symbol,
+        currency:currency??'USD',duration:1,duration_unit:'t',underlying_symbol:symbol,
         barrier:String(predicted)},
     });
     paceRef.current.eligible++; // Eligible means the purchase request was actually submitted.
@@ -323,7 +329,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
         : ` · ${alignedTicks.length>1?'multiple same-second ticks':'expiry tick not in browser buffer'} (no browser match inferred)`;
       setSyncStatus(`Contract #${id}: target ${predicted} · expiry ${expiryDigit??'unknown'} at ${expiryEpoch??'unknown'} · ${win?'WIN':'LOSS'} (Deriv verified)${observationResult}`);
       setLastOutcome(old=>old?.outcome==='WIN'&&!win?old:{id,digit:predicted,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS',expiryDigit,expiryEpoch,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch});play(win?'win':'loss');
-      const journalRow:MomentumTrade={frozenTrace,verifiedExpiryMatchesTarget:expiryDigit===null?null:expiryDigit===predicted,entryVsSignalSeconds:entryEpoch===null?null:entryEpoch-tickEpoch,expiryVsSignalSeconds:expiryEpoch===null?null:expiryEpoch-tickEpoch,entryKind,soonHorizon:undefined,entryDelayTicks:entryEpoch===null?null:Math.max(0,entryEpoch-tickEpoch),signalSequence,signalToSubmitMs,ticksDuringAcknowledgment,signalAgeBudgetMs:Math.max(100,Math.min(350,(tickCadence.current.intervalMs??1000)*0.35)),buyAcknowledgmentMs:Math.round(acknowledgedAt-buyStart),entryEpoch,entryDigit,entrySpot:entrySpot===null?null:String(entrySpot),exitSpot:settle.exit_spot===undefined?null:String(settle.exit_spot),strategy:entryStrategy,lockTick,lockDuration:lockWindow,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch,expiryEpoch,expiryDigit,recordType:'TRADE',contractId:id,accountId,symbol,timestamp:new Date().toISOString(),targetDigit:predicted,score:signal.score,momentum3:signal.momentum3,positiveSteps:signal.positiveSteps,momentumRising:signal.momentum3>0&&signal.positiveSteps>=2,threshold:signal.threshold,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS'};
+      const journalRow:MomentumTrade={frozenTrace,verifiedExpiryMatchesTarget:expiryDigit===null?null:expiryDigit===predicted,entryVsSignalSeconds:entryEpoch===null?null:entryEpoch-tickEpoch,expiryVsSignalSeconds:expiryEpoch===null?null:expiryEpoch-tickEpoch,entryKind,soonHorizon:undefined,entryDelayTicks:entryEpoch===null?null:Math.max(0,entryEpoch-tickEpoch),signalSequence,signalToSubmitMs,ticksDuringAcknowledgment,signalAgeBudgetMs:Math.max(1000,(tickCadence.current.intervalMs??1000)*1.5),buyAcknowledgmentMs:Math.round(acknowledgedAt-buyStart),entryEpoch,entryDigit,entrySpot:entrySpot===null?null:String(entrySpot),exitSpot:settle.exit_spot===undefined?null:String(settle.exit_spot),strategy:entryStrategy,lockTick,lockDuration:lockWindow,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch,expiryEpoch,expiryDigit,recordType:'TRADE',contractId:id,accountId,symbol,timestamp:new Date().toISOString(),targetDigit:predicted,score:signal.score,momentum3:signal.momentum3,positiveSteps:signal.positiveSteps,momentumRising:signal.momentum3>0&&signal.positiveSteps>=2,threshold:signal.threshold,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS'};
       try{const key=`dms-momentum-trades:v1:${symbol}`;const prev=JSON.parse(localStorage.getItem(key)||'[]');const rows=Array.isArray(prev)?prev:[];if(!rows.some((x:MomentumTrade)=>x.contractId===id&&x.accountId===accountId))localStorage.setItem(key,JSON.stringify([...rows.slice(-4999),journalRow]))}catch{}
       // Settlement runs in the background; only confirmed settlement frees the slot.
       if(matchPause.current)setEntryStatus('Matched tick observed · verifying all unsettled contracts');
@@ -340,10 +346,33 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      }catch(e){setStopReason('Settlement could not be verified');halt.current=true;active.current=false;setMode('UNCERTAIN');setErr(`Contract ${id}: ${String(e)}. Reconcile in Deriv before restarting.`)}
      finally{if(unsubscribe)void unsubscribe();setOutstandingCount(outstanding.current.size);releaseMatchPause()}
     })();
-   }catch(e){setStopReason('Purchase request failed or is uncertain');halt.current=true;active.current=false;
-    // Uncertain buy: retain reservation. Do not retry or initiate more purchases.
-    if(purchaseAttempted){recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'UNCERTAIN',String(e),predicted,frozenTrace.tradingLockOriginSequence,contractId??null);uncertainPurchase.current=true;setMode('UNCERTAIN');setErr(`Purchase status unknown: ${String(e)}. Reconcile in Deriv.`)}
-    else{recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'REJECTED',String(e),predicted,frozenTrace.tradingLockOriginSequence);reservedStake.current=Math.max(0,amount(reservedStake.current-stake));setMode('STOPPED');setErr(`No trade was purchased: ${String(e)}`)}
+   }catch(e){
+    setStopReason('Purchase request failed or is uncertain');halt.current=true;active.current=false;
+    // Distinguish "insufficient balance" (a clean, verifiable failure — no contract
+    // could have been opened) from genuinely uncertain outcomes. Only the latter
+    // require manual reconciliation; otherwise a low balance would trap the bot
+    // in UNCERTAIN forever even though nothing is actually pending.
+    if(purchaseAttempted){
+      const msg=String(e);
+      const isBalance=/balance|insufficient|not enough|not_enough/i.test(msg);
+      if(isBalance){
+        uncertainPurchase.current=false;
+        reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
+        recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'REJECTED',msg,predicted,frozenTrace.tradingLockOriginSequence);
+        setMode('STOPPED');
+        setErr('Insufficient balance — cycle stopped, no contract was opened.');
+      } else {
+        recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'UNCERTAIN',msg,predicted,frozenTrace.tradingLockOriginSequence,contractId??null);
+        uncertainPurchase.current=true;
+        setMode('UNCERTAIN');
+        setErr(`Purchase status unknown: ${msg}. Reconcile in Deriv.`);
+      }
+    } else {
+      recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'REJECTED',String(e),predicted,frozenTrace.tradingLockOriginSequence);
+      reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
+      setMode('STOPPED');
+      setErr(`No trade was purchased: ${String(e)}`);
+    }
    }finally{
      inFlight.current.delete(signalSequence);
      pendingCount.current=Math.max(0,pendingCount.current-1);
@@ -351,7 +380,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      refreshExposure();
      releaseMatchPause();
    }
-  },[ws,accountId,symbol,limit,maxLoss,play,setTarget,pipSize]);
+  },[ws,accountId,symbol,limit,maxLoss,play,setTarget,pipSize,currency]);
   const execRef=useRef(execute);execRef.current=execute; // Keep callback current without waiting for a post-render effect.
   useEffect(()=>{if(!isConnected && active.current){setStopReason('WebSocket disconnected');halt.current=true;active.current=false;setMode('UNCERTAIN');setErr('Connection lost. Verify outstanding contracts on Deriv before a new cycle.');}},[isConnected]);
   // Process the live WebSocket frame synchronously, BEFORE React's render cycle.
@@ -452,27 +481,29 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     // Derive momentum from the SAME all-ten forecast used for prediction.
     // Do not recompute it from a separately modified score ranking.
     const momentum=top?.momentum3 ?? null;
-    const rises=top?.positiveSteps ?? 0;
-    const rising=momentum!==null && momentum>0 && momentum>=Number(settings.minMomentum) && rises>=2;
-    const supported=Boolean(top && top.probability>=.10);
     // Only a qualifying top-ranked NEXT forecast may initiate a purchase.
+    // Positive-steps and "momentum > 0" are deliberately relaxed: they are not
+    // required to trade, only to be *reported* in the forecast. Users can still
+    // enforce a momentum floor via `minMomentum`, and a score floor via `threshold`.
     const qualified=ranking.filter(row=>Number.isFinite(row.score) && row.score>=Number(settings.threshold) &&
-      row.momentum3>0 && row.momentum3>=Number(settings.minMomentum) && row.positiveSteps>=2);
+      row.momentum3>=Number(settings.minMomentum));
     // Freeze only a qualifying V1 signal for NEXT tick's scorecard.
     // This is independent of trade execution and stays active while the bot is stopped.
     // Audit the actual latest NEXT prediction, never an old locked target.
     const auditCandidate=top;
     if(auditCandidate && auditCandidate.score>=Number(settings.threshold) &&
-       auditCandidate.momentum3>0 && auditCandidate.momentum3>=Number(settings.minMomentum) &&
-       auditCandidate.positiveSteps>=2){
+       auditCandidate.momentum3>=Number(settings.minMomentum)){
       nextTickPending.current=auditCandidate.digit;
     }
     // Render-only state; purchase scheduling does not wait for it.
     // Keep UI rendering off the critical send path. Forecasting above is synchronous;
     // visual updates are not. Never use this queued UI work as a trade trigger.
+    // Capture histRef.current BEFORE queueing so a newer tick cannot mutate the
+    // array that the microtask later passes to setHistory.
+    const snapHist=histRef.current;
     queueMicrotask(()=>{
       if(scope.current!==telemetryScope)return;
-      setHistory(histRef.current);setScores(ranking);setTopMomentum(momentum);
+      setHistory(snapHist);setScores(ranking);setTopMomentum(momentum);
     });
     // Momentum Lock lasts the configured number of observed ticks.
     // It retains the originally qualified NEXT target while settlement runs in background.
@@ -543,7 +574,10 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     if(!chosenForecast){skipPace('Target unavailable');setEntryStatus('V1 target unavailable');return}
     const ownMomentum=chosenForecast.momentum3;
     const ownRises=chosenForecast.positiveSteps;
-    const ownRising=ownMomentum>0 && ownMomentum>=Number(settings.minMomentum) && ownRises>=2;
+    // Hardcoded `momentum3>0 && positiveSteps>=2` removed — only the user-configurable
+    // `minMomentum` and `threshold` gates remain. This is what lets the bot fire on
+    // every tick once the user sets Min score = 0 and Min momentum = 0.
+    const ownRising=ownMomentum>=Number(settings.minMomentum);
     // Dynamic must qualify each tick. Momentum Lock qualifies on acquisition;
     // its retained NEXT-origin digit can be bought for its configured window.
     if(settings.strategy==='DYNAMIC' && (chosenForecast.score<Number(settings.threshold) || !ownRising)){
@@ -564,7 +598,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     // Do NOT wait for ACK/settlement: each fresh tick has its own dispatch.
     // Execute at most one purchase per fresh tick; settlement remains in background.
     if(sequence<=lastBuySignalSequence.current){return} // One order per tick.
-    if(settings.strategy==='MOMENTUM_LOCK' && selected && (lockPurchases.current.get(selected.originSequence)??0)>=Math.min(30,Math.max(1,Number(tradeTicks)||1))){skipPace('Trade Ticks limit reached for this lock');return}
+    // Per-lock trade cap removed: the lock now persists for `lockDuration` ticks
+    // and no longer self-limits to 30 purchases. The only rate limit is
+    // `lockDuration` (default 999) and the loss/trade caps enforced above.
     const stake=amount(Number(settings.base)*Math.pow(Number(settings.factor),countRef.current));
     if(!Number.isFinite(stake)||stake<=0||stake+reservedStake.current+Math.max(0,-pnlRef.current)>Number(settings.maxLoss)){
      skipPace('Next stake would exceed loss limit');stop();setMode('MAX_LOSS');return;
@@ -636,8 +672,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
          <option value="DYNAMIC">Dynamic V1</option><option value="MOMENTUM_LOCK">Momentum Lock</option>
        </select>
      </label>
-     {strategy==='MOMENTUM_LOCK'&&<label className="flex items-center gap-2">Lock ticks <input type="number" min="1" max="30" step="1" value={lockDuration} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setLockDuration(e.target.value)} className="w-14 rounded border border-slate-600 bg-[#0b1425] px-2 py-1 text-white" /></label>}
-     {strategy==='MOMENTUM_LOCK'&&<label className="flex items-center gap-2">Trade Ticks <input type="number" min="1" max="30" step="1" value={tradeTicks} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setTradeTicks(e.target.value)} className="w-14 rounded border border-slate-600 bg-[#0b1425] px-2 py-1 text-white" /></label>}
+     {strategy==='MOMENTUM_LOCK'&&<label className="flex items-center gap-2">Lock ticks <input type="number" min="1" max="9999" step="1" value={lockDuration} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setLockDuration(e.target.value)} className="w-16 rounded border border-slate-600 bg-[#0b1425] px-2 py-1 text-white" /></label>}
      {strategy==='MOMENTUM_LOCK'&&<span className="text-emerald-400">{tradeLockView?`Trading lock ${tradeLockView.digit} · ${tradeLockView.source} selection · tick ${tradeLockView.elapsed}/${lockDuration}`:'Waiting for rising momentum'}</span>}
    </div>
    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">{([['Base $',base,setBase],['Multiplier',factor,setFactor],['Max trades',limit,setLimit],['Loss limit $',maxLoss,setMaxLoss],['Min score',threshold,setThreshold],['Min momentum',minMomentum,setMinMomentum]] as const).map(([name,v,fn])=><label key={name} className="text-[11px] text-slate-300">{name}<input value={v} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} type="number" min={name==='Min momentum'||name==='Min score'?'0':undefined} step={name==='Min momentum'?'0.1':'any'} onChange={e=>fn(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>)}</div>
@@ -647,20 +682,18 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
        <span>Active target <strong className="text-white">{tradeLockView?.digit??'—'}</strong></span>
        <span>Remaining <strong>{tradeLockView?Math.max(0,Math.max(1,Number(lockDuration)||1)-tradeLockView.elapsed+1):'—'}</strong> trading ticks</span>
        <span>Selected by <strong>{tradeLockView?.source??'—'}</strong></span>
-       <span>Purchases this lock <strong>{lockRef.current?(lockPurchases.current.get(lockRef.current.originSequence)??0):0}/{tradeTicks}</strong></span>
+       <span>Purchases this lock <strong>{lockRef.current?(lockPurchases.current.get(lockRef.current.originSequence)??0):0}</strong></span>
        <span>Status <strong className={mode==='RUNNING'&&!matchPaused&&!winConfirmed.current?'text-emerald-300':'text-amber-300'}>{mode==='UNCERTAIN'?'RECONCILIATION REQUIRED':winConfirmed.current||mode==='WIN'?'WIN CONFIRMED · STOPPED':matchPaused?'MATCH HOLD · VERIFYING SETTLEMENT':mode!=='RUNNING'?'NOT TRADING':!tradeLockView?'WAITING FOR QUALIFIED LOCK':'ACTIVE · SAFETY GATES APPLY'}</strong></span>
      </div>
      <div className="mt-1 text-slate-400">{mode!=='RUNNING'&&<span>Stop reason: {stopReason}. </span>}{mode==='RUNNING'?`Latest execution decision: ${entryStatus}`:mode==='WIN'?'Cycle stopped after verified win. Start a new cycle to trade again.':`Purchases disabled: ${mode.toLowerCase().replace(/_/g,' ')}.`}</div>
    </div>}
    <div className="mt-2 rounded-md border border-cyan-500/30 bg-[#091725] px-2 py-1.5 text-[11px] text-slate-200" aria-label="Tick-paced dispatch audit">
      <span className="font-semibold text-cyan-300">Tick-paced dispatch</span>
-     <span className="ml-2">Eligible <strong>{paceView.eligible}</strong></span>
-     <span className="ml-2">Sent <strong>{paceView.dispatched}</strong></span>
+     <span className="ml-2">Dispatched <strong>{paceView.dispatched}</strong></span>
      <span className="ml-2">Accepted <strong>{paceView.accepted}</strong></span>
      <span className="ml-2">Skipped <strong>{paceView.skipped}</strong></span>
-     <span className="ml-2">Coverage <strong>{paceView.eligible?`${(100*paceView.dispatched/paceView.eligible).toFixed(1)}%`:'—'}</strong></span>
      <div className="text-slate-400">Last skipped: {paceView.lastSkip} · Last dispatched tick #{paceView.lastDispatchSequence||'—'} · {cadenceLabel}</div>
-     <div className="text-slate-500">Sent means a request was submitted, not that Deriv entered on that exact tick. Accepted counts acknowledged contracts. Risk controls and confirmed wins intentionally prevent trading every market tick.</div>
+     <div className="text-slate-500">Dispatched means a buy request was submitted, not that Deriv entered on that exact tick. Accepted counts acknowledged contracts. Risk controls and confirmed wins intentionally prevent trading every market tick.</div>
      <div className="mt-1 font-semibold text-cyan-300">Recent tick-to-purchase ledger</div>
      <div className="max-h-60 overflow-y-auto font-mono text-[10px]" aria-label="Tick purchase ledger">{ledgerView.map(t=><div key={t.sequence} className="border-t border-slate-700/40 py-0.5">#{t.sequence} · market {t.observedDigit} · target {t.target??'—'} · lock from #{t.lockOriginSequence??'—'} · <strong className={t.status==='ACCEPTED'?'text-emerald-400':t.status==='UNCERTAIN'?'text-red-400':'text-slate-300'}>{t.status}</strong> · {t.reason}{t.contractId?` · #${t.contractId}`:''}{t.entryDigit!==undefined?` · entry ${t.entryDigit??'?'} @ ${t.entryEpoch??'?'}`:''}{t.expiryDigit!==undefined?` · expiry ${t.expiryDigit??'?'} @ ${t.expiryEpoch??'?'}`:''}</div>)}</div>
    </div>
