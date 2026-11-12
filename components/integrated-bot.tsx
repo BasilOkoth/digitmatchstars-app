@@ -176,6 +176,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   const lastSignalDispatchMs=useRef<number|null>(null);
   const pendingMatchObserved=useRef(false);
   const winConfirmed=useRef(false);
+  // Synchronous win latch: stops dispatch the moment Deriv confirms a winning settlement.
+  const verifiedWinContract=useRef<number|null>(null);
   const streamTicks=useRef<Array<{epoch:number;digit:number;quote:number;receivedAt:number}>>([]);
   const tickStats=useRef({received:0,outOfOrder:0,duplicates:0,staleQuotes:0});
   const tickSequence=useRef(0);
@@ -353,7 +355,27 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
        const handle=(frame:Record<string,unknown>)=>{
         const c=(frame as any).proposal_open_contract;
         if(Number(c?.contract_id)!==id)return;
-        if(c.is_sold || c.status==='won' || c.status==='lost')finish(c);
+        if(c.is_sold || c.status==='won' || c.status==='lost'){
+           // Latch a verified WIN before resolving the settlement promise. This
+           // prevents another market-tick callback from submitting a purchase.
+           const settledProfit=Number(c.profit);
+           const sold=Number(c.sell_price??c.payout);
+           const cost=Number(c.buy_price);
+           const verifiedWin=c.status==='won' ||
+             ((c.is_sold || c.status==='won') &&
+               (Number.isFinite(settledProfit)?settledProfit>0:
+                 Number.isFinite(sold)&&Number.isFinite(cost)&&sold>cost));
+           if(verifiedWin){
+             verifiedWinContract.current=id;
+             winConfirmed.current=true;
+             halt.current=true;
+             active.current=false;
+             setStopReason(`Verified winning contract #${id}`);
+             setEntryStatus(`WIN confirmed by Deriv on #${id} · no further purchases`);
+             setMode('WIN');
+           }
+           finish(c);
+         }
        };
        void ws.subscribe({proposal_open_contract:1,contract_id:id},handle)
         .then(sub=>{unsubscribe=sub.unsubscribe;if(done)void sub.unsubscribe()})
@@ -452,7 +474,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     if(seenTickKeys.current.has(key)){tickStats.current.duplicates++;return}
     const prevEpoch=Number(lastTickKey.current.split(':')[0]);
     if(lastTickKey.current && Number.isFinite(prevEpoch) && epoch<prevEpoch){tickStats.current.outOfOrder++;return;}
-    if(epoch*1000<Date.now()-5000 || epoch*1000>Date.now()+5000){tickStats.current.staleQuotes++;return;}
+    if(epoch*1000<Date.now()-15000 || epoch*1000>Date.now()+15000){tickStats.current.staleQuotes++;setStreamStatus(`Tick rejected: timestamp ${Math.round((Date.now()-epoch*1000)/1000)}s from local clock · check clock/socket`);return;}
     lastTickKey.current=key;
     seenTickKeys.current.add(key);
     seenTickOrder.current.push(key);
@@ -659,7 +681,16 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     });
   },[]);
 
-  useEffect(()=>{if(!ws)return;return ws.onMessage((frame:Record<string,unknown>)=>{if(frame.msg_type==='tick' && frame.tick)processMarketTick(frame.tick);});},[ws,processMarketTick]);
+  const processMarketTickRef=useRef(processMarketTick);
+  processMarketTickRef.current=processMarketTick;
+  useEffect(()=>{
+    if(!ws)return;
+    // Register only when the socket object actually changes, not on Start/Stop
+    // or on forecast/dashboard updates. currentTick remains a second feed.
+    return ws.onMessage((frame:Record<string,unknown>)=>{
+      if(frame.msg_type==='tick' && frame.tick)processMarketTickRef.current(frame.tick);
+    });
+  },[ws]);
   useEffect(()=>{if(!isConnected || !currentTick || !symbol)return;processMarketTick({...currentTick,symbol});},[currentTick,symbol,isConnected,processMarketTick]);
 
   function start(){
@@ -670,7 +701,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(mode==='UNCERTAIN'||uncertainPurchase.current||pendingCount.current>0||outstanding.current.size>0)return;
    paceRef.current={eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—',lastDispatchSequence:0};
    setPaceView({...paceRef.current});tickLedger.current.clear();setLedgerView([]);
-   lockPurchases.current.clear();matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');setStopReason('Running');countRef.current=0;setSentCount(0);pnlRef.current=0;reservedStake.current=0;setRiskExposure(0);matchPause.current=false;setMatchPaused(false);confirmedLosses.current=0;lossBlockRef.current=0;lockedRef.current=null;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setCount(0);setPnl(0);setLossBlock(0);setLockedDigit(null);setTarget(null);setLastOutcome(null);setTargetScore(null);setTargetRises(null);setTargetMomentum(null);setTargetProbability(null);winConfirmed.current=false;setErr('');halt.current=false;active.current=true;setLastTiming(null);setMode('RUNNING');if(sound)tone('buy');
+   lockPurchases.current.clear();matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');setStopReason('Running');countRef.current=0;setSentCount(0);pnlRef.current=0;reservedStake.current=0;setRiskExposure(0);matchPause.current=false;setMatchPaused(false);confirmedLosses.current=0;lossBlockRef.current=0;lockedRef.current=null;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setCount(0);setPnl(0);setLossBlock(0);setLockedDigit(null);setTargetRef.current(null);setLastOutcome(null);setTargetScore(null);setTargetRises(null);setTargetMomentum(null);setTargetProbability(null);winConfirmed.current=false;verifiedWinContract.current=null;setErr('');halt.current=false;active.current=true;setLastTiming(null);setMode('RUNNING');if(sound)tone('buy');
   }
   return <section className="w-full min-w-0 px-0 pb-2 text-slate-100"><div className="rounded-xl border border-cyan-500/30 bg-[#101a2e] p-2.5 shadow-lg shadow-black/30">
    <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><h2 className="font-bold text-cyan-300">⚡ DigitMatchStars Tick-Synchronized Rapid Engine</h2><span className={`rounded-full px-2 py-1 text-xs font-bold ${real?'bg-rose-900 text-rose-200':'bg-sky-900 text-sky-200'}`}>{real?'REAL MONEY':demo?'DEMO':'LOG IN'} · {mode}</span></div>
