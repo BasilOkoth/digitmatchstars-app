@@ -66,6 +66,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   const [sentCount,setSentCount]=useState(0);
   const [lastTiming,setLastTiming]=useState<{contractId:number;target:number;signalSequence:number;ackTicks:number;submitMs:number;buyMs:number;entryDigit:number|null;expiryDigit:number|null;result:'WIN'|'LOSS'}|null>(null);
   const refreshExposure=()=>{setRiskExposure(reservedStake.current);setInFlightCount(pendingCount.current)};
+  // Releases a match-pause only once every in-flight contract has settled and
+  // no WIN has been confirmed. This is the resume path after an observed match
+  // turned out (via Deriv settlement) to be a pure loss, so the cycle continues.
   const releaseMatchPause=()=>{
     if(matchPause.current && pendingCount.current===0 && outstanding.current.size===0 && !uncertainPurchase.current && !winConfirmed.current){
       matchPause.current=false;setMatchPaused(false);
@@ -543,6 +546,36 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     if(!active.current||halt.current||uncertainPurchase.current||!settings.accountId||!settings.isConnected){
       recordTick(sequence,epoch,digit,'SKIPPED',!active.current?'Cycle inactive':halt.current?'Cycle halted':uncertainPurchase.current?'Uncertain purchase':!settings.accountId?'No account':'Disconnected',lockRef.current?.digit??null,lockRef.current?.originSequence??null);return;
     }
+    // === MATCH-DETECTION PAUSE ===
+    // If we are already paused because a previous tick matched the locked digit,
+    // do not fire anything on this tick. Settlement is still running in the
+    // background; releaseMatchPause() will lift the pause once all outstanding
+    // contracts have settled (and only if none was a WIN).
+    if(matchPause.current){
+      recordTick(sequence,epoch,digit,'SKIPPED','Match pause active · awaiting settlement',lockRef.current?.digit??null,lockRef.current?.originSequence??null);
+      return;
+    }
+    // If the newly-arrived market digit equals the currently active lock target,
+    // stop firing new trades. This is the user-facing "match detected" stop.
+    //   • If contracts are in flight → pause and wait for Deriv settlement:
+    //       – any WIN → cycle halts as WIN (handled in the settlement callback)
+    //       – all LOSS → releaseMatchPause() lifts the pause and firing resumes
+    //   • If nothing is in flight (rare) → just skip this one tick, no pause.
+    if(settings.strategy==='MOMENTUM_LOCK' && lockRef.current && digit===lockRef.current.digit){
+      const lockedDigit=lockRef.current.digit;
+      const originSeq=lockRef.current.originSequence;
+      if(outstanding.current.size>0 || pendingCount.current>0){
+        matchPause.current=true;
+        setMatchPaused(true);
+        setMode('SETTLING');
+        setEntryStatus(`Locked digit ${lockedDigit} matched observed tick ${sequence} · pausing new trades until settlement`);
+        recordTick(sequence,epoch,digit,'SKIPPED',`Locked digit ${lockedDigit} matched observed tick · pausing new trades until settlement`,lockedDigit,originSeq);
+      } else {
+        recordTick(sequence,epoch,digit,'SKIPPED',`Locked digit ${lockedDigit} matched observed tick · skipping this tick`,lockedDigit,originSeq);
+      }
+      return;
+    }
+    // === END MATCH-DETECTION PAUSE ===
     if(!ranking.length){skipPace('Forecast warming up');setEntryStatus('V1 warming up');return}
     if(countRef.current>=Number(settings.limit)){skipPace('Max trades reached');halt.current=true;active.current=false;setMode('MAX_TRADES');setStopReason('Maximum purchases reached');setEntryStatus('Max trades reached');return}
     // SOON has no trading path: no SOON selection, lock, or fallback.
@@ -685,59 +718,4 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
        <span>Purchases this lock <strong>{lockRef.current?(lockPurchases.current.get(lockRef.current.originSequence)??0):0}</strong></span>
        <span>Status <strong className={mode==='RUNNING'&&!matchPaused&&!winConfirmed.current?'text-emerald-300':'text-amber-300'}>{mode==='UNCERTAIN'?'RECONCILIATION REQUIRED':winConfirmed.current||mode==='WIN'?'WIN CONFIRMED · STOPPED':matchPaused?'MATCH HOLD · VERIFYING SETTLEMENT':mode!=='RUNNING'?'NOT TRADING':!tradeLockView?'WAITING FOR QUALIFIED LOCK':'ACTIVE · SAFETY GATES APPLY'}</strong></span>
      </div>
-     <div className="mt-1 text-slate-400">{mode!=='RUNNING'&&<span>Stop reason: {stopReason}. </span>}{mode==='RUNNING'?`Latest execution decision: ${entryStatus}`:mode==='WIN'?'Cycle stopped after verified win. Start a new cycle to trade again.':`Purchases disabled: ${mode.toLowerCase().replace(/_/g,' ')}.`}</div>
-   </div>}
-   <div className="mt-2 rounded-md border border-cyan-500/30 bg-[#091725] px-2 py-1.5 text-[11px] text-slate-200" aria-label="Tick-paced dispatch audit">
-     <span className="font-semibold text-cyan-300">Tick-paced dispatch</span>
-     <span className="ml-2">Dispatched <strong>{paceView.dispatched}</strong></span>
-     <span className="ml-2">Accepted <strong>{paceView.accepted}</strong></span>
-     <span className="ml-2">Skipped <strong>{paceView.skipped}</strong></span>
-     <div className="text-slate-400">Last skipped: {paceView.lastSkip} · Last dispatched tick #{paceView.lastDispatchSequence||'—'} · {cadenceLabel}</div>
-     <div className="text-slate-500">Dispatched means a buy request was submitted, not that Deriv entered on that exact tick. Accepted counts acknowledged contracts. Risk controls and confirmed wins intentionally prevent trading every market tick.</div>
-     <div className="mt-1 font-semibold text-cyan-300">Recent tick-to-purchase ledger</div>
-     <div className="max-h-60 overflow-y-auto font-mono text-[10px]" aria-label="Tick purchase ledger">{ledgerView.map(t=><div key={t.sequence} className="border-t border-slate-700/40 py-0.5">#{t.sequence} · market {t.observedDigit} · target {t.target??'—'} · lock from #{t.lockOriginSequence??'—'} · <strong className={t.status==='ACCEPTED'?'text-emerald-400':t.status==='UNCERTAIN'?'text-red-400':'text-slate-300'}>{t.status}</strong> · {t.reason}{t.contractId?` · #${t.contractId}`:''}{t.entryDigit!==undefined?` · entry ${t.entryDigit??'?'} @ ${t.entryEpoch??'?'}`:''}{t.expiryDigit!==undefined?` · expiry ${t.expiryDigit??'?'} @ ${t.expiryEpoch??'?'}`:''}</div>)}</div>
-   </div>
-   <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4">{[['Next-tick top',scores[0]?.digit??'—'],['Trade',`${count}/${limit}`],['Next stake',`$${next.toFixed(2)}`],['Cycle P/L',`${pnl>=0?'+':''}$${pnl.toFixed(2)}`]].map(([k,v])=><div key={String(k)} className="rounded-lg bg-[#0a1222] px-2 py-1.5"><div className="text-[11px] text-slate-400">{k}</div><div className={`font-extrabold ${k==='Cycle P/L' ? (pnl>0 ? 'text-green-400' : pnl<0 ? 'text-red-500' : 'text-slate-100') : 'text-slate-100'}`}>{v}</div></div>)}</div>
-   <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs" aria-live="polite">
-     <span className={topMomentum===null?'text-slate-400':topMomentum>0?'font-bold text-emerald-400':'font-bold text-rose-400'}>
-       Momentum {topMomentum===null?'warming up':`${topMomentum>=0?'+':''}${topMomentum.toFixed(2)}`}
-     </span>
-     <span className="text-slate-300">{strategy==='MOMENTUM_LOCK' ? 'Locked target (next tick)' : 'V1 next-tick target'} {winConfirmed.current ? '—' : (strategy==='MOMENTUM_LOCK' ? tradeLockView?.digit ?? '—' : scores[0]?.digit ?? '—')}</span>
-     {entrySignal&&<span className="font-semibold text-white">Last entry: {strategy==='MOMENTUM_LOCK'?'Momentum Lock':'Dynamic V1'} · {entrySignal} selection</span>}
-     {entryTimingView&&<span className="text-amber-200">Timing: {entryTimingView}</span>}
-     {lastTrace&&<div className="w-full rounded-md border border-slate-600 bg-[#0a1222] p-2 text-[11px]" aria-label="Frozen contract signal audit">
-       <div className="font-bold text-cyan-300">Verified contract trace · #{lastTrace.contractId}</div>
-       <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-slate-200">
-         <span>Method {lastTrace.trace.strategy==='MOMENTUM_LOCK'?'Momentum Lock':'Dynamic V1'} · selection {lastTrace.trace.lockSource??lastTrace.trace.signalKind} · target <strong>{lastTrace.trace.target}</strong></span>
-         <span>At signal: NEXT {lastTrace.trace.nextDigit??'—'}</span>
-         <span>Momentum {lastTrace.trace.momentum.toFixed(2)} · score {lastTrace.trace.score.toFixed(2)} · rises {lastTrace.trace.positiveSteps}/3</span>
-         <span>Signal tick #{lastTrace.trace.signalSequence} · observed {lastTrace.trace.signalObservedDigit} · epoch {lastTrace.trace.signalEpoch}</span>
-         <span>Deriv entry {lastTrace.entryDigit??'unknown'} · expiry {lastTrace.expiryDigit??'unknown'}</span>
-         <span>Entry time {lastTrace.entryEpoch??'unknown'} · expiry time {lastTrace.expiryEpoch??'unknown'}</span>
-         <strong className={lastTrace.profit>0?'text-green-400':'text-red-400'}>{lastTrace.outcome} {lastTrace.profit>=0?'+':''}${lastTrace.profit.toFixed(2)}</strong>
-       </div>
-       <div className="mt-1 text-slate-400">Frozen at dispatch. Deriv settlement determines WIN/LOSS; matching digits alone do not prove tick-level execution alignment.</div>
-     </div>}
-     <span className="text-slate-400">Open {outstandingCount} · ACK pending {inFlightCount} · At risk ${riskExposure.toFixed(2)}</span>
-     {matchPaused && <strong className="text-yellow-300">MATCH HOLD · awaiting verified settlement</strong>}
-     {active.current && <span className={/awaiting settlement/i.test(entryStatus) ? "font-semibold text-yellow-400" : "text-slate-400"}>{entryStatus}</span>}
-
-     {mode==='UNCERTAIN'&&<span className="font-bold text-amber-300">Settlement needs verification</span>}
-   </div>
-   <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-slate-700/70 p-2 text-xs text-slate-300">
-     <span>Measured next-tick accuracy: <strong className="text-white">{accuracyAudit.trials ? `${(100*accuracyAudit.hits/accuracyAudit.trials).toFixed(1)}%` : '—'}</strong> ({accuracyAudit.hits}/{accuracyAudit.trials})</span>
-     <label className="flex items-center gap-1.5"><input type="checkbox" checked={requireEvidence} disabled={active.current || pending.current || outstandingCount>0} onChange={e=>setRequireEvidence(e.target.checked)} />Require measured edge</label>
-   </div>
-   <div className="mt-2 flex items-center gap-2">
-     <button
-       disabled={!active.current && (!valid||!accountId||!isConnected||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN')}
-       onClick={() => { if(active.current) stop(); else start(); }}
-       className={`min-w-44 rounded-lg px-5 py-2.5 text-sm font-extrabold tracking-wide text-white shadow-lg transition disabled:opacity-30 ${active.current ? 'bg-rose-600 hover:bg-rose-500' : 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-900/30'}`}
-     >{active.current ? '■ STOP CYCLE' : '▶ START CYCLE'}</button>
-     <button aria-label={sound?'Mute sounds':'Enable sounds'} title={sound?'Mute':'Unmute'} onClick={()=>{setSound(v=>!v);if(!sound)tone('buy')}} className="flex h-8 w-8 items-center justify-center rounded-md border border-slate-700 bg-slate-900 text-xs text-emerald-300">{sound?'🔊':'🔇'}</button>
-   </div>
-   {lastOutcome&&<div className={`mt-3 rounded-lg border p-3 ${lastOutcome.outcome==='WIN'?'border-emerald-400 bg-emerald-500/20 text-emerald-300 shadow-lg shadow-emerald-950/30':'border-rose-500 bg-rose-500/10 text-rose-300'}`}><strong className="text-xl font-black tracking-wide">{lastOutcome.outcome==='WIN'?'🟢 WIN':'🔴 LOSS'} {lastOutcome.profit>=0?'+':''}${lastOutcome.profit.toFixed(2)}</strong><span className="ml-3 text-xs">Contract #{lastOutcome.id} · target {lastOutcome.digit}</span></div>}
-   {err&&<div role="alert" className="mt-3 rounded-lg border border-amber-500 p-2 text-xs text-amber-300">{err}{mode==='UNCERTAIN'?' — Purchase outcome requires verification in Deriv before restarting.':''}</div>}
-
-  </div></section>
-}
+     <div className="mt-1 text-slate-400">{mode!=='RUNNING'&&<span>Stop
