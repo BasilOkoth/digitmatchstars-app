@@ -474,7 +474,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     if(seenTickKeys.current.has(key)){tickStats.current.duplicates++;return}
     const prevEpoch=Number(lastTickKey.current.split(':')[0]);
     if(lastTickKey.current && Number.isFinite(prevEpoch) && epoch<prevEpoch){tickStats.current.outOfOrder++;return;}
-    if(epoch*1000<Date.now()-15000 || epoch*1000>Date.now()+15000){tickStats.current.staleQuotes++;setStreamStatus(`Tick rejected: timestamp ${Math.round((Date.now()-epoch*1000)/1000)}s from local clock · check clock/socket`);return;}
+    if(Math.abs(Date.now()-epoch*1000)>15000){tickStats.current.staleQuotes++;setStreamStatus(`Receiving ticks · market/local clock offset ${Math.round((Date.now()-epoch*1000)/1000)}s (not blocking stream)`);}
     lastTickKey.current=key;
     seenTickKeys.current.add(key);
     seenTickOrder.current.push(key);
@@ -683,15 +683,37 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
 
   const processMarketTickRef=useRef(processMarketTick);
   processMarketTickRef.current=processMarketTick;
+  // Subscribe independently: relying on the parent currentTick prop alone can
+  // leave the engine without a live feed when the parent pauses/re-renders.
+  // Both feeds are deduplicated by market tick identity in processMarketTick.
   useEffect(()=>{
-    if(!ws)return;
-    // Register only when the socket object actually changes, not on Start/Stop
-    // or on forecast/dashboard updates. currentTick remains a second feed.
-    return ws.onMessage((frame:Record<string,unknown>)=>{
-      if(frame.msg_type==='tick' && frame.tick)processMarketTickRef.current(frame.tick);
-    });
-  },[ws]);
-  useEffect(()=>{if(!isConnected || !currentTick || !symbol)return;processMarketTick({...currentTick,symbol});},[currentTick,symbol,isConnected,processMarketTick]);
+    if(!ws || !symbol || !isConnected)return;
+    let disposed=false;
+    let unsubscribe:(()=>Promise<void>)|undefined;
+    const consume=(frame:any)=>{
+      if(disposed)return;
+      const tick=frame?.tick ?? (frame?.msg_type==='tick'?frame?.tick:null);
+      if(!tick)return;
+      try{processMarketTickRef.current({...tick,symbol:tick.symbol??symbol});}
+      catch(error){
+        setStreamStatus(`Tick processing error: ${String(error)}`);
+        setErr(`Tick processing error: ${String(error)}`);
+        // Stop trading safely, but do not tear down the market feed.
+        halt.current=true;active.current=false;setMode('STOPPED');
+      }
+    };
+    let removeMessage:(()=>void)|undefined;
+    try{removeMessage=ws.onMessage(consume);}catch(error){setStreamStatus(`Tick listener error: ${String(error)}`)}
+    void ws.subscribe({ticks:symbol,subscribe:1},consume)
+      .then(sub=>{if(disposed)void sub.unsubscribe();else unsubscribe=sub.unsubscribe;setStreamStatus(`Subscribed to ${symbol} market ticks`);})
+      .catch(error=>{if(!disposed)setStreamStatus(`Tick subscription error: ${String(error)}`)});
+    return()=>{disposed=true;try{removeMessage?.()}catch{}if(unsubscribe)void unsubscribe()};
+  },[ws,symbol,isConnected]);
+  useEffect(()=>{
+    if(!isConnected || !currentTick || !symbol)return;
+    try{processMarketTickRef.current({...currentTick,symbol});}
+    catch(error){setStreamStatus(`Parent tick processing error: ${String(error)}`);halt.current=true;active.current=false;setMode('STOPPED')}
+  },[currentTick,symbol,isConnected]);
 
   function start(){
    if(!valid||!accountId||!isConnected||!ws||pendingCount.current>0||active.current||uncertainPurchase.current||outstanding.current.size)return;
