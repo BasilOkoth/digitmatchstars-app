@@ -223,6 +223,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
         currency:'USD',duration:1,duration_unit:'t',underlying_symbol:symbol,
         barrier:String(predicted)},
     });
+    paceRef.current.eligible++; // Eligible means the purchase request was actually submitted.
     paceRef.current.dispatched++;
     recordTick(signalSequence,tickEpoch,frozenTrace.signalObservedDigit,'SENT','Purchase request submitted',predicted,frozenTrace.tradingLockOriginSequence);
     paceRef.current.lastDispatchSequence=signalSequence;
@@ -587,7 +588,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       tradingLockOriginEpoch:settings.strategy==='MOMENTUM_LOCK'?selected?.originEpoch??null:null,
       tradingLockOriginDigit:settings.strategy==='MOMENTUM_LOCK'?selected?.digit??null:null,
     };
-    paceRef.current.eligible++;
+    // Candidate passed all gates; only count it as eligible once ws.send succeeds.
     recordTick(sequence,epoch,digit,'ELIGIBLE',settings.strategy==='MOMENTUM_LOCK'?'Active NEXT-origin lock; new market tick':'Fresh qualified NEXT forecast',target,selected?.originSequence??null);
     queueMicrotask(publishPace);
     const previousCount=countRef.current;
@@ -622,6 +623,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    if(!window.confirm(`Start ${acc} automatic cycle? Contract: 1-tick DigitMatch, one submission per eligible tick, overlapping contracts possible. Maximum loss: $${maxLoss}; up to ${limit} purchases. No guaranteed returns.`))return;
    // Must begin a fresh cycle. Uncertain purchases cannot be reset with this control.
    if(mode==='UNCERTAIN'||uncertainPurchase.current||pendingCount.current>0||outstanding.current.size>0)return;
+   // Reset cycle-scoped dispatch counters; previous cycles must not inflate Eligible.
+   paceRef.current={eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—',lastDispatchSequence:0};
+   setPaceView({...paceRef.current});tickLedger.current.clear();setLedgerView([]);
    lockPurchases.current.clear();matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');setStopReason('Running');countRef.current=0;setSentCount(0);pnlRef.current=0;reservedStake.current=0;setRiskExposure(0);matchPause.current=false;setMatchPaused(false);confirmedLosses.current=0;lossBlockRef.current=0;lockedRef.current=null;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setCount(0);setPnl(0);setLossBlock(0);setLockedDigit(null);setTarget(null);setLastOutcome(null);setTargetScore(null);setTargetRises(null);setTargetMomentum(null);setTargetProbability(null);winConfirmed.current=false;setErr('');halt.current=false;active.current=true;setLastTiming(null);setMode('RUNNING');if(sound)tone('buy');
   }
   return <section className="w-full min-w-0 px-0 pb-2 text-slate-100"><div className="rounded-xl border border-cyan-500/30 bg-[#101a2e] p-2.5 shadow-lg shadow-black/30">
