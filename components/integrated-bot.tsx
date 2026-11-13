@@ -573,17 +573,6 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     }
     if(!ranking.length){skipPace('Forecast warming up');setEntryStatus('V1 warming up');return}
     if(countRef.current>=Number(settings.limit)){skipPace('Max trades reached');halt.current=true;active.current=false;setMode('MAX_TRADES');setStopReason('Maximum purchases reached');setEntryStatus('Max trades reached');return}
-    // ─── SEQUENTIAL EXECUTION ───────────────────────────────────────────────
-    // One contract in flight at a time. Without this, a WIN settlement at tick N
-    // cannot cancel buys that were already submitted at ticks N-1, N-2, ...,
-    // producing the "WIN then seven LOSSes in the same cycle" symptom.
-    // With this guard, a WIN sets halt.current before the next tick can submit.
-    if(pendingCount.current>0 || outstanding.current.size>0){
-      skipPace(`Sequential · waiting for ${pendingCount.current + outstanding.current.size} outstanding contract(s)`);
-      setEntryStatus(`Sequential execution · ${pendingCount.current + outstanding.current.size} contract(s) settling`);
-      return;
-    }
-    // ─── END SEQUENTIAL EXECUTION ───────────────────────────────────────────
     const minLift=Number(settings.minHorizonLift);
     const minHorizonProb=Number(settings.minHorizonProbability);
     const minOverdue=Number(settings.minOverdueRatio);
