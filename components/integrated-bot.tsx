@@ -13,7 +13,7 @@ type Strategy='DYNAMIC'|'MOMENTUM_LOCK';
 type EntryKind='NEXT';
 type TickDecision={sequence:number;epoch:number;observedDigit:number;target:number|null;lockOriginSequence:number|null;status:'ELIGIBLE'|'SENT'|'ACCEPTED'|'SETTLED'|'SKIPPED'|'REJECTED'|'UNCERTAIN';reason:string;contractId:number|null;entryDigit?:number|null;entryEpoch?:number|null;expiryDigit?:number|null;expiryEpoch?:number|null;result?:'WIN'|'LOSS';at:string};
 type FrozenEntryTrace={strategy:Strategy;lockSource:EntryKind|null;signalKind:EntryKind;target:number;nextDigit:number|null;signalSequence:number;signalEpoch:number;signalObservedDigit:number;signalReceivedAtIso:string;momentum:number;score:number;positiveSteps:number;forecastProbability:number|null;lockRemainingTicks:number|null;tradingLockOriginSequence:number|null;tradingLockOriginEpoch:number|null;tradingLockOriginDigit:number|null;
-  horizonTicks?:number;horizonProbability?:number;horizonLift?:number;horizonRank?:number;horizonGapAtLock?:number;horizonGapExpectation?:number;
+  horizonTicks?:number;horizonProbability?:number;horizonLift?:number;horizonRank?:number;horizonGapAtLock?:number;horizonGapExpectation?:number;survivalP?:number;
 };
 type MomentumTrade = {frozenTrace?:FrozenEntryTrace;verifiedExpiryMatchesTarget?:boolean|null;entryVsSignalSeconds?:number|null;expiryVsSignalSeconds?:number|null;entryKind?:EntryKind;soonHorizon?:number;entryDelayTicks?:number|null;strategy?:Strategy;lockTick?:number;lockDuration?:number;signalEpoch?:number;purchaseEpoch?:number|null;expiryEpoch?:number|null;expiryDigit?:number|null;signalSequence?:number;signalToSubmitMs?:number;buyAcknowledgmentMs?:number;ticksDuringAcknowledgment?:number;signalAgeBudgetMs?:number;entryEpoch?:number|null;entryDigit?:number|null;entrySpot?:string|null;exitSpot?:string|null;recordType:'TRADE';contractId:number;accountId:string;symbol:string;timestamp:string;targetDigit:number;score:number;momentum3:number;positiveSteps:number;momentumRising:boolean;threshold:number;stake:number;payout:number;profit:number;outcome:'WIN'|'LOSS'};
 
@@ -31,7 +31,9 @@ function tone(kind:'buy'|'win'|'loss'){
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// DigitHorizonAnalyzer — empirical P(digit appears in next k ticks)
+// DigitHorizonAnalyzer — NOW includes survivalP (fair-RNG probability that
+// a digit could still be missing for this many ticks). Used to gate out deep
+// tails where a fair RNG says "this gap is already unusual, don't bet on it".
 // ════════════════════════════════════════════════════════════════════════════
 interface HorizonDigitScore {
   digit:number;
@@ -43,6 +45,7 @@ interface HorizonDigitScore {
   overdueRatio:number;
   nextTickScore:number;
   combined:number;
+  survivalP:number;   // 0.9^gap — probability a fair RNG would still be missing this digit
 }
 interface PendingHorizon { frozenAtSeq:number; topDigit:number; expiresAtSeq:number; hit:boolean }
 class DigitHorizonAnalyzer {
@@ -103,6 +106,10 @@ class DigitHorizonAnalyzer {
         overdueRatio:meanGap>0?currentGap/meanGap:1,
         nextTickScore:row.score??0,
         combined:0,
+        // NEW: survivalP = probability a fair RNG would still be missing this digit
+        // after `currentGap` ticks. 0.9^gap shrinks toward 0 as gap grows. Used by
+        // the outer gate to reject digits that are "too overdue to be credible".
+        survivalP: Math.pow(0.9, Math.max(0, currentGap)),
       });
     }
     const probs=rows.map(r=>r.horizonProbability);
@@ -127,8 +134,11 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   const [strategy,setStrategy]=useState<Strategy>('DYNAMIC');const [lockDuration,setLockDuration]=useState('999');
   const [horizonTicks,setHorizonTicks]=useState('5');
   const [minHorizonLift,setMinHorizonLift]=useState('1.0');
-  const [minHorizonProbability,setMinHorizonProbability]=useState('0.50');
+  const [minHorizonProbability,setMinHorizonProbability]=useState('0.41');
   const [minOverdueRatio,setMinOverdueRatio]=useState('1.0');
+  // NEW: reject digits whose fair-RNG survival probability is below this value.
+  // Lower value = allows deeper gaps. Default 0.50 = only allow gap ≤ 6 ticks.
+  const [maxSurvivalP,setMaxSurvivalP]=useState('0.50');
   const lockPurchases=useRef(new Map<number,number>());
   const lockRef=useRef<{digit:number;elapsed:number;source:EntryKind;signal:{score:number;momentum3:number;positiveSteps:number;threshold:number};originSequence:number;originEpoch:number;gapAtLock:number;gapExpectation:number;horizonProb:number;horizonLift:number}|null>(null);
   const [lockPosition,setLockPosition]=useState(0);
@@ -221,7 +231,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   };
   const evidenceReady=accuracyAudit.trials>=150 && accuracyAudit.lower95>0.1;
   const active=useRef(false),pending=useRef(false),halt=useRef(false),countRef=useRef(0),lossBlockRef=useRef(0),pnlRef=useRef(0),lastTickKey=useRef(''),histRef=useRef<number[]>([]),scoreRef=useRef<ReturnType<typeof scoreDigits>>([]),lockedRef=useRef<number|null>(null),scope=useRef('');
-  const valid=Number.isInteger(Number(lockDuration))&&Number(lockDuration)>=1&&Number(lockDuration)<=9999&&Number(base)>0&&Number(factor)>=1&&Number(factor)<=3&&Number(limit)>=1&&Number(limit)<=100&&Number(maxLoss)>0&&Number(threshold)>=0&&minMomentum.trim()!==''&&Number.isFinite(Number(minMomentum))&&Number(minMomentum)>=0&&[1,3,4,5].includes(Number(horizonTicks))&&Number.isFinite(Number(minHorizonLift))&&Number(minHorizonLift)>=0&&Number.isFinite(Number(minHorizonProbability))&&Number(minHorizonProbability)>=0&&Number(minHorizonProbability)<=1&&Number.isFinite(Number(minOverdueRatio))&&Number(minOverdueRatio)>=0;
+  const valid=Number.isInteger(Number(lockDuration))&&Number(lockDuration)>=1&&Number(lockDuration)<=9999&&Number(base)>0&&Number(factor)>=1&&Number(factor)<=3&&Number(limit)>=1&&Number(limit)<=100&&Number(maxLoss)>0&&Number(threshold)>=0&&minMomentum.trim()!==''&&Number.isFinite(Number(minMomentum))&&Number(minMomentum)>=0&&[1,3,4,5].includes(Number(horizonTicks))&&Number.isFinite(Number(minHorizonLift))&&Number(minHorizonLift)>=0&&Number.isFinite(Number(minHorizonProbability))&&Number(minHorizonProbability)>=0&&Number(minHorizonProbability)<=1&&Number.isFinite(Number(minOverdueRatio))&&Number(minOverdueRatio)>=0&&Number.isFinite(Number(maxSurvivalP))&&Number(maxSurvivalP)>0&&Number(maxSurvivalP)<=1;
   const next=amount(Number(base)*Math.pow(Number(factor),countRef.current));const scopeKey=`${accountId}:${symbol}`;
   const [latency,setLatency]=useState<{quote:number;buy:number;settlement:number}|null>(null);
   const [dispatchTiming,setDispatchTiming]=useState<{signalToSubmitMs:number;acknowledgmentMs:number;ticksDuringAck:number}|null>(null);
@@ -331,7 +341,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     setSyncStatus(`Bought #${contractId} · target ${predicted} · signal ${tickEpoch} · ${acknowledgedEpoch===null?'purchase time unavailable':`buy ${acknowledgedEpoch}`}`);
     setOutstandingCount(outstanding.current.size);
     if(!matchPause.current && active.current && !halt.current && !winConfirmed.current && !uncertainPurchase.current)setMode('RUNNING');
-    const id=contractId;    void (async()=>{
+    const id=contractId;
+    void (async()=>{
      let unsubscribe:(()=>Promise<void>)|undefined;
      const settlementStart=performance.now();
      try{
@@ -449,8 +460,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   },[ws,accountId,symbol,limit,maxLoss,play,pipSize,currency]);
   const execRef=useRef(execute);execRef.current=execute;
   useEffect(()=>{if(!isConnected && active.current){setStopReason('WebSocket disconnected');halt.current=true;active.current=false;setMode('UNCERTAIN');setErr('Connection lost. Verify outstanding contracts on Deriv before a new cycle.');}},[isConnected]);
-  const tickSettings=useRef({pipSize,limit,threshold,minMomentum,base,factor,maxLoss,isConnected,accountId,symbol,strategy,lockDuration,horizonTicks,minHorizonLift,minHorizonProbability,minOverdueRatio});
-  tickSettings.current={pipSize,limit,threshold,minMomentum,base,factor,maxLoss,isConnected,accountId,symbol,strategy,lockDuration,horizonTicks,minHorizonLift,minHorizonProbability,minOverdueRatio};
+  const tickSettings=useRef({pipSize,limit,threshold,minMomentum,base,factor,maxLoss,isConnected,accountId,symbol,strategy,lockDuration,horizonTicks,minHorizonLift,minHorizonProbability,minOverdueRatio,maxSurvivalP});
+  tickSettings.current={pipSize,limit,threshold,minMomentum,base,factor,maxLoss,isConnected,accountId,symbol,strategy,lockDuration,horizonTicks,minHorizonLift,minHorizonProbability,minOverdueRatio,maxSurvivalP};
   const processMarketTick=useCallback((tick:any)=>{
     const settings=tickSettings.current;
     if(tick.symbol && tick.symbol!==settings.symbol)return;
@@ -556,7 +567,6 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       recordTick(sequence,epoch,digit,'SKIPPED',!active.current?'Cycle inactive':halt.current?'Cycle halted':uncertainPurchase.current?'Uncertain purchase':!settings.accountId?'No account':'Disconnected',lockRef.current?.digit??null,lockRef.current?.originSequence??null);return;
     }
     if(matchPause.current){recordTick(sequence,epoch,digit,'SKIPPED','Match pause active · awaiting settlement',lockRef.current?.digit??null,lockRef.current?.originSequence??null);return;}
-    // Universal match detection for BOTH strategies.
     const activeTarget = settings.strategy==='MOMENTUM_LOCK'
       ? (lockRef.current?.digit ?? null)
       : (lockedRef.current ?? null);
@@ -576,7 +586,16 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     const minLift=Number(settings.minHorizonLift);
     const minHorizonProb=Number(settings.minHorizonProbability);
     const minOverdue=Number(settings.minOverdueRatio);
+    const maxSurvival=Number(settings.maxSurvivalP);
+    // ─── TAIL-AWARE FILTER CHAIN ─────────────────────────────────────────────
+    // Step 1: reject digits whose fair-RNG survival is below maxSurvivalP.
+    //         This is the "avoid deep tails" gate: a digit that's been missing
+    //         15+ ticks has survivalP = 0.9^15 ≈ 20%, which is below the default
+    //         threshold of 50%, so it is excluded. Only digits whose gap is
+    //         "normal" for a fair RNG can be considered.
+    // Step 2: then apply the user's probability / lift / overdue gates.
     const horizonCandidates = horizonRanking
+      .filter(r => r.survivalP >= maxSurvival)     // ← NEW tail gate (first)
       .filter(r => qualified.some(q => q.digit===r.digit))
       .filter(r => r.lift >= minLift)
       .filter(r => r.horizonProbability >= minHorizonProb)
@@ -611,8 +630,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     if(!choiceForecast && !(settings.strategy==='MOMENTUM_LOCK' && selected)){
       const topLift=horizonRanking[0]?.lift??0;
       const topProb=horizonRanking[0]?.horizonProbability??0;
-      skipPace(`No digit passes lift≥${minLift.toFixed(2)}× / P≥${(100*minHorizonProb).toFixed(0)}% / overdue≥${minOverdue.toFixed(2)}×`);
-      setEntryStatus(`Waiting for a due digit · best P=${(100*topProb).toFixed(1)}% lift ${topLift.toFixed(2)}×`);
+      const topSurv=horizonRanking[0]?.survivalP??0;
+      skipPace(`No digit passes survival≥${(100*maxSurvival).toFixed(0)}% / lift≥${minLift.toFixed(2)}× / P≥${(100*minHorizonProb).toFixed(0)}% / overdue≥${minOverdue.toFixed(2)}×`);
+      setEntryStatus(`Waiting for short-tail digit · best P=${(100*topProb).toFixed(1)}% surv=${(100*topSurv).toFixed(1)}% lift ${topLift.toFixed(2)}×`);
       return;
     }
     if(settings.strategy==='MOMENTUM_LOCK' && !selected){
@@ -666,6 +686,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       horizonRank:chosenHorizon?horizonRanking.findIndex(r=>r.digit===target)+1:undefined,
       horizonGapAtLock:chosenHorizon?chosenHorizon.gap:undefined,
       horizonGapExpectation:chosenHorizon?chosenHorizon.gapExpectation:undefined,
+      survivalP:chosenHorizon?chosenHorizon.survivalP:undefined,
     };
     recordTick(sequence,epoch,digit,'ELIGIBLE',settings.strategy==='MOMENTUM_LOCK'?'Active NEXT-origin lock; new market tick':'Fresh qualified NEXT forecast',target,selected?.originSequence??null);
     queueMicrotask(publishPace);
@@ -716,10 +737,11 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      {strategy==='MOMENTUM_LOCK'&&<span className="text-emerald-400">{tradeLockView?`Trading lock ${tradeLockView.digit} · ${tradeLockView.source} selection · tick ${tradeLockView.elapsed}/${lockDuration}`:'Waiting for due digit'}</span>}
    </div>
    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">{([['Base $',base,setBase],['Multiplier',factor,setFactor],['Max trades',limit,setLimit],['Loss limit $',maxLoss,setMaxLoss],['Min score',threshold,setThreshold],['Min momentum',minMomentum,setMinMomentum]] as const).map(([name,v,fn])=><label key={name} className="text-[11px] text-slate-300">{name}<input value={v} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} type="number" min={name==='Min momentum'||name==='Min score'?'0':undefined} step={name==='Min momentum'?'0.1':'any'} onChange={e=>fn(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>)}</div>
-   <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
+   <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
      <label className="text-[11px] text-slate-300">Min P(k) <input type="number" min="0" max="1" step="0.01" value={minHorizonProbability} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setMinHorizonProbability(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>
      <label className="text-[11px] text-slate-300">Min overdue ratio <input type="number" min="0" step="0.05" value={minOverdueRatio} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setMinOverdueRatio(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>
      <label className="text-[11px] text-slate-300">Min horizon lift <input type="number" min="0" step="0.05" value={minHorizonLift} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setMinHorizonLift(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>
+     <label className="text-[11px] text-slate-300" title="Reject digits whose fair-RNG survival probability is below this value. Higher = only allow short gaps.">Max survival P <input type="number" min="0.01" max="1" step="0.01" value={maxSurvivalP} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setMaxSurvivalP(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>
    </div>
    {strategy==='MOMENTUM_LOCK'&&<div className="mt-2 rounded-lg border border-emerald-500/30 bg-[#0a1721] p-2 text-xs" aria-label="Momentum Lock trading status" aria-live="polite">
      <div className="mb-1 font-bold text-emerald-300">Momentum Lock · NEXT-only trading target</div>
@@ -728,19 +750,18 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
        <span>Remaining <strong>{tradeLockView?Math.max(0,Math.max(1,Number(lockDuration)||1)-tradeLockView.elapsed+1):'—'}</strong> trading ticks</span>
        <span>Selected by <strong>{tradeLockView?.source??'—'}</strong></span>
        <span>Purchases this lock <strong>{lockRef.current?(lockPurchases.current.get(lockRef.current.originSequence)??0):0}</strong></span>
-       <span>Status <strong className={mode==='RUNNING'&&!matchPaused&&!winConfirmed.current?'text-emerald-300':'text-amber-300'}>{mode==='UNCERTAIN'?'RECONCILIATION REQUIRED':winConfirmed.current||mode==='WIN'?'WIN CONFIRMED · STOPPED':matchPaused?'MATCH HOLD · VERIFYING SETTLEMENT':mode!=='RUNNING'?'NOT TRADING':!tradeLockView?'WAITING FOR DUE DIGIT':'ACTIVE · SEQUENTIAL EXECUTION'}</strong></span>
+       <span>Status <strong className={mode==='RUNNING'&&!matchPaused&&!winConfirmed.current?'text-emerald-300':'text-amber-300'}>{mode==='UNCERTAIN'?'RECONCILIATION REQUIRED':winConfirmed.current||mode==='WIN'?'WIN CONFIRMED · STOPPED':matchPaused?'MATCH HOLD · VERIFYING SETTLEMENT':mode!=='RUNNING'?'NOT TRADING':!tradeLockView?'WAITING FOR DUE DIGIT':'ACTIVE · TAIL GATE APPLIED'}</strong></span>
      </div>
      <div className="mt-1 text-slate-400">{mode!=='RUNNING'&&<span>Stop reason: {stopReason}. </span>}{mode==='RUNNING'?`Latest execution decision: ${entryStatus}`:mode==='WIN'?'Cycle stopped after verified win. Start a new cycle to trade again.':`Purchases disabled: ${mode.toLowerCase().replace(/_/g,' ')}.`}</div>
    </div>}
    {horizonRankingView.length>0&&<div className="mt-2 rounded-md border border-violet-500/30 bg-[#0d1524] px-2 py-1.5 text-[11px]" aria-label="Horizon prediction diagnostic">
      <div className="font-semibold text-violet-300">Due digit diagnostic · k={horizonAccuracy.horizon} ticks</div>
-     <div className="text-slate-400">Warm-up: {horizonAccuracy.warmup} gap samples per digit (need ≥5) · Uniform baseline P(k)={(100*(1-Math.pow(0.9,horizonAccuracy.horizon))).toFixed(1)}%</div>
+     <div className="text-slate-400">Warm-up: {horizonAccuracy.warmup} gap samples per digit (need ≥5) · Uniform baseline P(k)={(100*(1-Math.pow(0.9,horizonAccuracy.horizon))).toFixed(1)}% · Survival gate ≥{(100*Number(maxSurvivalP)).toFixed(0)}% (gap ≤ {Math.floor(Math.log(Number(maxSurvivalP))/Math.log(0.9))} ticks)</div>
      <div className="mt-1 font-mono text-[10px]">
-       {horizonRankingView.map(r=><div key={r.digit} className="border-t border-slate-700/40 py-0.5">
-         <span className="font-bold text-white">{r.digit}</span>{' · gap '}{r.gap}{' / mean '}{r.gapExpectation.toFixed(1)}{' · P'}{horizonAccuracy.horizon}{' '}{(100*r.horizonProbability).toFixed(1)}{'% · lift '}{r.lift.toFixed(2)}{'× · n='}{r.rawGapSamples}
-       </div>)}
+       {horizonRankingView.map(r=>{const survPass=r.survivalP>=Number(maxSurvivalP);return <div key={r.digit} className="border-t border-slate-700/40 py-0.5"><span className="font-bold text-white">{r.digit}</span>{' · gap '}{r.gap}{' / mean '}{r.gapExpectation.toFixed(1)}{' · P'}{horizonAccuracy.horizon}{' '}{(100*r.horizonProbability).toFixed(1)}{'% · lift '}{r.lift.toFixed(2)}{'× · surv '}<span className={survPass?'text-emerald-400':'text-rose-400'}>{(100*r.survivalP).toFixed(1)}{'%'}</span>{' · n='}{r.rawGapSamples}</div>;})}
      </div>
      <div className="mt-1 text-slate-400">Measured horizon hit rate: <strong className="text-white">{horizonAccuracy.trials?`${(100*horizonAccuracy.hits/horizonAccuracy.trials).toFixed(1)}%`:'—'}</strong> ({horizonAccuracy.hits}/{horizonAccuracy.trials}) · Wilson 95% LB <strong className="text-white">{(100*horizonAccuracy.lower95).toFixed(1)}%</strong></div>
+     <div className="text-slate-500">Survival P = 0.9^gap. Green = fair-RNG would still allow this gap; red = deep tail, rejected.</div>
    </div>}
    <div className="mt-2 rounded-md border border-cyan-500/30 bg-[#091725] px-2 py-1.5 text-[11px] text-slate-200" aria-label="Tick-paced dispatch audit">
      <span className="font-semibold text-cyan-300">Tick-paced dispatch</span>
@@ -762,7 +783,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
        <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-slate-200">
          <span>Method {lastTrace.trace.strategy==='MOMENTUM_LOCK'?'Momentum Lock':'Dynamic V1'} · target <strong>{lastTrace.trace.target}</strong></span>
          <span>At signal: NEXT {lastTrace.trace.nextDigit??'—'}</span>
-         {lastTrace.trace.horizonProbability!==undefined&&<span>P({lastTrace.trace.horizonTicks}) {(100*lastTrace.trace.horizonProbability).toFixed(1)}% · lift {lastTrace.trace.horizonLift?.toFixed(2)}× · gap {lastTrace.trace.horizonGapAtLock}/{(lastTrace.trace.horizonGapExpectation??0).toFixed(1)}</span>}
+         {lastTrace.trace.horizonProbability!==undefined&&<span>P({lastTrace.trace.horizonTicks}) {(100*lastTrace.trace.horizonProbability).toFixed(1)}% · lift {lastTrace.trace.horizonLift?.toFixed(2)}× · surv {(100*(lastTrace.trace.survivalP??0)).toFixed(1)}% · gap {lastTrace.trace.horizonGapAtLock}/{(lastTrace.trace.horizonGapExpectation??0).toFixed(1)}</span>}
          <span>Momentum {lastTrace.trace.momentum.toFixed(2)} · score {lastTrace.trace.score.toFixed(2)} · rises {lastTrace.trace.positiveSteps}/3</span>
          <span>Signal tick #{lastTrace.trace.signalSequence} · observed {lastTrace.trace.signalObservedDigit} · epoch {lastTrace.trace.signalEpoch}</span>
          <span>Deriv entry {lastTrace.entryDigit??'unknown'} · expiry {lastTrace.expiryDigit??'unknown'}</span>
