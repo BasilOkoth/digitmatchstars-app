@@ -637,11 +637,11 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
 
 
 
-type Ledger={day:string;account:string;attempts:number;profit:number;uncertain:boolean};
+type Ledger={day:string;account:string;attempts:number;profit:number;uncertain:boolean;pendingContractId?:number|null};
 const dayUTC=()=>new Date().toISOString().slice(0,10);
 const storageKey=(account:string)=>`dms-differs-v1:${account}:${dayUTC()}`;
 const readLedger=(account:string):Ledger=>{
- const fresh={day:dayUTC(),account,attempts:0,profit:0,uncertain:false};
+ const fresh={day:dayUTC(),account,attempts:0,profit:0,uncertain:false,pendingContractId:null};
  try{const raw=localStorage.getItem(storageKey(account));if(!raw)return fresh;const v=JSON.parse(raw);if(v.day===fresh.day&&v.account===account&&Number.isInteger(v.attempts)&&v.attempts>=0&&Number.isFinite(v.profit))return {...fresh,...v}}catch{}
  return fresh;
 };
@@ -672,6 +672,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
  const history=useRef<number[]>([]);
  const session=useRef('');
  const uncertain=useRef(false);
+ const reconciling=useRef(false);
  const demo=Boolean(accountId)&&(/demo|virtual/i.test(accountType??'')||/^VRT/i.test(accountId??''));
  const isLive=Boolean(accountId)&&!demo;
  const update=(v:Ledger)=>{latestLedger.current=v;setLedger(v);persist(v)};
@@ -681,6 +682,38 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   if(accountId){const l=readLedger(accountId);latestLedger.current=l;setLedger(l);uncertain.current=l.uncertain}else{latestLedger.current=null;setLedger(null)}
   session.current=`${accountId??''}:${symbol}`;
  },[accountId,symbol,stop]);
+ // Reconcile only a broker-acknowledged contract ID. Never repeat a buy.
+ // The contract ID and attempted slot survive refreshes and WebSocket reconnects.
+ useEffect(()=>{
+  if(!accountId||!ws||!isConnected)return;
+  const saved=readLedger(accountId);
+  if(!saved.uncertain||!saved.pendingContractId)return;
+  let cancelled=false;
+  const reconcile=async()=>{
+   if(cancelled||reconciling.current||busy.current)return;
+   reconciling.current=true;
+   try{
+    const frame=await ws.send<any>({proposal_open_contract:1,contract_id:saved.pendingContractId});
+    if(cancelled)return;
+    const c=frame?.proposal_open_contract;
+    if(Number(c?.contract_id)!==saved.pendingContractId)throw new Error('Contract ID mismatch');
+    if(!(c.is_sold||c.status==='won'||c.status==='lost')){
+     setStatus(`Contract #${saved.pendingContractId} open — awaiting broker settlement`);return;
+    }
+    const profit=Number(c.profit);
+    if(!Number.isFinite(profit))throw new Error('Broker settlement has no profit');
+    const latest=readLedger(accountId);
+    if(!latest.uncertain||latest.pendingContractId!==saved.pendingContractId)return;
+    const next={...latest,profit:Number((latest.profit+profit).toFixed(2)),uncertain:false,pendingContractId:null};
+    update(next);uncertain.current=false;setError('');
+    setStatus(`Reconciled contract #${saved.pendingContractId}: ${profit>=0?'WIN':'LOSS'} ${profit.toFixed(2)} USD — press Start to resume`);
+    setNotice({id:Date.now(),contractId:saved.pendingContractId!,profit,kind:profit>0?'WIN':'LOSS'});
+   }catch(e){if(!cancelled)setStatus(`Reconciliation pending for #${saved.pendingContractId} — waiting for Deriv connection`)}
+   finally{reconciling.current=false}
+  };
+  void reconcile();const timer=setInterval(()=>void reconcile(),5000);
+  return()=>{cancelled=true;clearInterval(timer)};
+ },[accountId,ws,isConnected]);
  const monitor=useCallback(async(id:number,connection:DerivWS):Promise<any>=>new Promise((resolve,reject)=>{
   let done=false;let unsub:(()=>Promise<unknown>|void)|undefined;let poll:ReturnType<typeof setInterval>|undefined;
   const timeout=setTimeout(()=>finish(null,new Error('Settlement not confirmed; manual reconciliation required')),60000);
@@ -734,6 +767,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
     const result=await ws.send<any>({buy:'1',price:Number((amount*1.05).toFixed(2)),parameters:{amount,basis:'stake',contract_type:'DIGITDIFF',currency:'USD',duration:1,duration_unit:'t',underlying_symbol:symbol,barrier:String(target)}});
     const id=Number(result?.buy?.contract_id);
     if(!Number.isSafeInteger(id)||id<=0)throw new Error('Purchase acknowledgment missing contract ID');
+    update({...reserved,uncertain:true,pendingContractId:id});
     setStatus(`Contract ${id}: waiting for broker settlement`);
     const c=await monitor(id,ws);
     const profit=Number(c?.profit);
@@ -741,21 +775,21 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
     // Avoid applying an old account's outcome to a new account's ledger.
     const current=latestLedger.current;
     if(session.current===entrySession&&current&&current.account===accountId&&current.day===reserved.day){
-     const next={...current,profit:Number((current.profit+profit).toFixed(2))};update(next);
+     const next={...current,profit:Number((current.profit+profit).toFixed(2)),uncertain:false,pendingContractId:null};update(next);uncertain.current=false;
      setStatus(`Settled: ${profit>=0?'WIN':'LOSS'} ${profit.toFixed(2)} USD · ${next.attempts}${enforceFivePerDay?'/5':''}`);
      setNotice({id:Date.now(),contractId:id,profit,kind:profit>0?'WIN':'LOSS'});
      if((enforceFivePerDay&&next.attempts>=5)||next.profit<=-maxLoss)stop('Daily risk/trade limit reached');
     }
    }catch(e){
     const current=latestLedger.current;
-    if(session.current===entrySession&&current&&current.account===accountId){update({...current,uncertain:true});uncertain.current=true;stop('Uncertain order or settlement — trading halted');setError(e instanceof Error?e.message:String(e))}
+    if(session.current===entrySession&&current&&current.account===accountId){update({...current,uncertain:true});uncertain.current=true;stop(current.pendingContractId?'Settlement pending — automatic reconciliation on reconnect':'Purchase acknowledgement unknown — manual reconciliation required');setError(current.pendingContractId?`Contract #${current.pendingContractId} will be checked against Deriv before another trade.`:`Purchase confirmation missing. Check Deriv transaction history before resuming. ${String(e)}`)}
    }finally{busy.current=false}
   })();
  },[accountId,currentTick,dailyLoss,enforceFivePerDay,isConnected,isLive,liveApproved,minObservations,monitor,pipSize,stake,stop,symbol,ws]);
  const start=()=>{
   setError('');if(!accountId||!ws||!isConnected){setError('Connect your Deriv account first');return}
   const l=readLedger(accountId);update(l);
-  if(l.uncertain){setError('An earlier purchase has uncertain status. Reconcile it in Deriv before continuing.');return}
+  if(l.uncertain){setError(l.pendingContractId?`Contract #${l.pendingContractId} is awaiting automatic reconciliation with Deriv.`:'Purchase acknowledgement is missing. Check Deriv transaction history before continuing.');return}
   if(enforceFivePerDay&&l.attempts>=5){setError('Five trades already attempted today (UTC). Disable the five-trade limit to continue, subject to the loss cap.');return}
   if(isLive&&!liveApproved){setError('Confirm live trading first.');return}
   if(Number(stake)<50||!Number.isFinite(Number(stake))||Number(dailyLoss)<Number(stake)||(!Number.isInteger(Number(minObservations))||Number(minObservations)<20)){setError('Invalid settings: stake ≥ $50, loss cap ≥ stake, minimum ticks ≥ 20.');return}
