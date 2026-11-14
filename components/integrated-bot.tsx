@@ -31,9 +31,8 @@ function tone(kind:'buy'|'win'|'loss'){
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// DigitHorizonAnalyzer — NOW includes survivalP (fair-RNG probability that
-// a digit could still be missing for this many ticks). Used to gate out deep
-// tails where a fair RNG says "this gap is already unusual, don't bet on it".
+// DigitHorizonAnalyzer — empirical P(digit appears in next k ticks)
+// + survivalP (fair-RNG probability a digit could still be missing this long).
 // ════════════════════════════════════════════════════════════════════════════
 interface HorizonDigitScore {
   digit:number;
@@ -106,9 +105,6 @@ class DigitHorizonAnalyzer {
         overdueRatio:meanGap>0?currentGap/meanGap:1,
         nextTickScore:row.score??0,
         combined:0,
-        // NEW: survivalP = probability a fair RNG would still be missing this digit
-        // after `currentGap` ticks. 0.9^gap shrinks toward 0 as gap grows. Used by
-        // the outer gate to reject digits that are "too overdue to be credible".
         survivalP: Math.pow(0.9, Math.max(0, currentGap)),
       });
     }
@@ -136,8 +132,6 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   const [minHorizonLift,setMinHorizonLift]=useState('1.0');
   const [minHorizonProbability,setMinHorizonProbability]=useState('0.41');
   const [minOverdueRatio,setMinOverdueRatio]=useState('1.0');
-  // NEW: reject digits whose fair-RNG survival probability is below this value.
-  // Lower value = allows deeper gaps. Default 0.50 = only allow gap ≤ 6 ticks.
   const [maxSurvivalP,setMaxSurvivalP]=useState('0.50');
   const lockPurchases=useRef(new Map<number,number>());
   const lockRef=useRef<{digit:number;elapsed:number;source:EntryKind;signal:{score:number;momentum3:number;positiveSteps:number;threshold:number};originSequence:number;originEpoch:number;gapAtLock:number;gapExpectation:number;horizonProb:number;horizonLift:number}|null>(null);
@@ -342,7 +336,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     setOutstandingCount(outstanding.current.size);
     if(!matchPause.current && active.current && !halt.current && !winConfirmed.current && !uncertainPurchase.current)setMode('RUNNING');
     const id=contractId;
-    void (async()=>{
+        void (async()=>{
      let unsubscribe:(()=>Promise<void>)|undefined;
      const settlementStart=performance.now();
      try{
@@ -587,15 +581,34 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     const minHorizonProb=Number(settings.minHorizonProbability);
     const minOverdue=Number(settings.minOverdueRatio);
     const maxSurvival=Number(settings.maxSurvivalP);
-    // ─── TAIL-AWARE FILTER CHAIN ─────────────────────────────────────────────
-    // Step 1: reject digits whose fair-RNG survival is below maxSurvivalP.
-    //         This is the "avoid deep tails" gate: a digit that's been missing
-    //         15+ ticks has survivalP = 0.9^15 ≈ 20%, which is below the default
-    //         threshold of 50%, so it is excluded. Only digits whose gap is
-    //         "normal" for a fair RNG can be considered.
-    // Step 2: then apply the user's probability / lift / overdue gates.
+    // ─── PER-DISPATCH GATE RE-CHECK (NEW) ────────────────────────────────────
+    // For MOMENTUM_LOCK, gates were evaluated at lock acquisition. The market
+    // keeps moving during the lock window, so re-check the locked digit against
+    // the SAME gates on every tick. If any gate fails, skip this dispatch but
+    // keep the lock alive (the digit's stats may recover on the next tick).
+    // This is why the frozen trace at dispatch will always show numbers that
+    // pass the gates — otherwise the trade is skipped, not sent.
+    if(settings.strategy==='MOMENTUM_LOCK' && selected){
+      const lockedHorizon=horizonRanking.find(r=>r.digit===selected!.digit) ?? null;
+      if(!lockedHorizon){
+        skipPace(`Locked ${selected!.digit} out of ranking`); return;
+      }
+      if(lockedHorizon.survivalP < maxSurvival){
+        skipPace(`Locked ${selected!.digit} fails survival (${(100*lockedHorizon.survivalP).toFixed(1)}% < ${(100*maxSurvival).toFixed(0)}%)`); return;
+      }
+      if(lockedHorizon.horizonProbability < minHorizonProb){
+        skipPace(`Locked ${selected!.digit} below P(k) (${(100*lockedHorizon.horizonProbability).toFixed(1)}% < ${(100*minHorizonProb).toFixed(0)}%)`); return;
+      }
+      if(lockedHorizon.lift < minLift){
+        skipPace(`Locked ${selected!.digit} below lift (${lockedHorizon.lift.toFixed(2)}× < ${minLift.toFixed(2)}×)`); return;
+      }
+      if(lockedHorizon.overdueRatio < minOverdue){
+        skipPace(`Locked ${selected!.digit} below overdue (${lockedHorizon.overdueRatio.toFixed(2)}× < ${minOverdue.toFixed(2)}×)`); return;
+      }
+    }
+    // ─── END PER-DISPATCH GATE RE-CHECK ─────────────────────────────────────
     const horizonCandidates = horizonRanking
-      .filter(r => r.survivalP >= maxSurvival)     // ← NEW tail gate (first)
+      .filter(r => r.survivalP >= maxSurvival)
       .filter(r => qualified.some(q => q.digit===r.digit))
       .filter(r => r.lift >= minLift)
       .filter(r => r.horizonProbability >= minHorizonProb)
@@ -744,13 +757,13 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      <label className="text-[11px] text-slate-300" title="Reject digits whose fair-RNG survival probability is below this value. Higher = only allow short gaps.">Max survival P <input type="number" min="0.01" max="1" step="0.01" value={maxSurvivalP} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setMaxSurvivalP(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>
    </div>
    {strategy==='MOMENTUM_LOCK'&&<div className="mt-2 rounded-lg border border-emerald-500/30 bg-[#0a1721] p-2 text-xs" aria-label="Momentum Lock trading status" aria-live="polite">
-     <div className="mb-1 font-bold text-emerald-300">Momentum Lock · NEXT-only trading target</div>
+     <div className="mb-1 font-bold text-emerald-300">Momentum Lock · NEXT-only trading target · per-dispatch gate re-check</div>
      <div className="flex flex-wrap gap-x-4 gap-y-1 text-slate-200">
        <span>Active target <strong className="text-white">{tradeLockView?.digit??'—'}</strong></span>
        <span>Remaining <strong>{tradeLockView?Math.max(0,Math.max(1,Number(lockDuration)||1)-tradeLockView.elapsed+1):'—'}</strong> trading ticks</span>
        <span>Selected by <strong>{tradeLockView?.source??'—'}</strong></span>
        <span>Purchases this lock <strong>{lockRef.current?(lockPurchases.current.get(lockRef.current.originSequence)??0):0}</strong></span>
-       <span>Status <strong className={mode==='RUNNING'&&!matchPaused&&!winConfirmed.current?'text-emerald-300':'text-amber-300'}>{mode==='UNCERTAIN'?'RECONCILIATION REQUIRED':winConfirmed.current||mode==='WIN'?'WIN CONFIRMED · STOPPED':matchPaused?'MATCH HOLD · VERIFYING SETTLEMENT':mode!=='RUNNING'?'NOT TRADING':!tradeLockView?'WAITING FOR DUE DIGIT':'ACTIVE · TAIL GATE APPLIED'}</strong></span>
+       <span>Status <strong className={mode==='RUNNING'&&!matchPaused&&!winConfirmed.current?'text-emerald-300':'text-amber-300'}>{mode==='UNCERTAIN'?'RECONCILIATION REQUIRED':winConfirmed.current||mode==='WIN'?'WIN CONFIRMED · STOPPED':matchPaused?'MATCH HOLD · VERIFYING SETTLEMENT':mode!=='RUNNING'?'NOT TRADING':!tradeLockView?'WAITING FOR DUE DIGIT':'ACTIVE · TAIL+GATE RE-CHECK'}</strong></span>
      </div>
      <div className="mt-1 text-slate-400">{mode!=='RUNNING'&&<span>Stop reason: {stopReason}. </span>}{mode==='RUNNING'?`Latest execution decision: ${entryStatus}`:mode==='WIN'?'Cycle stopped after verified win. Start a new cycle to trade again.':`Purchases disabled: ${mode.toLowerCase().replace(/_/g,' ')}.`}</div>
    </div>}
@@ -761,7 +774,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
        {horizonRankingView.map(r=>{const survPass=r.survivalP>=Number(maxSurvivalP);return <div key={r.digit} className="border-t border-slate-700/40 py-0.5"><span className="font-bold text-white">{r.digit}</span>{' · gap '}{r.gap}{' / mean '}{r.gapExpectation.toFixed(1)}{' · P'}{horizonAccuracy.horizon}{' '}{(100*r.horizonProbability).toFixed(1)}{'% · lift '}{r.lift.toFixed(2)}{'× · surv '}<span className={survPass?'text-emerald-400':'text-rose-400'}>{(100*r.survivalP).toFixed(1)}{'%'}</span>{' · n='}{r.rawGapSamples}</div>;})}
      </div>
      <div className="mt-1 text-slate-400">Measured horizon hit rate: <strong className="text-white">{horizonAccuracy.trials?`${(100*horizonAccuracy.hits/horizonAccuracy.trials).toFixed(1)}%`:'—'}</strong> ({horizonAccuracy.hits}/{horizonAccuracy.trials}) · Wilson 95% LB <strong className="text-white">{(100*horizonAccuracy.lower95).toFixed(1)}%</strong></div>
-     <div className="text-slate-500">Survival P = 0.9^gap. Green = fair-RNG would still allow this gap; red = deep tail, rejected.</div>
+     <div className="text-slate-500">Survival P = 0.9^gap. Green = fair-RNG would still allow this gap; red = deep tail, rejected. Locked digits are re-checked against these gates on every dispatch.</div>
    </div>}
    <div className="mt-2 rounded-md border border-cyan-500/30 bg-[#091725] px-2 py-1.5 text-[11px] text-slate-200" aria-label="Tick-paced dispatch audit">
      <span className="font-semibold text-cyan-300">Tick-paced dispatch</span>
