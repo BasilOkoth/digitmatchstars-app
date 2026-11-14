@@ -213,6 +213,25 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       selected=lockRef.current;setLockPosition(1);setTradeLockView({digit:selected.digit,source:'NEXT',elapsed:1});
     }
     const target=choice.digit;
+    // ── PER-DISPATCH SCORE + MOMENTUM GATE ──────────────────────────────
+    // `Min score` and `Min momentum` must gate every BUY, not just lock
+    // acquisition. Otherwise a lock that qualified at score 6 will keep
+    // firing at score 1 until it expires. Re-check the target's CURRENT
+    // score/momentum against the user's threshold on every dispatch.
+    const dispatchForecast = ranking.find(row => row.digit === target);
+    if (!dispatchForecast) {
+      setEntryStatus(`Target ${target} unavailable in current ranking`);
+      return;
+    }
+    if (dispatchForecast.score < Number(settings.threshold)) {
+      setEntryStatus(`Skipped: ${target} score ${dispatchForecast.score.toFixed(2)} < ${settings.threshold}`);
+      return;
+    }
+    if (dispatchForecast.momentum3 < Number(settings.minMomentum)) {
+      setEntryStatus(`Skipped: ${target} momentum ${dispatchForecast.momentum3.toFixed(2)} < ${settings.minMomentum}`);
+      return;
+    }
+    // ── END PER-DISPATCH GATE ───────────────────────────────────────────
     const stake=amount(Number(settings.base)*Math.pow(Number(settings.factor),countRef.current));
     if(!Number.isFinite(stake)||stake<=0||stake+reservedStake.current+Math.max(0,-pnlRef.current)>Number(settings.maxLoss)){setStopReason('Stake would exceed loss limit');stopRef.current();setMode('MAX_LOSS');return;}
     lockedRef.current=target;
