@@ -25,6 +25,22 @@ const amount=(n:number)=>Math.round((n+Number.EPSILON)*100)/100;
 function tone(kind:'buy'|'win'|'loss'){
  try{const A=window.AudioContext;const ctx=new A();const osc=ctx.createOscillator();const gain=ctx.createGain();osc.type=kind==='win'?'sine':'triangle';osc.frequency.value=kind==='win'?880:kind==='buy'?650:250;gain.gain.value=.065;osc.connect(gain);gain.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+(kind==='win'?.42:.15));osc.onended=()=>{void ctx.close()}}catch{/* audio unsupported */}
 }
+type TradeNotice={id:number;profit:number;contractId:number;kind:'WIN'|'LOSS'};
+function SettlementToast({notice,onDismiss}:{notice:TradeNotice|null;onDismiss:()=>void}){
+ useEffect(()=>{if(!notice)return;const timer=window.setTimeout(onDismiss,5500);return()=>window.clearTimeout(timer)},[notice,onDismiss]);
+ if(!notice)return null;
+ const win=notice.kind==='WIN';
+ return <div role="status" aria-live="polite" className="fixed right-4 top-5 z-[100] w-[min(23rem,calc(100vw-2rem))] animate-in slide-in-from-top-3 fade-in duration-300">
+  <div className={`overflow-hidden rounded-2xl border p-4 shadow-2xl backdrop-blur-xl ${win?'border-emerald-400/70 bg-[#062b23]/95 text-emerald-100 shadow-emerald-900/40':'border-rose-400/70 bg-[#34131d]/95 text-rose-100 shadow-rose-950/40'}`}>
+   <div className="flex items-start gap-3">
+    <span aria-hidden="true" className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-2xl ${win?'bg-emerald-400/20':'bg-rose-400/20'}`}>{win?'✓':'✕'}</span>
+    <div className="min-w-0 flex-1"><p className="text-xs font-semibold uppercase tracking-[.18em] opacity-75">Trade settled</p><p className={`text-xl font-black tracking-wide ${win?'text-emerald-300':'text-rose-300'}`}>{win?'WIN · PROFIT':'LOSS'}</p><p className={`mt-1 text-2xl font-black tabular-nums ${win?'text-green-400':'text-red-400'}`}>{notice.profit>=0?'+':'−'}${Math.abs(notice.profit).toFixed(2)}</p><p className="mt-1 text-xs opacity-75">Deriv contract #{notice.contractId}</p></div>
+    <button type="button" aria-label="Dismiss trade notification" onClick={onDismiss} className="rounded-lg px-2 py-1 text-lg opacity-70 transition hover:bg-white/10 hover:opacity-100">×</button>
+   </div>
+   <div className={`mt-3 h-1 w-full rounded-full ${win?'bg-emerald-400/30':'bg-rose-400/30'}`}><div className={`h-full w-full rounded-full ${win?'bg-emerald-400':'bg-rose-400'}`}/></div>
+  </div>
+ </div>;
+}
 function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pipSize,symbol,onBusyChange}:{ws:DerivWS|null;accountId:string|null;accountType:string|null;isConnected:boolean;currentTick:Tick|null;pipSize:number;symbol:string;onBusyChange:(busy:boolean)=>void}){
  const {setTarget} = useExecutionTarget();
  const {publishForecast} = useEngineForecast();
@@ -34,6 +50,8 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
  const [lockPosition,setLockPosition]=useState(0);
  const [base,setBase]=useState('1');const [factor,setFactor]=useState('1.15');const [limit,setLimit]=useState('20');const [maxLoss,setMaxLoss]=useState('40');const [threshold,setThreshold]=useState('6');const [minMomentum,setMinMomentum]=useState('0');
  const [mode,setMode]=useState<Mode>('IDLE');const [count,setCount]=useState(0);const [pnl,setPnl]=useState(0);const [lastOutcome,setLastOutcome]=useState<Outcome|null>(null);const [err,setErr]=useState('');const [sound,setSound]=useState(true);
+ const [notice,setNotice]=useState<TradeNotice|null>(null);
+ const dismissNotice=useCallback(()=>setNotice(null),[]);
  const [history,setHistory]=useState<number[]>([]);const [scores,setScores]=useState<ReturnType<typeof scoreDigits>>([]);const [lockedDigit,setLockedDigit]=useState<number|null>(null);const [lossBlock,setLossBlock]=useState(0);
  const scoreHistoryRef=useRef<Record<number,number>[]>([]);
  const intelligenceRef=useRef(new NextTickIntelligence());
@@ -273,6 +291,7 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
        ? ` · streamed expiry-epoch digit ${aligned.digit}${aligned.digit===expiryDigit?' (aligned)':' (disagrees: verify pip precision)'}`
        : ` · ${alignedTicks.length>1?'multiple same-second ticks':'expiry tick not in browser buffer'} (no browser match inferred)`;
      setSyncStatus(`Contract #${id}: target ${predicted} · expiry ${expiryDigit??'unknown'} at ${expiryEpoch??'unknown'} · ${win?'WIN':'LOSS'} (Deriv verified)${observationResult}`);
+     setNotice({id:Date.now(),contractId:id,profit,kind:win?'WIN':'LOSS'});
      setLastOutcome(old=>old?.outcome==='WIN'&&!win?old:{id,digit:predicted,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS',expiryDigit,expiryEpoch,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch});play(win?'win':'loss');
      const journalRow:MomentumTrade={signalSequence,signalToSubmitMs,ticksDuringAcknowledgment,signalAgeBudgetMs:Math.max(120,Math.min(1000,(tickCadence.current.intervalMs??1000)*0.65)),buyAcknowledgmentMs:Math.round(acknowledgedAt-buyStart),entryEpoch,entryDigit,entrySpot:entrySpot===null?null:String(entrySpot),exitSpot:settle.exit_spot===undefined?null:String(settle.exit_spot),strategy:entryStrategy,lockTick,lockDuration:lockWindow,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch,expiryEpoch,expiryDigit,recordType:'TRADE',contractId:id,accountId,symbol,timestamp:new Date().toISOString(),targetDigit:predicted,score:signal.score,momentum3:signal.momentum3,positiveSteps:signal.positiveSteps,momentumRising:signal.momentum3>0&&signal.positiveSteps>=2,threshold:signal.threshold,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS'};
      try{const key=`dms-momentum-trades:v1:${symbol}`;const prev=JSON.parse(localStorage.getItem(key)||'[]');const rows=Array.isArray(prev)?prev:[];if(!rows.some((x:MomentumTrade)=>x.contractId===id&&x.accountId===accountId))localStorage.setItem(key,JSON.stringify([...rows.slice(-4999),journalRow]))}catch{}
@@ -607,6 +626,7 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
     >{active.current ? '■ STOP CYCLE' : '▶ START CYCLE'}</button>
     <button aria-label={sound?'Mute sounds':'Enable sounds'} title={sound?'Mute':'Unmute'} onClick={()=>{setSound(v=>!v);if(!sound)tone('buy')}} className="flex h-8 w-8 items-center justify-center rounded-md border border-slate-700 bg-slate-900 text-xs text-emerald-300">{sound?'🔊':'🔇'}</button>
   </div>
+  <SettlementToast notice={notice} onDismiss={dismissNotice}/>
   {lastOutcome&&<div className={`mt-3 rounded-lg border p-3 ${lastOutcome.outcome==='WIN'?'border-emerald-400 bg-emerald-500/20 text-emerald-300 shadow-lg shadow-emerald-950/30':'border-rose-500 bg-rose-500/10 text-rose-300'}`}><strong className="text-xl font-black tracking-wide">{lastOutcome.outcome==='WIN'?'🟢 WIN':'🔴 LOSS'} {lastOutcome.profit>=0?'+':''}${lastOutcome.profit.toFixed(2)}</strong><span className="ml-3 text-xs">Verified contract #{lastOutcome.id} · target {lastOutcome.digit} · expiry {lastOutcome.expiryDigit??'unavailable'} · signal tick {lastOutcome.signalEpoch} · buy {lastOutcome.purchaseEpoch??'unavailable'} · expiry time {lastOutcome.expiryEpoch??'unavailable'}</span></div>}
   {err&&<div role="alert" className="mt-3 rounded-lg border border-amber-500 p-2 text-xs text-amber-300">{err}{mode==='UNCERTAIN'?' — Purchase outcome requires verification in Deriv before restarting.':''}</div>}
 
@@ -630,18 +650,12 @@ const digitOf=(tick:Tick,pipSize:number)=>{
  const p=Number.isInteger(pipSize)&&pipSize>=0&&pipSize<=12?pipSize:2;
  return Number(tick.quote.toFixed(p).slice(-1));
 };
-// Wilson upper bound for the frequency of the selected losing digit.
-// A lower observed frequency alone is not sufficient evidence of an edge.
-const wilsonUpper=(hits:number,n:number)=>{
- if(n<=0)return 1;const z=1.96,p=hits/n,z2=z*z;
- return (p+z2/(2*n)+z*Math.sqrt((p*(1-p)+z2/(4*n))/n))/(1+z2/n);
-};
 function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,pipSize,symbol,onBusyChange}:{ws:DerivWS|null;accountId:string|null;accountType:string|null;isConnected:boolean;currentTick:Tick|null;pipSize:number;symbol:string;onBusyChange:(busy:boolean)=>void}){
  const [stake,setStake]=useState('50');
  const [dailyLoss,setDailyLoss]=useState('250');
  const [minObservations,setMinObservations]=useState('100');
- const [maxUpper,setMaxUpper]=useState('15');
- const [useUpperFilter,setUseUpperFilter]=useState(true);
+ const [notice,setNotice]=useState<TradeNotice|null>(null);
+ const dismissNotice=useCallback(()=>setNotice(null),[]);
  const [enabled,setEnabled]=useState(false);
  const [liveApproved,setLiveApproved]=useState(false);
  const [ledger,setLedger]=useState<Ledger|null>(null);
@@ -689,8 +703,8 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   const l=latestLedger.current;
   if(!l||l.account!==accountId||l.day!==dayUTC()){stop('Daily boundary reached — restart to load new UTC day');return}
   if(l.attempts>=5){stop('Daily limit: 5 purchases');return}
-  const amount=Number(stake),maxLoss=Number(dailyLoss),minimum=Number(minObservations),upperLimit=Number(maxUpper);
-  if(!Number.isFinite(amount)||amount<50||!Number.isFinite(maxLoss)||maxLoss<amount||!Number.isInteger(minimum)||minimum<20||(useUpperFilter&&(!Number.isFinite(upperLimit)||upperLimit<=0||upperLimit>1))){stop('Invalid risk or signal settings');return}
+  const amount=Number(stake),maxLoss=Number(dailyLoss),minimum=Number(minObservations);
+  if(!Number.isFinite(amount)||amount<50||!Number.isFinite(maxLoss)||maxLoss<amount||!Number.isInteger(minimum)||minimum<20){stop('Invalid risk or signal settings');return}
   if(l.profit-amount < -maxLoss){stop('Daily loss exposure limit');return}
   if(arr.length<minimum){setStatus(`Warming up: ${arr.length}/${minimum} ticks`);return}
   // Use the user-selected sample size, excluding the current tick. Split chronologically
@@ -703,9 +717,11 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   const counts=Array.from({length:10},(_,d)=>training.filter(x=>x===d).length);
   const target=counts.indexOf(Math.min(...counts));
   const valHits=validation.filter(d=>d===target).length;
-  const upper=wilsonUpper(valHits,validation.length);
   setSelected(target);
-  if(useUpperFilter&&upper>=upperLimit){setStatus(`Signal filtered: digit ${target}, validation upper bound ${(upper*100).toFixed(1)}% exceeds your ${(upperLimit*100).toFixed(1)}% limit (not proof of an edge)`);return}
+  // Simple selective check: require the chosen digit to occur less often than
+  // the uniform 10% baseline in a separate validation window. This is not
+  // statistically verified predictive power or a guarantee of profitability.
+  if(valHits/validation.length>=0.1){setStatus(`Waiting: digit ${target} validation frequency ${(100*valHits/validation.length).toFixed(1)}% is not below 10%`);return}
   if(isLive&&!liveApproved){stop('Live account requires explicit confirmation');return}
   // Reserve a purchase slot synchronously BEFORE sending the buy request.
   busy.current=true;
@@ -726,6 +742,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
     if(session.current===entrySession&&current&&current.account===accountId&&current.day===reserved.day){
      const next={...current,profit:Number((current.profit+profit).toFixed(2))};update(next);
      setStatus(`Settled: ${profit>=0?'WIN':'LOSS'} ${profit.toFixed(2)} USD · ${next.attempts}/5`);
+     setNotice({id:Date.now(),contractId:id,profit,kind:profit>0?'WIN':'LOSS'});
      if(next.attempts>=5||next.profit<=-maxLoss)stop('Daily risk/trade limit reached');
     }
    }catch(e){
@@ -733,30 +750,28 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
     if(session.current===entrySession&&current&&current.account===accountId){update({...current,uncertain:true});uncertain.current=true;stop('Uncertain order or settlement — trading halted');setError(e instanceof Error?e.message:String(e))}
    }finally{busy.current=false}
   })();
- },[accountId,currentTick,dailyLoss,isConnected,isLive,liveApproved,maxUpper,useUpperFilter,minObservations,monitor,pipSize,stake,stop,symbol,ws]);
+ },[accountId,currentTick,dailyLoss,isConnected,isLive,liveApproved,minObservations,monitor,pipSize,stake,stop,symbol,ws]);
  const start=()=>{
   setError('');if(!accountId||!ws||!isConnected){setError('Connect your Deriv account first');return}
   const l=readLedger(accountId);update(l);
   if(l.uncertain){setError('An earlier purchase has uncertain status. Reconcile it in Deriv before continuing.');return}
   if(l.attempts>=5){setError('Five trades already attempted today (UTC).');return}
   if(isLive&&!liveApproved){setError('Confirm live trading first.');return}
-  if(Number(stake)<50||!Number.isFinite(Number(stake))||Number(dailyLoss)<Number(stake)||(!Number.isInteger(Number(minObservations))||Number(minObservations)<20)||(useUpperFilter&&(!Number.isFinite(Number(maxUpper))||Number(maxUpper)>100||Number(maxUpper)<=0))){setError('Invalid settings: stake ≥ $50, loss cap ≥ stake, minimum ticks ≥ 20, upper-bound percentage between 0 and 100 when enabled.');return}
+  if(Number(stake)<50||!Number.isFinite(Number(stake))||Number(dailyLoss)<Number(stake)||(!Number.isInteger(Number(minObservations))||Number(minObservations)<20)){setError('Invalid settings: stake ≥ $50, loss cap ≥ stake, minimum ticks ≥ 20.');return}
   enabledRef.current=true;setEnabled(true);setStatus('Monitoring ticks for qualifying signal');
  };
  return <section className="rounded-xl border border-slate-600 p-4 space-y-3 text-sm">
   <div className="flex justify-between gap-2"><h3 className="font-bold text-lg">Selective Digit Differs</h3><span>{demo?'DEMO':isLive?'LIVE':'DISCONNECTED'}</span></div>
-  <p>At most five $50+ one-tick DIGITDIFF purchases per UTC day. A statistical validation filter can reject every signal; it does not guarantee a profitable edge.</p>
-  <p className="text-xs text-amber-300">Set your own validation upper-bound percentage or disable this filter entirely. Disabling it removes this statistical safeguard; it does not create an edge or improve expected returns.</p>
+  <p>At most five $50+ one-tick DIGITDIFF purchases per UTC day. Entry requires a candidate digit to appear below 10% in the held-out sample; this does not prove a trading edge.</p>
   <div className="grid grid-cols-2 gap-2">
    <label>Stake USD<input className="block w-full rounded border bg-transparent p-2" type="number" min="50" step="0.01" value={stake} disabled={enabled} onChange={e=>setStake(e.target.value)}/></label>
    <label>Daily loss cap USD<input className="block w-full rounded border bg-transparent p-2" type="number" min="50" step="0.01" value={dailyLoss} disabled={enabled} onChange={e=>setDailyLoss(e.target.value)}/></label>
    <label>Minimum ticks<input className="block w-full rounded border bg-transparent p-2" type="number" min="20" step="1" value={minObservations} disabled={enabled} onChange={e=>setMinObservations(e.target.value)}/></label>
-   <label>Upper-bound limit (%)<input className="block w-full rounded border bg-transparent p-2" type="number" min="0.1" max="100" step="0.1" value={maxUpper} disabled={enabled||!useUpperFilter} onChange={e=>setMaxUpper(e.target.value)}/></label>
   </div>
-  <label className="flex items-center gap-2"><input type="checkbox" checked={useUpperFilter} disabled={enabled} onChange={e=>setUseUpperFilter(e.target.checked)}/>Apply upper-bound validation filter (optional)</label>
   {isLive&&<label className="flex gap-2"><input type="checkbox" checked={liveApproved} disabled={enabled} onChange={e=>setLiveApproved(e.target.checked)}/> I understand these are real-money $50+ trades and authorize live execution.</label>}
   <div className="flex gap-2"><button className="rounded bg-emerald-700 px-4 py-2 text-white disabled:opacity-40" disabled={enabled||busy.current||!isConnected} onClick={start}>Start selective bot</button><button className="rounded bg-slate-600 px-4 py-2 text-white" onClick={()=>stop('Stopped — existing contract will still settle')}>Stop</button></div>
-  <p>Today: <strong>{ledger?.attempts??0}/5</strong> attempted · Realized P/L <strong>${(ledger?.profit??0).toFixed(2)}</strong> · Candidate digit: {selected??'—'}</p>
+  <p>Today: <strong>{ledger?.attempts??0}/5</strong> attempted · Realized P/L <strong className={`font-black tabular-nums ${(ledger?.profit??0)>0?'text-green-400':(ledger?.profit??0)<0?'text-red-400':'text-slate-100'}`}>{(ledger?.profit??0)>0?'PROFIT ': (ledger?.profit??0)<0?'LOSS ':''}{(ledger?.profit??0)>=0?'+':'−'}${Math.abs(ledger?.profit??0).toFixed(2)}</strong> · Candidate digit: {selected??'—'}</p>
+  <SettlementToast notice={notice} onDismiss={dismissNotice}/>
   <p>Status: {status}</p>{error&&<p role="alert" className="text-red-500">{error}</p>}
   <p className="text-xs opacity-75">Daily ledger is browser-local, not synchronized across devices. Do not run multiple bot tabs or instances. An uncertain order blocks further trading until manually reconciled. Stopping does not cancel a submitted purchase.</p>
  </section>;
