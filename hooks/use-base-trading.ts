@@ -64,13 +64,14 @@ export function useBaseTrading({
 }: UseBaseTradingParams): UseBaseTradingReturn {
   const { localize } = useAppTranslations();
 
-  // When the authenticated WS exhausts all reconnect attempts, fall back to
-  // the public WS by triggering logout.
+  // Reconnection exhaustion is a transport failure, not proof of invalid
+  // credentials. Keep the authenticated session and account selection intact.
+  // Trading hooks already receive isConnected=false and must not place orders.
   useEffect(() => {
     if (isExhausted && ws) {
-      onAuthWSFailed?.();
+      console.warn('[useBaseTrading] WebSocket reconnects exhausted; retaining session');
     }
-  }, [isExhausted, ws, onAuthWSFailed]);
+  }, [isExhausted, ws]);
 
   const {
     symbols,

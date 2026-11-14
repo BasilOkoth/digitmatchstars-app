@@ -250,10 +250,12 @@ export function useAuth(): UseAuthReturn {
               getAuthConfig().clientId
             );
           } catch {
-            // Refresh failed (token revoked/expired) — fall back to
-            // unauthenticated (public WS)
-            clearAllAuthData();
-            setAuthState('unauthenticated');
+            // Network failures and revoked refresh tokens cannot be reliably
+            // distinguished here. Do not destroy stored credentials automatically.
+            // Disable authenticated trading until a successful refresh/login.
+            setWsUrl(undefined);
+            setError('Session refresh failed. Check your connection and reconnect or sign in again.');
+            setAuthState('error');
             return;
           }
           try {
@@ -263,8 +265,10 @@ export function useAuth(): UseAuthReturn {
             // failure after a successful refresh keeps the session alive on
             // the cached snapshot instead of forcing a logout.
             if (!(await restoreCachedSession(refreshed))) {
-              clearAllAuthData();
-              setAuthState('unauthenticated');
+              // Preserve credentials and account selection during API outages.
+              setWsUrl(undefined);
+              setError('Unable to restore account connection. Please retry.');
+              setAuthState('error');
             }
           }
           return;
@@ -278,8 +282,10 @@ export function useAuth(): UseAuthReturn {
           // Fresh fetch failed (e.g. transient network error) — keep the
           // session alive on the cached snapshot rather than logging out.
           if (!(await restoreCachedSession(storedAuth))) {
-            clearAllAuthData();
-            setAuthState('unauthenticated');
+            // Do not treat an OTP or account-fetch network error as logout.
+            setWsUrl(undefined);
+            setError('Unable to restore account connection. Please retry.');
+            setAuthState('error');
           }
         }
       }
@@ -316,9 +322,10 @@ export function useAuth(): UseAuthReturn {
         const otpUrl = await fetchOTPUrl(accountId, authInfo);
         setWsUrl(otpUrl);
       } catch {
-        clearAllAuthData();
-        setAuthState('unauthenticated');
-        setWsUrl(undefined);
+        // A transient OTP failure on tab return is not a logout event.
+        // Preserve the existing socket URL and authentication state;
+        // reconnection will be retried on the next tab return.
+        setError('Could not refresh the Deriv connection. Trading remains paused if disconnected.');
       }
     };
 
