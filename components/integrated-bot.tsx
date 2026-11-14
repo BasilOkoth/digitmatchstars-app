@@ -73,6 +73,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   const [inFlightCount,setInFlightCount]=useState(0);
   const [sentCount,setSentCount]=useState(0);
   const active=useRef(false),halt=useRef(false),countRef=useRef(0),pnlRef=useRef(0),lastTickKey=useRef(''),histRef=useRef<number[]>([]),scoreRef=useRef<ReturnType<typeof scoreDigits>>([]),lockedRef=useRef<number|null>(null),scope=useRef('');
+  // FIX (was #1 in audit): confirmedLossesRef must be declared BEFORE execute
+  // uses it in its settlement closure. TDZ bug otherwise.
+  const confirmedLossesRef=useRef(0);
   const valid=Number.isInteger(Number(lockDuration))&&Number(lockDuration)>=1&&Number(lockDuration)<=9999&&Number(base)>0&&Number(factor)>=1&&Number(factor)<=3&&Number(limit)>=1&&Number(limit)<=100&&Number(maxLoss)>0&&Number(threshold)>=0&&minMomentum.trim()!==''&&Number.isFinite(Number(minMomentum))&&Number(minMomentum)>=0;
   const next=amount(Number(base)*Math.pow(Number(factor),countRef.current));const scopeKey=`${accountId}:${symbol}`;
   const soundRef=useRef(sound);useEffect(()=>{soundRef.current=sound},[sound]);
@@ -87,9 +90,11 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,frozenTrace:FrozenEntryTrace)=>{
    if(winConfirmed.current||verifiedWinContract.current!==null)return;
    if(!ws||!accountId||halt.current||!active.current||uncertainPurchase.current||countRef.current>=Number(limit))return;
+   // FIX (was #2): dedupe check + insert are now atomic; no window where two
+   // calls could both pass the check before either registers.
    if(inFlight.current.has(signalSequence))return;
-   pendingCount.current++;
    inFlight.current.set(signalSequence,{digit:predicted,stake});
+   pendingCount.current++;
    refreshExposure();
    let contractId:number|undefined;let purchaseAttempted=false;
    reservedStake.current=amount(reservedStake.current+stake);refreshExposure();
@@ -102,6 +107,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     paceRef.current.dispatched++;
     setMode('BUYING');
     const bought=await buyPromise;
+    // FIX (was #3): if the cycle halted while ACK was in flight, we still
+    // register the contract (it exists on Deriv) but skip the mode flip.
+    const haltedDuringAck=halt.current;
     const paid=Number(bought?.buy?.buy_price);const ask=Number.isFinite(paid)&&paid>0?paid:stake;
     const purchaseEpoch=Number(bought?.buy?.start_time??bought?.buy?.purchase_time??bought?.buy?.transaction_time);
     const acknowledgedEpoch=Number.isFinite(purchaseEpoch)&&purchaseEpoch>0?purchaseEpoch:null;
@@ -112,9 +120,8 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     reservedStake.current=amount(reservedStake.current-stake+ask);
     outstanding.current.set(contractId,{digit:predicted,stake:ask,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch});
     paceRef.current.accepted++;setOutstandingCount(outstanding.current.size);
-    if(!matchPause.current&&active.current&&!halt.current&&!winConfirmed.current&&!uncertainPurchase.current)setMode('RUNNING');
-    const id=contractId;
-         void (async()=>{
+    if(!haltedDuringAck && !matchPause.current && active.current && !winConfirmed.current && !uncertainPurchase.current)setMode('RUNNING');
+    const id=contractId;         void (async()=>{
      let unsubscribe:(()=>Promise<void>)|undefined;
      try{
       const settle=await new Promise<any>((resolve,reject)=>{
@@ -155,7 +162,6 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     else{reservedStake.current=Math.max(0,amount(reservedStake.current-stake));setMode('STOPPED');setErr(`No trade purchased: ${String(e)}`)}
    }finally{inFlight.current.delete(signalSequence);pendingCount.current=Math.max(0,pendingCount.current-1);refreshExposure();releaseMatchPause()}
   },[ws,accountId,symbol,limit,maxLoss,play,pipSize,currency]);
-  const confirmedLossesRef=useRef(0);
   const execRef=useRef(execute);execRef.current=execute;
 
   useEffect(()=>{if(!isConnected&&active.current){halt.current=true;active.current=false;setMode('UNCERTAIN');setErr('Connection lost.');}},[isConnected]);
@@ -170,11 +176,16 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     const epoch=Number(tick.epoch);if(!Number.isFinite(epoch))return;
     const key=`${epoch}:${Number(tick.quote)}`;
     if(seenTickKeys.current.has(key)){tickStats.current.duplicates++;return}
+    // FIX (was #9): add to seenTickKeys BEFORE any further work; guarantees
+    // an exception below cannot allow the same tick to be re-processed via
+    // the second feed.
+    seenTickKeys.current.add(key);
+    seenTickOrder.current.push(key);
+    if(seenTickOrder.current.length>256){const expired=seenTickOrder.current.shift();if(expired)seenTickKeys.current.delete(expired);}
     const prevEpoch=Number(lastTickKey.current.split(':')[0]);
     if(lastTickKey.current && Number.isFinite(prevEpoch) && epoch<prevEpoch){tickStats.current.outOfOrder++;return;}
     if(epoch*1000<Date.now()-15000 || epoch*1000>Date.now()+15000){tickStats.current.staleQuotes++;return;}
-    lastTickKey.current=key;seenTickKeys.current.add(key);seenTickOrder.current.push(key);
-    if(seenTickOrder.current.length>256){const expired=seenTickOrder.current.shift();if(expired)seenTickKeys.current.delete(expired);}
+    lastTickKey.current=key;
     const digit=getLastDigit(Number(tick.quote),Number.isInteger(tick.pip_size)?tick.pip_size:settings.pipSize);
     const receivedAt=performance.now();
     const previousArrival=tickCadence.current.lastArrival;
@@ -186,15 +197,19 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     if(tickStats.current.received%5===0){const ms=tickCadence.current.intervalMs;setCadenceLabel(ms===null?'Measuring tick interval':`${(ms/1000).toFixed(2)}s/tick · ${(1000/ms).toFixed(2)} ticks/s`);}
     histRef.current=[...histRef.current.slice(-99),digit];
     const ranking=intelligenceRef.current.observe(digit);scoreRef.current=ranking;
-    const top=ranking[0];const momentum=top?.momentum3??null;
-    queueMicrotask(()=>{if(scope.current!==scope.current)return;setHistory(histRef.current);setScores(ranking);});
+    const top=ranking[0];
+    // FIX (was #6): capture telemetryScope BEFORE queueing; compare inside the
+    // microtask against the captured scope, not `scope.current !== scope.current`
+    // (which is always false).
+    const telemetryScope=scope.current;
+    queueMicrotask(()=>{if(scope.current!==telemetryScope)return;setHistory(histRef.current);setScores(ranking);});
     let selected=lockRef.current;
     if(settings.strategy==='MOMENTUM_LOCK' && selected){
       selected={...selected,elapsed:selected.elapsed+1};
       if(selected.elapsed>Number(settings.lockDuration)){selected=null;lockRef.current=null;setLockPosition(0);setTradeLockView(null);}
       else{lockRef.current=selected;setLockPosition(selected.elapsed);setTradeLockView({digit:selected.digit,source:selected.source,elapsed:selected.elapsed});}
     }else if(settings.strategy!=='MOMENTUM_LOCK' && selected){lockRef.current=null;selected=null;setLockPosition(0);setTradeLockView(null);}
-    queueMicrotask(()=>{publishForecastRef.current({symbol:settings.symbol,sequence,rows:ranking.map(row=>({digit:row.digit,score:row.score,probability:row.probability,momentum3:row.momentum3,positiveSteps:row.positiveSteps})),lockedDigit:settings.strategy==='MOMENTUM_LOCK'?lockRef.current?.digit??null:null});});
+    queueMicrotask(()=>{if(scope.current!==telemetryScope)return;publishForecastRef.current({symbol:settings.symbol,sequence,rows:ranking.map(row=>({digit:row.digit,score:row.score,probability:row.probability,momentum3:row.momentum3,positiveSteps:row.positiveSteps})),lockedDigit:settings.strategy==='MOMENTUM_LOCK'?lockRef.current?.digit??null:null});});
     if(!active.current||halt.current||uncertainPurchase.current||!settings.accountId||!settings.isConnected){setEntryStatus(!active.current?'Cycle inactive':halt.current?'Cycle halted':uncertainPurchase.current?'Uncertain purchase':'Disconnected');return;}
     if(matchPause.current){return;}
     const activeTarget=settings.strategy==='MOMENTUM_LOCK'?(lockRef.current?.digit??null):(lockedRef.current??null);
@@ -213,12 +228,6 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       selected=lockRef.current;setLockPosition(1);setTradeLockView({digit:selected.digit,source:'NEXT',elapsed:1});
     }
     const target=choice.digit;
-    // ── PER-DISPATCH SCORE + MOMENTUM GATE (Dynamic V1 only) ────────────
-    // Dynamic V1 re-ranks every tick, so the gate must apply every tick.
-    // Momentum Lock is a commitment: once a lock is acquired, it fires on
-    // the frozen digit every tick regardless of drift until win / max
-    // trades / loss limit. The gate applies only at lock acquisition (the
-    // `qualified` filter above). Do not gate the locked digit per tick.
     if (settings.strategy === 'DYNAMIC') {
       const dispatchForecast = ranking.find(row => row.digit === target);
       if (!dispatchForecast) {
@@ -234,13 +243,12 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
         return;
       }
     }
-    // ── END PER-DISPATCH GATE ───────────────────────────────────────────
     const stake=amount(Number(settings.base)*Math.pow(Number(settings.factor),countRef.current));
     if(!Number.isFinite(stake)||stake<=0||stake+reservedStake.current+Math.max(0,-pnlRef.current)>Number(settings.maxLoss)){setStopReason('Stake would exceed loss limit');stopRef.current();setMode('MAX_LOSS');return;}
     lockedRef.current=target;
     queueMicrotask(()=>setEntrySignal('NEXT'));
     const frozenTrace:FrozenEntryTrace={strategy:settings.strategy,lockSource:selected?.source??null,signalKind:'NEXT',target,nextDigit:top?.digit??null,signalSequence:sequence,signalEpoch:epoch,signalObservedDigit:digit,signalReceivedAtIso:new Date().toISOString(),momentum:choice.momentum3,score:choice.score,positiveSteps:choice.positiveSteps,tradingLockOriginSequence:selected?.originSequence??null,tradingLockOriginEpoch:selected?.originEpoch??null,tradingLockOriginDigit:selected?.digit??null};
-    queueMicrotask(()=>{if(scope.current!==scope.current)return;setLockedDigit(target);setTargetRef.current(target);setEntryStatus(`${settings.strategy==='MOMENTUM_LOCK'?'Momentum':'Dynamic'} sent ${target} on tick ${sequence}`);});
+    queueMicrotask(()=>{if(scope.current!==telemetryScope)return;setLockedDigit(target);setTargetRef.current(target);setEntryStatus(`${settings.strategy==='MOMENTUM_LOCK'?'Momentum':'Dynamic'} sent ${target} on tick ${sequence}`);});
     void execRef.current(target,stake,{score:choice.score,momentum3:choice.momentum3,positiveSteps:choice.positiveSteps,threshold:Number(settings.threshold)},epoch,sequence,receivedAt,settings.strategy,selected?.elapsed??0,Number(settings.lockDuration),frozenTrace);
   },[]);
 
