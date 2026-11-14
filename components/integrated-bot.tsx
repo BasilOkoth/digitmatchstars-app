@@ -763,7 +763,6 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
  };
  return <section className="rounded-xl border border-slate-600 p-4 space-y-3 text-sm">
   <div className="flex justify-between gap-2"><h3 className="font-bold text-lg">Selective Digit Differs</h3><span>{demo?'DEMO':isLive?'LIVE':'DISCONNECTED'}</span></div>
-  <p>Optional five-trade daily limit for $50+ one-tick DIGITDIFF purchases. The daily loss cap remains active even when the trade-count limit is disabled. Entry requires a candidate digit to appear below 10% in the held-out sample; this does not prove a trading edge.</p>
   <div className="grid grid-cols-2 gap-2">
    <label>Stake USD<input className="block w-full rounded border bg-transparent p-2" type="number" min="50" step="0.01" value={stake} disabled={enabled} onChange={e=>setStake(e.target.value)}/></label>
    <label>Daily loss cap USD<input className="block w-full rounded border bg-transparent p-2" type="number" min="50" step="0.01" value={dailyLoss} disabled={enabled} onChange={e=>setDailyLoss(e.target.value)}/></label>
@@ -774,8 +773,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   <div className="flex gap-2"><button className="rounded bg-emerald-700 px-4 py-2 text-white disabled:opacity-40" disabled={enabled||busy.current||!isConnected} onClick={start}>Start selective bot</button><button className="rounded bg-slate-600 px-4 py-2 text-white" onClick={()=>stop('Stopped — existing contract will still settle')}>Stop</button></div>
   <p>Today: <strong>{ledger?.attempts??0}{enforceFivePerDay?'/5':''}</strong> attempted · Realized P/L <strong className={`font-black tabular-nums ${(ledger?.profit??0)>0?'text-green-400':(ledger?.profit??0)<0?'text-red-400':'text-slate-100'}`}>{(ledger?.profit??0)>0?'PROFIT ': (ledger?.profit??0)<0?'LOSS ':''}{(ledger?.profit??0)>=0?'+':'−'}${Math.abs(ledger?.profit??0).toFixed(2)}</strong> · Candidate digit: {selected??'—'}</p>
   <SettlementToast notice={notice} onDismiss={dismissNotice}/>
-  <p>Status: {status}</p>{error&&<p role="alert" className="text-red-500">{error}</p>}
-  <p className="text-xs opacity-75">Daily trade-count limit is optional; the daily loss cap and uncertain-order block remain enforced. Daily ledger is browser-local, not synchronized across devices. Do not run multiple bot tabs or instances. An uncertain order blocks further trading until manually reconciled. Stopping does not cancel a submitted purchase.</p>
+  <div role="status" aria-live="polite" className={`flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2 font-semibold ${/settlement|settling|submitting|pending|waiting for broker/i.test(status)?'border-amber-500/40 bg-amber-500/10 text-amber-300':/settled.*win/i.test(status)?'border-emerald-500/40 bg-emerald-500/10 text-emerald-300':/settled.*loss|uncertain|invalid|limit reached|halted/i.test(status)?'border-rose-500/40 bg-rose-500/10 text-rose-300':/monitoring|warming|waiting/i.test(status)?'border-sky-500/40 bg-sky-500/10 text-sky-300':'border-slate-600 bg-slate-800/50 text-slate-200'}`}><span className="inline-block h-2 w-2 shrink-0 rounded-full bg-current"/><span className="uppercase tracking-wide text-xs">Status</span><span>{status}</span></div>{error&&<p role="alert" className="font-semibold text-red-400">{error}</p>}
  </section>;
 }
 
