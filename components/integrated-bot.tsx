@@ -114,7 +114,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     paceRef.current.accepted++;setOutstandingCount(outstanding.current.size);
     if(!matchPause.current&&active.current&&!halt.current&&!winConfirmed.current&&!uncertainPurchase.current)setMode('RUNNING');
     const id=contractId;
-    void (async()=>{
+         void (async()=>{
      let unsubscribe:(()=>Promise<void>)|undefined;
      try{
       const settle=await new Promise<any>((resolve,reject)=>{
@@ -213,23 +213,26 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       selected=lockRef.current;setLockPosition(1);setTradeLockView({digit:selected.digit,source:'NEXT',elapsed:1});
     }
     const target=choice.digit;
-    // ── PER-DISPATCH SCORE + MOMENTUM GATE ──────────────────────────────
-    // `Min score` and `Min momentum` must gate every BUY, not just lock
-    // acquisition. Otherwise a lock that qualified at score 6 will keep
-    // firing at score 1 until it expires. Re-check the target's CURRENT
-    // score/momentum against the user's threshold on every dispatch.
-    const dispatchForecast = ranking.find(row => row.digit === target);
-    if (!dispatchForecast) {
-      setEntryStatus(`Target ${target} unavailable in current ranking`);
-      return;
-    }
-    if (dispatchForecast.score < Number(settings.threshold)) {
-      setEntryStatus(`Skipped: ${target} score ${dispatchForecast.score.toFixed(2)} < ${settings.threshold}`);
-      return;
-    }
-    if (dispatchForecast.momentum3 < Number(settings.minMomentum)) {
-      setEntryStatus(`Skipped: ${target} momentum ${dispatchForecast.momentum3.toFixed(2)} < ${settings.minMomentum}`);
-      return;
+    // ── PER-DISPATCH SCORE + MOMENTUM GATE (Dynamic V1 only) ────────────
+    // Dynamic V1 re-ranks every tick, so the gate must apply every tick.
+    // Momentum Lock is a commitment: once a lock is acquired, it fires on
+    // the frozen digit every tick regardless of drift until win / max
+    // trades / loss limit. The gate applies only at lock acquisition (the
+    // `qualified` filter above). Do not gate the locked digit per tick.
+    if (settings.strategy === 'DYNAMIC') {
+      const dispatchForecast = ranking.find(row => row.digit === target);
+      if (!dispatchForecast) {
+        setEntryStatus(`Target ${target} unavailable in current ranking`);
+        return;
+      }
+      if (dispatchForecast.score < Number(settings.threshold)) {
+        setEntryStatus(`Skipped: ${target} score ${dispatchForecast.score.toFixed(2)} < ${settings.threshold}`);
+        return;
+      }
+      if (dispatchForecast.momentum3 < Number(settings.minMomentum)) {
+        setEntryStatus(`Skipped: ${target} momentum ${dispatchForecast.momentum3.toFixed(2)} < ${settings.minMomentum}`);
+        return;
+      }
     }
     // ── END PER-DISPATCH GATE ───────────────────────────────────────────
     const stake=amount(Number(settings.base)*Math.pow(Number(settings.factor),countRef.current));
