@@ -64,6 +64,71 @@ interface DNAWindow {
   frozenAtSeq:number;
 }
 
+// Horizon diagnostics are observational, not proof of a trading edge.
+interface HorizonDigitScore {
+  digit:number;
+  horizonProbability:number;
+  lift:number;
+  rawGapSamples:number;
+  gap:number;
+  gapExpectation:number;
+  overdueRatio:number;
+  nextTickScore:number;
+  combined:number;
+  survivalP:number;
+  shortHitRate:number;
+  shortHitRateLB:number;
+  gapRiskRatio:number;
+}
+interface PendingHorizon { frozenAtSeq:number; topDigit:number; expiresAtSeq:number; hit:boolean }
+
+class DigitHorizonAnalyzer {
+  private gapsByDigit=new Map<number,number[]>();
+  private lastSeenTick=new Map<number,number>();
+  private totalObserved=0;
+  reset(){this.gapsByDigit.clear();this.lastSeenTick.clear();this.totalObserved=0;}
+  minGapSamples(){return Math.min(...Array.from({length:10},(_,d)=>this.gapsByDigit.get(d)?.length??0));}
+  observe(digit:number){
+    const t=this.totalObserved++;
+    const last=this.lastSeenTick.get(digit);
+    if(last!==undefined){
+      const gaps=this.gapsByDigit.get(digit)??[];
+      gaps.push(t-last);
+      if(gaps.length>200)gaps.shift();
+      this.gapsByDigit.set(digit,gaps);
+    }
+    this.lastSeenTick.set(digit,t);
+  }
+  rank(k:number,nextRanking:ReturnType<typeof scoreDigits>):HorizonDigitScore[]{
+    const baseline=1-Math.pow(0.9,k);
+    const rows:HorizonDigitScore[]=nextRanking.map(row=>{
+      const digit=row.digit;
+      const currentGap=Math.max(0,this.totalObserved-(this.lastSeenTick.get(digit)??-1)-1);
+      const gaps=this.gapsByDigit.get(digit)??[];
+      const meanGap=gaps.length?gaps.reduce((a,b)=>a+b,0)/gaps.length:10;
+      const survived=gaps.filter(g=>g>currentGap);
+      const hits=survived.filter(g=>g<=currentGap+k).length;
+      const n=survived.length;
+      const shortHitRate=n?hits/n:baseline;
+      const shortHitRateLB=n>=5?wilsonLower(hits,n):0;
+      const empirical=(hits+1)/(n+2);
+      const weight=n>=5?n/(n+30):0;
+      const horizonProbability=weight*empirical+(1-weight)*baseline;
+      return {digit,horizonProbability,lift:horizonProbability/baseline,
+        rawGapSamples:n,gap:currentGap,gapExpectation:meanGap,
+        overdueRatio:meanGap>0?currentGap/meanGap:0,
+        nextTickScore:row.score??0,combined:0,
+        survivalP:Math.pow(0.9,currentGap),shortHitRate,shortHitRateLB,
+        gapRiskRatio:meanGap>0?currentGap/meanGap:0};
+    });
+    const ps=rows.map(r=>r.horizonProbability), ns=rows.map(r=>r.nextTickScore);
+    const pMin=Math.min(...ps),pSpan=Math.max(...ps)-pMin||1;
+    const nMin=Math.min(...ns),nSpan=Math.max(...ns)-nMin||1;
+    for(const r of rows)r.combined=0.7*(r.horizonProbability-pMin)/pSpan+0.3*(r.nextTickScore-nMin)/nSpan;
+    return rows.sort((a,b)=>b.combined-a.combined);
+  }
+}
+
 const NUM_FEATURES=5;
 
 class DigitDNAModel {
@@ -88,7 +153,7 @@ class DigitDNAModel {
 
   reset(){this.history=[];this.windows=[];this.gapsByDigit.clear();this.lastSeenTick.clear();this.transitionCounts=Array.from({length:10},()=>new Array(10).fill(0));this.totalObserved=0;this.ticksSinceRefit=0;this.weights=Array.from({length:10},()=>new Array(NUM_FEATURES+1).fill(0));this.oosHits=new Array(10).fill(0);this.oosTrials=new Array(10).fill(0);this.pendingWindows=[];this.lastOOS=Array.from({length:10},()=>[])}
 
-  setHorizon(k:number){if(k!==this.k){this.k=k;this.windows=[];this.pendingWindows=[];this.oosHits=new Array(10).fill(0);this.oosTrials=new Array(10).fill(0);}}
+  setHorizon(k:number){if(k!==this.k){this.k=k;this.windows=[];this.pendingWindows=[];this.oosHits=new Array(10).fill(0);this.oosTrials=new Array(10).fill(0);this.weights=Array.from({length:10},()=>new Array(NUM_FEATURES+1).fill(0));this.ticksSinceRefit=0;}}
 
   private currentFeatures(digit:number):number[]{
     const gap=this.totalObserved-(this.lastSeenTick.get(digit)??-1)-1;
@@ -127,12 +192,13 @@ class DigitDNAModel {
     // 1. Grade any pending windows whose horizon has now expired
     const stillPending:typeof this.pendingWindows=[];
     for(const p of this.pendingWindows){
-      if(t>p.expiresAtSeq){
-        // window is complete; its hit flag was already set during intermediate ticks
+      if(t>p.window.frozenAtSeq && t<=p.expiresAtSeq && digit===p.window.digit)p.hit=true;
+      if(t>=p.expiresAtSeq){
+        // The realized label is observed only after the full future window.
+        p.window.label=p.hit?1:0;
         this.windows.push(p.window);
         if(this.windows.length>this.maxWindows)this.windows.shift();
       } else {
-        if(t>p.window.frozenAtSeq && t<=p.expiresAtSeq && digit===p.window.digit)p.hit=true;
         stillPending.push(p);
       }
     }
@@ -205,37 +271,32 @@ class DigitDNAModel {
   }
 
   private refitAll(){
-    // 5-fold walk-forward per digit. For each fold, train on earlier windows,
-    // evaluate on the fold's windows, accumulate OOS hits/trials.
+    // Expanding-window, chronological evaluation: never train on a later observation.
+    // A selected prediction is one whose estimated P(k) exceeds the fair baseline.
     const baseline=1-Math.pow(0.9,this.k);
     this.oosHits=new Array(10).fill(0);
     this.oosTrials=new Array(10).fill(0);
     for(let d=0;d<10;d++){
       const rows=this.windows.filter(w=>w.digit===d);
-      if(rows.length<40)continue;
-      const foldSize=Math.floor(rows.length/5);
-      if(foldSize<8)continue;
-      let oosHit=0,oosTotal=0;
-      for(let fold=0;fold<5;fold++){
-        const testStart=fold*foldSize;
-        const testEnd=fold===4?rows.length:testStart+foldSize;
-        const train=rows.slice(0,testStart).concat(rows.slice(testEnd));
-        if(train.length<20)continue;
-        const w=this.trainFold(train);
-        for(let i=testStart;i<testEnd;i++){
+      if(rows.length<100)continue;
+      const initialTrain=Math.max(40,Math.floor(rows.length*0.40));
+      const chunk=Math.max(1,Math.floor((rows.length-initialTrain)/5));
+      let hits=0,trials=0;
+      for(let start=initialTrain;start<rows.length;start+=chunk){
+        const model=this.trainFold(rows.slice(0,Math.max(0,start-this.k)));
+        const end=Math.min(rows.length,start+chunk);
+        for(let i=start;i<end;i++){
           const r=rows[i];
-          let z=w[0];
-          for(let f=0;f<NUM_FEATURES;f++)z+=w[f+1]*r.features[f];
-          const p=sigmoid(z);
-          // Classify: predict positive if p>baseline
-          const pred=p>baseline?1:0;
-          if(pred===1){oosTotal++;if(r.label===1)oosHit++;}
-          else{oosTotal++;if(r.label===1)oosHit+=0;}
+          let z=model[0];
+          for(let f=0;f<NUM_FEATURES;f++)z+=model[f+1]*r.features[f];
+          if(sigmoid(z)>baseline){
+            trials++;
+            if(r.label===1)hits++;
+          }
         }
       }
-      this.oosHits[d]=oosHit;
-      this.oosTrials[d]=oosTotal;
-      // Full-model weights = train on all windows
+      this.oosHits[d]=hits;
+      this.oosTrials[d]=trials;
       this.weights[d]=this.trainFold(rows);
     }
   }
@@ -262,14 +323,14 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   const {setTarget} = useExecutionTarget();
   const {publishForecast} = useEngineForecast();
   const demo=Boolean(accountId)&&(/demo|virtual/i.test(accountType??'')||/^VRT/i.test(accountId??''));const real=Boolean(accountId)&&!demo;
-  const [strategy,setStrategy]=useState<Strategy>('MOMENTUM_LOCK');const [lockDuration,setLockDuration]=useState('999');
+  const [strategy,setStrategy]=useState<Strategy>('MOMENTUM_LOCK');const [lockDuration,setLockDuration]=useState('10');
   const [horizonTicks,setHorizonTicks]=useState('3');
   const [lockMode,setLockMode]=useState<LockMode>('EAGER');
   const [minHorizonLift,setMinHorizonLift]=useState('1.0');
   const [minHorizonProbability,setMinHorizonProbability]=useState('0.271');
-  const [minOverdueRatio,setMinOverdueRatio]=useState('1.0');
-  const [maxSurvivalP,setMaxSurvivalP]=useState('0.50');
-  const [minShortHitLB,setMinShortHitLB]=useState('0.271');
+  const [minOverdueRatio,setMinOverdueRatio]=useState('0.35');
+  const [maxSurvivalP,setMaxSurvivalP]=useState('0.50'); // Minimum allowed survival probability
+  const [minShortHitLB,setMinShortHitLB]=useState('0');
   const [maxGapRiskRatio,setMaxGapRiskRatio]=useState('2.0');
   const lockPurchases=useRef(new Map<number,number>());
   const lockRef=useRef<{digit:number;elapsed:number;source:EntryKind;signal:{score:number;momentum3:number;positiveSteps:number;threshold:number};originSequence:number;originEpoch:number;gapAtLock:number;gapExpectation:number;horizonProb:number;horizonLift:number}|null>(null);
@@ -281,6 +342,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   const scoreHistoryRef=useRef<Record<number,number>[]>([]);
   const intelligenceRef=useRef(new NextTickIntelligence());
   const dnaModelRef=useRef(new DigitDNAModel());
+  const horizonAnalyzerRef=useRef(new DigitHorizonAnalyzer());
   const [dnaView,setDnaView]=useState<{modelAge:number;oosOverallAccuracy:number;predictions:DNAPrediction[]}>({modelAge:0,oosOverallAccuracy:0,predictions:[]});
   const pendingHorizonRef=useRef<PendingHorizon[]>([]);
   const horizonResultsRef=useRef<number[]>([]);
@@ -370,7 +432,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   const publishForecastRef=useRef(publishForecast);publishForecastRef.current=publishForecast;
   const stop=useCallback(()=>{setStopReason('Stopped manually or by risk-control request');halt.current=true;active.current=false;setTargetRef.current(null);setLockedDigit(null);lockedRef.current=null;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);setMode(m=>m==='RUNNING'?'STOPPED':m)},[]);
   const stopRef=useRef(stop);stopRef.current=stop;
-  useEffect(()=>{if(scope.current!==scopeKey){const unsettled=outstanding.current.size>0||pendingCount.current>0||uncertainPurchase.current;scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];intelligenceRef.current.reset();dnaModelRef.current.reset();dnaModelRef.current.setHorizon(Number(horizonTicks)||3);setDnaView({modelAge:0,oosOverallAccuracy:0,predictions:[]});pendingHorizonRef.current=[];horizonResultsRef.current=[];setHorizonAccuracy({trials:0,hits:0,lower95:0,horizon:Number(horizonTicks)||3,warmup:0});setHorizonRankingView([]);setEntryTimingView(null);setEntrySignal(null);setLastTrace(null);executionForecastRef.current.reset();setLastTiming(null);setExecutionAudit(null);setHorizonTarget(null);setHorizonProbability(null);setIntelligenceAudit(null);nextTickPending.current=null;eligibleResults.current=[];setAccuracyAudit({trials:0,hits:0,lower95:0});if(!unsettled)confirmedLosses.current=0;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setTopMomentum(null);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);lockedRef.current=null;if(!unsettled){countRef.current=0;setSentCount(0);lossBlockRef.current=0;pnlRef.current=0;}if(!unsettled){pending.current=false;pendingCount.current=0;inFlight.current.clear();matchPause.current=false;setMatchPaused(false);setInFlightCount(0);reservedStake.current=0;setRiskExposure(0);uncertainPurchase.current=false;}lastTickKey.current='';if(!unsettled)matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');setStopReason('Account or symbol changed');paceRef.current={eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—',lastDispatchSequence:0};setPaceView({...paceRef.current});tickLedger.current.clear();setLedgerView([]);tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTargetRef.current(null);setCount(0);setPnl(0);setLossBlock(0);setMode(unsettled?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;verifiedWinContract.current=null;if(unsettled)setErr('Account/symbol changed with a pending or unsettled order. Reconcile on Deriv before restarting.');else setErr('')}},[scopeKey]);
+  useEffect(()=>{if(scope.current!==scopeKey){const unsettled=outstanding.current.size>0||pendingCount.current>0||uncertainPurchase.current;scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];intelligenceRef.current.reset();dnaModelRef.current.reset();horizonAnalyzerRef.current.reset();dnaModelRef.current.setHorizon(Number(horizonTicks)||3);setDnaView({modelAge:0,oosOverallAccuracy:0,predictions:[]});pendingHorizonRef.current=[];horizonResultsRef.current=[];setHorizonAccuracy({trials:0,hits:0,lower95:0,horizon:Number(horizonTicks)||3,warmup:0});setHorizonRankingView([]);setEntryTimingView(null);setEntrySignal(null);setLastTrace(null);executionForecastRef.current.reset();setLastTiming(null);setExecutionAudit(null);setHorizonTarget(null);setHorizonProbability(null);setIntelligenceAudit(null);nextTickPending.current=null;eligibleResults.current=[];setAccuracyAudit({trials:0,hits:0,lower95:0});if(!unsettled)confirmedLosses.current=0;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setTopMomentum(null);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);lockedRef.current=null;if(!unsettled){countRef.current=0;setSentCount(0);lossBlockRef.current=0;pnlRef.current=0;}if(!unsettled){pending.current=false;pendingCount.current=0;inFlight.current.clear();matchPause.current=false;setMatchPaused(false);setInFlightCount(0);reservedStake.current=0;setRiskExposure(0);uncertainPurchase.current=false;}lastTickKey.current='';if(!unsettled)matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');setStopReason('Account or symbol changed');paceRef.current={eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—',lastDispatchSequence:0};setPaceView({...paceRef.current});tickLedger.current.clear();setLedgerView([]);tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTargetRef.current(null);setCount(0);setPnl(0);setLossBlock(0);setMode(unsettled?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;verifiedWinContract.current=null;if(unsettled)setErr('Account/symbol changed with a pending or unsettled order. Reconcile on Deriv before restarting.');else setErr('')}},[scopeKey]);
   const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,firstLockMatch:boolean,entryKind:EntryKind,soonHorizon:number|null,frozenTrace:FrozenEntryTrace)=>{
    if(winConfirmed.current||verifiedWinContract.current!==null)return;
    if(entryKind!=='NEXT' || frozenTrace.signalKind!=='NEXT' || (entryStrategy==='MOMENTUM_LOCK' && frozenTrace.lockSource!=='NEXT'))return;
@@ -573,6 +635,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     histRef.current=[...histRef.current.slice(-99),digit];
     const ranking=intelligenceRef.current.observe(digit);scoreRef.current=ranking;
     const dnaResult=dnaModelRef.current.observe(digit);
+    horizonAnalyzerRef.current.observe(digit);
     const horizonRanking=horizonAnalyzerRef.current.rank(horizonK, ranking);
     const topHorizon=horizonRanking[0];
     if(topHorizon){pendingHorizonRef.current.push({frozenAtSeq:sequence,topDigit:topHorizon.digit,expiresAtSeq:sequence+horizonK,hit:false});}
@@ -636,7 +699,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     const strictChoices=survivors.filter(r=>{const d=dnaByDigit.get(r.digit);return d!==undefined && d.hasEdge;});
     const horizonChoice = settings.lockMode==='STRICT' ? (strictChoices[0]??null) : survivorChoice;
     const nextCandidate = top && qualified.some(row=>row.digit===top.digit) ? top : null;
-    const choiceForecast = horizonChoice ? (qualified.find(q => q.digit===horizonChoice.digit) ?? null) : nextCandidate;
+    const choiceForecast = horizonChoice ? (qualified.find(q => q.digit===horizonChoice.digit) ?? null) : null;
     const choiceKind:EntryKind='NEXT';
     if(selected?.source!=='NEXT' && selected){selected=null;lockRef.current=null;setLockPosition(0);setTradeLockView(null);}
     if(settings.strategy==='MOMENTUM_LOCK' && !selected && choiceForecast && horizonChoice){
@@ -705,7 +768,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
        <select value={horizonTicks} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>{setHorizonTicks(e.target.value);dnaModelRef.current.setHorizon(Number(e.target.value)||3);}} className="rounded border border-slate-600 bg-[#0b1425] px-2 py-1 text-white"><option value="1">1</option><option value="3">3</option><option value="4">4</option><option value="5">5</option></select>
      </label>
      <label className="flex items-center gap-2">Lock mode
-       <select value={lockMode} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setLockMode(e.target.value as LockMode)} className="rounded border border-slate-600 bg-[#0b1425] px-2 py-1 text-white"><option value="EAGER">EAGER (trade every tick)</option><option value="STRICT">STRICT (only proven edge)</option></select>
+       <select value={lockMode} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setLockMode(e.target.value as LockMode)} className="rounded border border-slate-600 bg-[#0b1425] px-2 py-1 text-white"><option value="EAGER">EAGER (no DNA evidence requirement)</option><option value="STRICT">STRICT (requires candidate statistical evidence)</option></select>
      </label>
      {strategy==='MOMENTUM_LOCK'&&<label className="flex items-center gap-2">Lock ticks <input type="number" min="1" max="9999" step="1" value={lockDuration} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setLockDuration(e.target.value)} className="w-16 rounded border border-slate-600 bg-[#0b1425] px-2 py-1 text-white" /></label>}
    </div>
@@ -714,11 +777,19 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      <label className="text-[11px] text-slate-300">Min P(k) <input type="number" min="0" max="1" step="0.01" value={minHorizonProbability} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setMinHorizonProbability(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>
      <label className="text-[11px] text-slate-300">Min overdue <input type="number" min="0" step="0.05" value={minOverdueRatio} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setMinOverdueRatio(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>
      <label className="text-[11px] text-slate-300">Min lift <input type="number" min="0" step="0.05" value={minHorizonLift} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setMinHorizonLift(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>
-     <label className="text-[11px] text-slate-300">Max survival P <input type="number" min="0.01" max="1" step="0.01" value={maxSurvivalP} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setMaxSurvivalP(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>
+     <label className="text-[11px] text-slate-300">Min survival P <input type="number" min="0.01" max="1" step="0.01" value={maxSurvivalP} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setMaxSurvivalP(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>
      <label className="text-[11px] text-slate-300">Max gap risk <input type="number" min="0.1" step="0.1" value={maxGapRiskRatio} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} onChange={e=>setMaxGapRiskRatio(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>
    </div>
+   <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
+     <label className="text-[11px] text-slate-300">Min short-window lower bound
+       <input type="number" min="0" max="1" step="0.01" value={minShortHitLB}
+         disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'}
+         onChange={e=>setMinShortHitLB(e.target.value)}
+         className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white" />
+     </label>
+   </div>
    {strategy==='MOMENTUM_LOCK'&&<div className="mt-2 rounded-lg border border-emerald-500/30 bg-[#0a1721] p-2 text-xs">
-     <div className="mb-1 flex items-center gap-3"><strong className="text-emerald-300">Momentum Lock · {lockMode} mode</strong>{lockMode==='EAGER'&&<span className="rounded bg-amber-900/50 px-2 py-0.5 text-[10px] font-bold text-amber-200">EAGER trades every tick · DNA edge shown per trade</span>}</div>
+     <div className="mb-1 flex items-center gap-3"><strong className="text-emerald-300">Momentum Lock · {lockMode} mode</strong>{lockMode==='EAGER'&&<span className="rounded bg-amber-900/50 px-2 py-0.5 text-[10px] font-bold text-amber-200">EAGER does not require DNA evidence threshold</span>}</div>
      <div className="flex flex-wrap gap-x-4 gap-y-1 text-slate-200">
        <span>Active target <strong className="text-white">{tradeLockView?.digit??'—'}</strong></span>
        <span>Remaining <strong>{tradeLockView?Math.max(0,Math.max(1,Number(lockDuration)||1)-tradeLockView.elapsed+1):'—'}</strong> ticks</span>
@@ -728,17 +799,17 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      <div className="mt-1 text-slate-400">{mode==='RUNNING'?`Latest: ${entryStatus}`:`Stop: ${stopReason}`}</div>
    </div>}
    {dnaView.predictions.length>0&&<div className="mt-2 rounded-md border border-fuchsia-500/30 bg-[#160d24] px-2 py-1.5 text-[11px]" aria-label="DNA model diagnostic">
-     <div className="flex flex-wrap items-baseline gap-x-3"><span className="font-semibold text-fuchsia-300">DigitDNA model</span><span className="text-slate-400">windows={dnaView.modelAge} · OOS accuracy {(100*dnaView.oosOverallAccuracy).toFixed(1)}% · baseline {(100*(1-Math.pow(0.9,horizonAccuracy.horizon))).toFixed(1)}%</span></div>
+     <div className="flex flex-wrap items-baseline gap-x-3"><span className="font-semibold text-fuchsia-300">DigitDNA model</span><span className="text-slate-400">windows={dnaView.modelAge} · OOS selected-hit rate {(100*dnaView.oosOverallAccuracy).toFixed(1)}% · baseline {(100*(1-Math.pow(0.9,horizonAccuracy.horizon))).toFixed(1)}%</span></div>
      <div className="mt-1 font-mono text-[10px]">
        {dnaView.predictions.slice(0,5).map(p=>{const hasEdge=p.hasEdge;const lbPass=p.outOfSampleLB>=(1-Math.pow(0.9,horizonAccuracy.horizon));return <div key={p.digit} className="border-t border-slate-700/40 py-0.5"><span className="font-bold text-white">{p.digit}</span>{' · p='}{(100*p.probability).toFixed(1)}{'% · OOS LB '}<span className={lbPass?'text-emerald-400':'text-rose-400'}>{(100*p.outOfSampleLB).toFixed(1)}{'%'}</span>{' (n='}{p.outOfSampleSamples}{')'}{hasEdge?<span className="ml-2 rounded bg-emerald-900 px-1 text-emerald-200">EDGE</span>:<span className="ml-2 rounded bg-slate-800 px-1 text-slate-400">no edge</span>}</div>;})}
      </div>
-     <div className="text-slate-500">OOS LB = Wilson 95% lower bound of walk-forward out-of-sample hit rate. EAGER mode still trades the top-pick, but this number tells you whether that pick had proven edge (EDGE badge) or not.</div>
+     <div className="text-slate-500">OOS LB = Wilson 95% lower bound of walk-forward out-of-sample hit rate. EAGER mode still trades the top-pick, but this number tells you whether that pick meets the experimental evidence threshold (EDGE badge) or not; overlapping windows may overstate confidence.</div>
    </div>}
    {horizonRankingView.length>0&&<div className="mt-2 rounded-md border border-violet-500/30 bg-[#0d1524] px-2 py-1.5 text-[11px]" aria-label="Horizon diagnostic">
      <div className="font-semibold text-violet-300">Due digit diagnostic · k={horizonAccuracy.horizon} · short-tail gates</div>
      <div className="text-slate-400">survival≥{(100*Number(maxSurvivalP)).toFixed(0)}% · gapRisk≤{Number(maxGapRiskRatio).toFixed(1)} · shortLB≥{(100*Number(minShortHitLB)).toFixed(1)}%</div>
      <div className="mt-1 font-mono text-[10px]">
-       {horizonRankingView.map(r=>{const survPass=r.survivalP>=Number(maxSurvivalP);const riskPass=r.gapRiskRatio<=Number(maxGapRiskRatio);const lbPass=r.shortHitRateLB>=Number(minShortHitLB);return <div key={r.digit} className="border-t border-slate-700/40 py-0.5"><span className="font-bold text-white">{r.digit}</span>{' · gap '}{r.gap}{' · P3 '}<span className={lbPass?'text-emerald-400':'text-rose-400'}>{(100*r.shortHitRate).toFixed(1)}%</span>{' · LB '}{(100*r.shortHitRateLB).toFixed(1)}{'% · gapRisk '}<span className={riskPass?'text-emerald-400':'text-rose-400'}>{r.gapRiskRatio.toFixed(1)}{'×'}</span>{' · surv '}<span className={survPass?'text-emerald-400':'text-rose-400'}>{(100*r.survivalP).toFixed(0)}{'%'}</span></div>;})}
+       {horizonRankingView.map(r=>{const survPass=r.survivalP>=Number(maxSurvivalP);const riskPass=r.gapRiskRatio<=Number(maxGapRiskRatio);const lbPass=r.shortHitRateLB>=Number(minShortHitLB);return <div key={r.digit} className="border-t border-slate-700/40 py-0.5"><span className="font-bold text-white">{r.digit}</span>{' · gap '}{r.gap}{' · P(k) '}<span className={lbPass?'text-emerald-400':'text-rose-400'}>{(100*r.shortHitRate).toFixed(1)}%</span>{' · LB '}{(100*r.shortHitRateLB).toFixed(1)}{'% · gapRisk '}<span className={riskPass?'text-emerald-400':'text-rose-400'}>{r.gapRiskRatio.toFixed(1)}{'×'}</span>{' · surv '}<span className={survPass?'text-emerald-400':'text-rose-400'}>{(100*r.survivalP).toFixed(0)}{'%'}</span></div>;})}
      </div>
    </div>}
    <div className="mt-2 rounded-md border border-cyan-500/30 bg-[#091725] px-2 py-1.5 text-[11px] text-slate-200">
@@ -759,7 +830,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
        <div className="font-bold text-cyan-300">Contract #{lastTrace.contractId} · target {lastTrace.trace.target}</div>
        <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-slate-200">
          {lastTrace.trace.dnaProbability!==undefined&&<span>DNA p={(100*lastTrace.trace.dnaProbability).toFixed(1)}% · OOS LB {(100*(lastTrace.trace.dnaOutOfSampleLB??0)).toFixed(1)}%{lastTrace.trace.dnaHasEdge?' · EDGE':''}</span>}
-         {lastTrace.trace.horizonProbability!==undefined&&<span>P3 {(100*lastTrace.trace.horizonProbability).toFixed(1)}% · LB {(100*(lastTrace.trace.shortHitRateLB??0)).toFixed(1)}%</span>}
+         {lastTrace.trace.horizonProbability!==undefined&&<span>P(k) {(100*lastTrace.trace.horizonProbability).toFixed(1)}% · LB {(100*(lastTrace.trace.shortHitRateLB??0)).toFixed(1)}%</span>}
          <span>gap {lastTrace.trace.horizonGapAtLock}/{(lastTrace.trace.horizonGapExpectation??0).toFixed(1)}</span>
          <span>entry {lastTrace.entryDigit??'?'} · expiry {lastTrace.expiryDigit??'?'}</span>
          <strong className={lastTrace.profit>0?'text-green-400':'text-red-400'}>{lastTrace.outcome} {lastTrace.profit>=0?'+':''}${lastTrace.profit.toFixed(2)}</strong>
@@ -771,7 +842,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
    </div>
    <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-slate-700/70 p-2 text-xs text-slate-300">
      <span>Next-tick {accuracyAudit.trials?`${(100*accuracyAudit.hits/accuracyAudit.trials).toFixed(1)}%`:'—'} · Horizon {horizonAccuracy.trials?`${(100*horizonAccuracy.hits/horizonAccuracy.trials).toFixed(1)}%`:'—'} · DNA OOS {(100*dnaView.oosOverallAccuracy).toFixed(1)}%</span>
-     <label className="flex items-center gap-1.5"><input type="checkbox" checked={requireEvidence} disabled={active.current||pending.current||outstandingCount>0} onChange={e=>setRequireEvidence(e.target.checked)} />Require V1 edge</label>
+     <label className="flex items-center gap-1.5"><input type="checkbox" checked={requireEvidence} disabled={active.current||pending.current||outstandingCount>0} onChange={e=>setRequireEvidence(e.target.checked)} />Require NEXT forecast evidence</label>
    </div>
    <div className="mt-2 flex items-center gap-2">
      <button disabled={!active.current && (!valid||!accountId||!isConnected||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN')} onClick={() => { if(active.current) stop(); else start(); }} className={`min-w-44 rounded-lg px-5 py-2.5 text-sm font-extrabold tracking-wide text-white shadow-lg transition disabled:opacity-30 ${active.current?'bg-rose-600 hover:bg-rose-500':'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-900/30'}`}>{active.current?'■ STOP CYCLE':'▶ START CYCLE'}</button>
