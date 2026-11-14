@@ -639,8 +639,8 @@ const wilsonUpper=(hits:number,n:number)=>{
 function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,pipSize,symbol,onBusyChange}:{ws:DerivWS|null;accountId:string|null;accountType:string|null;isConnected:boolean;currentTick:Tick|null;pipSize:number;symbol:string;onBusyChange:(busy:boolean)=>void}){
  const [stake,setStake]=useState('50');
  const [dailyLoss,setDailyLoss]=useState('250');
- const [minObservations,setMinObservations]=useState('500');
- const [maxUpper,setMaxUpper]=useState('0.10');
+ const [minObservations,setMinObservations]=useState('100');
+ const [maxUpper,setMaxUpper]=useState('0.15');
  const [enabled,setEnabled]=useState(false);
  const [liveApproved,setLiveApproved]=useState(false);
  const [ledger,setLedger]=useState<Ledger|null>(null);
@@ -689,19 +689,22 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   if(!l||l.account!==accountId||l.day!==dayUTC()){stop('Daily boundary reached — restart to load new UTC day');return}
   if(l.attempts>=5){stop('Daily limit: 5 purchases');return}
   const amount=Number(stake),maxLoss=Number(dailyLoss),minimum=Number(minObservations),upperLimit=Number(maxUpper);
-  if(!Number.isFinite(amount)||amount<50||!Number.isFinite(maxLoss)||maxLoss<amount||!Number.isInteger(minimum)||minimum<401||!Number.isFinite(upperLimit)||upperLimit<=0||upperLimit>0.1){stop('Invalid risk or signal settings');return}
+  if(!Number.isFinite(amount)||amount<50||!Number.isFinite(maxLoss)||maxLoss<amount||!Number.isInteger(minimum)||minimum<20||!Number.isFinite(upperLimit)||upperLimit<=0||upperLimit>1){stop('Invalid risk or signal settings');return}
   if(l.profit-amount < -maxLoss){stop('Daily loss exposure limit');return}
   if(arr.length<minimum){setStatus(`Warming up: ${arr.length}/${minimum} ticks`);return}
-  // Train on past ticks only, and assess on the last 200 previously observed ticks.
-  // The current tick is excluded from the forecast; the purchase settles on a future tick.
-  const past=arr.slice(0,-1),training=past.slice(-400,-200),validation=past.slice(-200);
-  if(training.length<200||validation.length<200){setStatus('Collecting separate training and validation samples');return}
+  // Use the user-selected sample size, excluding the current tick. Split chronologically
+  // into independent training (60%) and validation (40%) windows.
+  const past=arr.slice(0,-1);
+  if(past.length<minimum){setStatus(`Warming up: ${past.length}/${minimum} completed ticks`);return}
+  const sample=past.slice(-minimum);
+  const trainCount=Math.floor(sample.length*0.6);
+  const training=sample.slice(0,trainCount),validation=sample.slice(trainCount);
   const counts=Array.from({length:10},(_,d)=>training.filter(x=>x===d).length);
   const target=counts.indexOf(Math.min(...counts));
   const valHits=validation.filter(d=>d===target).length;
   const upper=wilsonUpper(valHits,validation.length);
   setSelected(target);
-  if(upper>=upperLimit){setStatus(`No verified edge: digit ${target}, validation upper bound ${(upper*100).toFixed(1)}%`);return}
+  if(upper>=upperLimit){setStatus(`Signal filtered: digit ${target}, validation upper bound ${(upper*100).toFixed(1)}% exceeds ${(upperLimit*100).toFixed(1)}% (not proof of an edge)`);return}
   if(isLive&&!liveApproved){stop('Live account requires explicit confirmation');return}
   // Reserve a purchase slot synchronously BEFORE sending the buy request.
   busy.current=true;
@@ -736,17 +739,18 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   if(l.uncertain){setError('An earlier purchase has uncertain status. Reconcile it in Deriv before continuing.');return}
   if(l.attempts>=5){setError('Five trades already attempted today (UTC).');return}
   if(isLive&&!liveApproved){setError('Confirm live trading first.');return}
-  if(Number(stake)<50||!Number.isFinite(Number(stake))||Number(dailyLoss)<Number(stake)||Number(minObservations)<401||Number(maxUpper)>0.1||Number(maxUpper)<=0){setError('Invalid settings: stake ≥ $50, loss cap ≥ stake, sample ≥ 401, upper-bound threshold ≤ 10%.');return}
+  if(Number(stake)<50||!Number.isFinite(Number(stake))||Number(dailyLoss)<Number(stake)||(!Number.isInteger(Number(minObservations))||Number(minObservations)<20)||Number(maxUpper)>1||Number(maxUpper)<=0){setError('Invalid settings: stake ≥ $50, loss cap ≥ stake, minimum ticks ≥ 20, upper-bound threshold between 0 and 1.');return}
   enabledRef.current=true;setEnabled(true);setStatus('Monitoring ticks for qualifying signal');
  };
  return <section className="rounded-xl border border-slate-600 p-4 space-y-3 text-sm">
   <div className="flex justify-between gap-2"><h3 className="font-bold text-lg">Selective Digit Differs</h3><span>{demo?'DEMO':isLive?'LIVE':'DISCONNECTED'}</span></div>
   <p>At most five $50+ one-tick DIGITDIFF purchases per UTC day. A statistical validation filter can reject every signal; it does not guarantee a profitable edge.</p>
+  <p className="text-xs text-amber-300">Default validation threshold 0.15 (15%) is more permissive than 0.10; passing it does not establish a statistical edge or positive expected return. Smaller samples make estimates less reliable.</p>
   <div className="grid grid-cols-2 gap-2">
    <label>Stake USD<input className="block w-full rounded border bg-transparent p-2" type="number" min="50" step="0.01" value={stake} disabled={enabled} onChange={e=>setStake(e.target.value)}/></label>
    <label>Daily loss cap USD<input className="block w-full rounded border bg-transparent p-2" type="number" min="50" step="0.01" value={dailyLoss} disabled={enabled} onChange={e=>setDailyLoss(e.target.value)}/></label>
-   <label>Minimum ticks<input className="block w-full rounded border bg-transparent p-2" type="number" min="401" value={minObservations} disabled={enabled} onChange={e=>setMinObservations(e.target.value)}/></label>
-   <label>Validation upper bound<input className="block w-full rounded border bg-transparent p-2" type="number" min="0.001" max="0.1" step="0.001" value={maxUpper} disabled={enabled} onChange={e=>setMaxUpper(e.target.value)}/></label>
+   <label>Minimum ticks<input className="block w-full rounded border bg-transparent p-2" type="number" min="20" step="1" value={minObservations} disabled={enabled} onChange={e=>setMinObservations(e.target.value)}/></label>
+   <label>Validation upper bound<input className="block w-full rounded border bg-transparent p-2" type="number" min="0.001" max="1" step="0.005" value={maxUpper} disabled={enabled} onChange={e=>setMaxUpper(e.target.value)}/></label>
   </div>
   {isLive&&<label className="flex gap-2"><input type="checkbox" checked={liveApproved} disabled={enabled} onChange={e=>setLiveApproved(e.target.checked)}/> I understand these are real-money $50+ trades and authorize live execution.</label>}
   <div className="flex gap-2"><button className="rounded bg-emerald-700 px-4 py-2 text-white disabled:opacity-40" disabled={enabled||busy.current||!isConnected} onClick={start}>Start selective bot</button><button className="rounded bg-slate-600 px-4 py-2 text-white" onClick={()=>stop('Stopped — existing contract will still settle')}>Stop</button></div>
