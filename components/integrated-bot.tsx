@@ -626,6 +626,12 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
     >{active.current ? '■ STOP CYCLE' : '▶ START CYCLE'}</button>
     <button aria-label={sound?'Mute sounds':'Enable sounds'} title={sound?'Mute':'Unmute'} onClick={()=>{setSound(v=>!v);if(!sound)tone('buy')}} className="flex h-8 w-8 items-center justify-center rounded-md border border-slate-700 bg-slate-900 text-xs text-emerald-300">{sound?'🔊':'🔇'}</button>
   </div>
+  {demo&&ledger?.uncertain&&!ledger.pendingContractId&&<div className="space-y-2 rounded-xl border border-amber-500/50 bg-amber-500/10 p-3 text-amber-100">
+   <div className="font-extrabold text-amber-300">Purchase confirmation missing</div>
+   <p className="text-xs">Only use this recovery after checking Deriv demo transaction history and confirming the last purchase has settled and no related contract remains open. This does not change recorded profit or trade attempts.</p>
+   <label className="flex items-start gap-2 text-xs"><input type="checkbox" className="mt-0.5" checked={settlementVerified} onChange={e=>setSettlementVerified(e.target.checked)}/> I verified the last purchase is settled in Deriv and there is no related open contract.</label>
+   <button type="button" className="rounded-lg bg-amber-500 px-3 py-2 font-bold text-slate-950 disabled:cursor-not-allowed disabled:opacity-40" disabled={!settlementVerified||busy.current||reconciling.current||enabled} onClick={clearVerifiedPurchase}>Clear verified settled purchase</button>
+  </div>}
   <SettlementToast notice={notice} onDismiss={dismissNotice}/>
   {lastOutcome&&<div className={`mt-3 rounded-lg border p-3 ${lastOutcome.outcome==='WIN'?'border-emerald-400 bg-emerald-500/20 text-emerald-300 shadow-lg shadow-emerald-950/30':'border-rose-500 bg-rose-500/10 text-rose-300'}`}><strong className="text-xl font-black tracking-wide">{lastOutcome.outcome==='WIN'?'🟢 WIN':'🔴 LOSS'} {lastOutcome.profit>=0?'+':''}${lastOutcome.profit.toFixed(2)}</strong><span className="ml-3 text-xs">Verified contract #{lastOutcome.id} · target {lastOutcome.digit} · expiry {lastOutcome.expiryDigit??'unavailable'} · signal tick {lastOutcome.signalEpoch} · buy {lastOutcome.purchaseEpoch??'unavailable'} · expiry time {lastOutcome.expiryEpoch??'unavailable'}</span></div>}
   {err&&<div role="alert" className="mt-3 rounded-lg border border-amber-500 p-2 text-xs text-amber-300">{err}{mode==='UNCERTAIN'?' — Purchase outcome requires verification in Deriv before restarting.':''}</div>}
@@ -662,6 +668,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
  const [ledger,setLedger]=useState<Ledger|null>(null);
  const [status,setStatus]=useState('Stopped');
  const [error,setError]=useState('');
+ const [settlementVerified,setSettlementVerified]=useState(false);
  const [recent,setRecent]=useState<number[]>([]);
  const [selected,setSelected]=useState<number|null>(null);
  const busy=useRef(false);
@@ -678,6 +685,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
  const update=(v:Ledger)=>{latestLedger.current=v;setLedger(v);persist(v)};
  const stop=useCallback((message:string)=>{enabledRef.current=false;setEnabled(false);setStatus(message)},[]);
  useEffect(()=>{
+  setSettlementVerified(false);
   stop('Stopped — account or market changed');busy.current=false;uncertain.current=false;history.current=[];lastTick.current='';setRecent([]);setSelected(null);setLiveApproved(false);
   if(accountId){const l=readLedger(accountId);latestLedger.current=l;setLedger(l);uncertain.current=l.uncertain}else{latestLedger.current=null;setLedger(null)}
   session.current=`${accountId??''}:${symbol}`;
@@ -786,6 +794,17 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
    }finally{busy.current=false}
   })();
  },[accountId,currentTick,dailyLoss,enforceFivePerDay,isConnected,isLive,liveApproved,minObservations,monitor,pipSize,stake,stop,symbol,ws]);
+ // Explicit demo-only acknowledgement of a broker-verified settlement when no
+ // contract ID was received. Do not modify attempts or realized P/L: the
+ // unknown settlement cannot be reliably attributed to the local ledger.
+ const clearVerifiedPurchase=()=>{
+  if(!demo||!accountId||!isConnected||!settlementVerified||busy.current||reconciling.current||enabledRef.current)return;
+  const current=readLedger(accountId);
+  if(!current.uncertain||current.pendingContractId){setError('This contract has a known ID; wait for automatic broker reconciliation.');return}
+  const next={...current,uncertain:false,pendingContractId:null};
+  update(next);uncertain.current=false;setSettlementVerified(false);setError('');
+  setStatus('Verified settled purchase cleared — ready to start');
+ };
  const start=()=>{
   setError('');if(!accountId||!ws||!isConnected){setError('Connect your Deriv account first');return}
   const l=readLedger(accountId);update(l);
