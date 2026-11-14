@@ -22,6 +22,39 @@ const spotDigit=(spot:unknown,precision:number):number|null=>{
 const expiryDigitOf=(c:any,precision:number):number|null=>
   spotDigit(c?.exit_spot??c?.exit_tick??c?.exit_tick_display_value,precision);
 const amount=(n:number)=>Math.round((n+Number.EPSILON)*100)/100;
+// Walk-forward NEXT-OBSERVED-TICK audit: each forecast is evaluated only on a
+// subsequent observed tick. A forecast is NOT a verified contract win.
+type ForecastAudit={target:number;probability:number;sequence:number};
+class WalkForwardAudit {
+  private pending:ForecastAudit|null=null;
+  private trials=0;
+  private hits=0;
+  private brier=0;
+  private readonly recent:number[]=[];
+  observe(digit:number,sequence:number){
+    if(this.pending && sequence===this.pending.sequence+1){
+      const hit=Number(this.pending.target===digit);
+      this.trials++;this.hits+=hit;
+      this.brier+=(this.pending.probability-hit)**2;
+      this.recent.push(hit);if(this.recent.length>500)this.recent.shift();
+    }
+    this.pending=null;
+  }
+  predict(target:number,probability:number,sequence:number){
+    if(Number.isInteger(target)&&target>=0&&target<=9&&Number.isFinite(probability))
+      this.pending={target,probability:Math.max(0,Math.min(1,probability)),sequence};
+  }
+  get stats(){
+    const n=this.recent.length;const hits=this.recent.reduce((a,b)=>a+b,0);
+    const rate=n?hits/n:0;
+    // Wilson 95% lower confidence bound, not a guarantee of future accuracy.
+    const z=1.96,den=1+z*z/Math.max(1,n);
+    const lower=n?Math.max(0,(rate+z*z/(2*n)-z*Math.sqrt(rate*(1-rate)/n+z*z/(4*n*n)))/den):0;
+    return {trials:this.trials,hits:this.hits,rate,lower,brier:this.trials?this.brier/this.trials:0};
+  }
+  reset(){this.pending=null;this.trials=0;this.hits=0;this.brier=0;this.recent.length=0;}
+}
+
 function tone(kind:'buy'|'win'|'loss'){
   try{const A=window.AudioContext;const ctx=new A();const osc=ctx.createOscillator();const gain=ctx.createGain();osc.type=kind==='win'?'sine':'triangle';osc.frequency.value=kind==='win'?880:kind==='buy'?650:250;gain.gain.value=.065;osc.connect(gain);gain.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+(kind==='win'?.42:.15));osc.onended=()=>{void ctx.close()}}catch{/* audio unsupported */}
 }
@@ -35,10 +68,17 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   const lockRef=useRef<{digit:number;elapsed:number;source:EntryKind;signal:{score:number;momentum3:number;positiveSteps:number;threshold:number};originSequence:number;originEpoch:number}|null>(null);
   const [lockPosition,setLockPosition]=useState(0);
   const [tradeLockView,setTradeLockView]=useState<{digit:number;source:EntryKind;elapsed:number}|null>(null);
-  const [base,setBase]=useState('1');const [factor,setFactor]=useState('1.15');const [limit,setLimit]=useState('20');const [maxLoss,setMaxLoss]=useState('40');const [threshold,setThreshold]=useState('0');const [minMomentum,setMinMomentum]=useState('0');
+  const [base,setBase]=useState('1');const [factor,setFactor]=useState('1.15');const [limit,setLimit]=useState('5');const [maxLoss,setMaxLoss]=useState('40');const [threshold,setThreshold]=useState('0');const [minMomentum,setMinMomentum]=useState('0');
   const [mode,setMode]=useState<Mode>('IDLE');const [count,setCount]=useState(0);const [pnl,setPnl]=useState(0);const [lastOutcome,setLastOutcome]=useState<Outcome|null>(null);const [err,setErr]=useState('');const [sound,setSound]=useState(true);
   const [history,setHistory]=useState<number[]>([]);const [scores,setScores]=useState<ReturnType<typeof scoreDigits>>([]);const [lockedDigit,setLockedDigit]=useState<number|null>(null);
   const intelligenceRef=useRef(new NextTickIntelligence());
+   const auditRef=useRef(new WalkForwardAudit());
+   const [auditView,setAuditView]=useState(auditRef.current.stats);
+   const [evidenceGate,setEvidenceGate]=useState(false);
+   const [minSamples,setMinSamples]=useState('300');
+   const [minNetReturn,setMinNetReturn]=useState('7.33');
+   const [sessionPnl,setSessionPnl]=useState(0);
+   const sessionPnlRef=useRef(0);
   const [entrySignal,setEntrySignal]=useState<EntryKind|null>(null);
   const [lastTrace,setLastTrace]=useState<{trace:FrozenEntryTrace;contractId:number;entryDigit:number|null;expiryDigit:number|null;profit:number;outcome:'WIN'|'LOSS'}|null>(null);
   const executionForecastRef=useRef(new ExecutionAwareForecast());
@@ -85,7 +125,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   const stop=useCallback(()=>{setStopReason('Stopped');halt.current=true;active.current=false;setTargetRef.current(null);setLockedDigit(null);lockedRef.current=null;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setMode(m=>m==='RUNNING'?'STOPPED':m)},[]);
   const stopRef=useRef(stop);stopRef.current=stop;
 
-  useEffect(()=>{if(scope.current!==scopeKey){const unsettled=outstanding.current.size>0||pendingCount.current>0||uncertainPurchase.current;scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];intelligenceRef.current.reset();setEntrySignal(null);setLastTrace(null);if(!unsettled){countRef.current=0;setSentCount(0);pnlRef.current=0;}lockRef.current=null;setLockPosition(0);setTradeLockView(null);setLockedDigit(null);setTargetRef.current(null);if(!unsettled){pendingCount.current=0;inFlight.current.clear();matchPause.current=false;setMatchPaused(false);reservedStake.current=0;setRiskExposure(0);uncertainPurchase.current=false;}lastTickKey.current='';setEntryStatus('Waiting for signal');setStopReason('Account or symbol changed');paceRef.current={eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—'};tickSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setHistory([]);setScores([]);setCount(0);setPnl(0);setMode(unsettled?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;verifiedWinContract.current=null;if(unsettled)setErr('Account/symbol changed with a pending or unsettled order. Reconcile on Deriv.');else setErr('')}},[scopeKey]);
+  useEffect(()=>{if(scope.current!==scopeKey){const unsettled=outstanding.current.size>0||pendingCount.current>0||uncertainPurchase.current;scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];intelligenceRef.current.reset();auditRef.current.reset();setAuditView(auditRef.current.stats);setEntrySignal(null);setLastTrace(null);if(!unsettled){countRef.current=0;setSentCount(0);pnlRef.current=0;}lockRef.current=null;setLockPosition(0);setTradeLockView(null);setLockedDigit(null);setTargetRef.current(null);if(!unsettled){pendingCount.current=0;inFlight.current.clear();matchPause.current=false;setMatchPaused(false);reservedStake.current=0;setRiskExposure(0);uncertainPurchase.current=false;}lastTickKey.current='';setEntryStatus('Waiting for signal');setStopReason('Account or symbol changed');paceRef.current={eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—'};tickSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setHistory([]);setScores([]);setCount(0);setPnl(0);setMode(unsettled?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;verifiedWinContract.current=null;if(unsettled)setErr('Account/symbol changed with a pending or unsettled order. Reconcile on Deriv.');else setErr('')}},[scopeKey]);
 
   const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,frozenTrace:FrozenEntryTrace)=>{
    if(winConfirmed.current||verifiedWinContract.current!==null)return;
@@ -142,7 +182,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       });
       const payout=Number(settle.sell_price??settle.payout);const buyPrice=Number(settle.buy_price??ask);
       if(!Number.isFinite(payout)||!Number.isFinite(buyPrice)||payout<0||buyPrice<=0)throw new Error('Settlement amounts unavailable');
-      const profit=amount(payout-buyPrice);pnlRef.current=amount(pnlRef.current+profit);setPnl(pnlRef.current);
+      const profit=amount(payout-buyPrice);pnlRef.current=amount(pnlRef.current+profit);setPnl(pnlRef.current);sessionPnlRef.current=amount(sessionPnlRef.current+profit);setSessionPnl(sessionPnlRef.current);
       const win=profit>0;executionForecastRef.current.observeSettlement(win);
       const expiryDigit=expiryDigitOf(settle,pipSize);
       const entryDigit=spotDigit(settle.entry_spot??settle.entry_tick??null,pipSize);
@@ -152,7 +192,7 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
       try{const key=`dms-momentum-trades:v1:${symbol}`;const prev=JSON.parse(localStorage.getItem(key)||'[]');const rows=Array.isArray(prev)?prev:[];if(!rows.some((x:any)=>x.contractId===id&&x.accountId===accountId))localStorage.setItem(key,JSON.stringify([...rows.slice(-4999),journalRow]))}catch{}
       outstanding.current.delete(id);reservedStake.current=Math.max(0,amount(reservedStake.current-ask));setOutstandingCount(outstanding.current.size);refreshExposure();
       if(win){setStopReason('Verified winning contract');winConfirmed.current=true;halt.current=true;active.current=false;matchPause.current=false;setMatchPaused(false);lockedRef.current=null;lockRef.current=null;setLockedDigit(null);setLockPosition(0);setTradeLockView(null);setTargetRef.current(null);setMode('WIN')}
-      else{confirmedLossesRef.current++;if(countRef.current>=Number(limit)){halt.current=true;active.current=false;setMode('MAX_TRADES')}else if(-pnlRef.current+reservedStake.current>=Number(maxLoss)){halt.current=true;active.current=false;setMode('MAX_LOSS')}else if(active.current&&!halt.current&&!matchPause.current&&!uncertainPurchase.current){setMode('RUNNING');setEntryStatus('Settled · next tick may submit a buy');}}
+      else{confirmedLossesRef.current++;if(winConfirmed.current||verifiedWinContract.current!==null){setMode('WIN')}else if(countRef.current>=Number(limit)){halt.current=true;active.current=false;setMode('MAX_TRADES')}else if(-pnlRef.current+reservedStake.current>=Number(maxLoss)){halt.current=true;active.current=false;setMode('MAX_LOSS')}else if(active.current&&!halt.current&&!matchPause.current&&!uncertainPurchase.current){setMode('RUNNING');setEntryStatus('Settled · next tick may submit a buy');}}
       releaseMatchPause();
      }catch(e){halt.current=true;active.current=false;setMode('UNCERTAIN');setErr(`Contract ${id}: ${String(e)}. Reconcile in Deriv.`)}
      finally{if(unsubscribe)void unsubscribe();setOutstandingCount(outstanding.current.size);releaseMatchPause()}
@@ -166,7 +206,9 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
 
   useEffect(()=>{if(!isConnected&&active.current){halt.current=true;active.current=false;setMode('UNCERTAIN');setErr('Connection lost.');}},[isConnected]);
 
-  const tickSettings=useRef({pipSize,limit,threshold,minMomentum,base,factor,maxLoss,isConnected,accountId,symbol,strategy,lockDuration});
+  const evidenceGateRef=useRef({enabled:evidenceGate,samples:Number(minSamples),netReturn:Number(minNetReturn)});
+   evidenceGateRef.current={enabled:evidenceGate,samples:Number(minSamples),netReturn:Number(minNetReturn)};
+   const tickSettings=useRef({pipSize,limit,threshold,minMomentum,base,factor,maxLoss,isConnected,accountId,symbol,strategy,lockDuration});
   tickSettings.current={pipSize,limit,threshold,minMomentum,base,factor,maxLoss,isConnected,accountId,symbol,strategy,lockDuration};
 
   const processMarketTick=useCallback((tick:any)=>{
@@ -196,7 +238,10 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     tickStats.current.received++;
     if(tickStats.current.received%5===0){const ms=tickCadence.current.intervalMs;setCadenceLabel(ms===null?'Measuring tick interval':`${(ms/1000).toFixed(2)}s/tick · ${(1000/ms).toFixed(2)} ticks/s`);}
     histRef.current=[...histRef.current.slice(-99),digit];
-    const ranking=intelligenceRef.current.observe(digit);scoreRef.current=ranking;
+    auditRef.current.observe(digit,sequence);
+     const ranking=intelligenceRef.current.observe(digit);scoreRef.current=ranking;
+     if(ranking.length){const lead=ranking[0];auditRef.current.predict(lead.digit,Number(lead.probability)>1?Number(lead.probability)/100:Number(lead.probability),sequence);}
+     if(sequence%5===0)setAuditView(auditRef.current.stats);
     const top=ranking[0];
     // FIX (was #6): capture telemetryScope BEFORE queueing; compare inside the
     // microtask against the captured scope, not `scope.current !== scope.current`
@@ -223,6 +268,13 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
     const nextCandidate=top && qualified.some(row=>row.digit===top.digit)?top:null;
     const choice=settings.strategy==='MOMENTUM_LOCK' ? (selected ? {digit:selected.digit,score:selected.signal.score,momentum3:selected.signal.momentum3,positiveSteps:selected.signal.positiveSteps,probability:0} : nextCandidate) : nextCandidate;
     if(!choice){setEntryStatus('Waiting for qualified signal');return}
+     if(evidenceGateRef.current.enabled){
+       const stats=auditRef.current.stats;
+       const breakEven=1/(1+evidenceGateRef.current.netReturn);
+       if(stats.trials<evidenceGateRef.current.samples || stats.lower<=breakEven){
+         setEntryStatus(`Research gate: ${stats.trials}/${evidenceGateRef.current.samples} samples · lower ${(stats.lower*100).toFixed(2)}% · break-even ${(breakEven*100).toFixed(2)}%`);return;
+       }
+     }
     if(settings.strategy==='MOMENTUM_LOCK' && !selected){
       lockRef.current={digit:choice.digit,elapsed:1,source:'NEXT',originSequence:sequence,originEpoch:epoch,signal:{score:choice.score,momentum3:choice.momentum3,positiveSteps:choice.positiveSteps,threshold:Number(settings.threshold)}};
       selected=lockRef.current;setLockPosition(1);setTradeLockView({digit:selected.digit,source:'NEXT',elapsed:1});
@@ -253,14 +305,15 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
   },[]);
 
   const processMarketTickRef=useRef(processMarketTick);processMarketTickRef.current=processMarketTick;
-  useEffect(()=>{if(!ws)return;return ws.onMessage((frame:Record<string,unknown>)=>{if(frame.msg_type==='tick'&&frame.tick)processMarketTickRef.current(frame.tick);});},[ws]);
-  useEffect(()=>{if(!isConnected||!currentTick||!symbol)return;processMarketTick({...currentTick,symbol});},[currentTick,symbol,isConnected,processMarketTick]);
+  useEffect(()=>{if(!ws)return;return ws.onMessage((frame:Record<string,unknown>)=>{if(frame.msg_type==='tick'&&frame.tick)try{processMarketTickRef.current(frame.tick)}catch(e){halt.current=true;active.current=false;setMode('UNCERTAIN');setErr(`Tick processing error: ${String(e)}`)}});},[ws]);
+  useEffect(()=>{if(!isConnected||!currentTick||!symbol)return;try{processMarketTick({...currentTick,symbol})}catch(e){halt.current=true;active.current=false;setMode('UNCERTAIN');setErr(`Tick processing error: ${String(e)}`)}},[currentTick,symbol,isConnected,processMarketTick]);
 
   function start(){
    if(!valid||!accountId||!isConnected||!ws||pendingCount.current>0||active.current||uncertainPurchase.current||outstanding.current.size)return;
    const acc=real?'REAL MONEY':'DEMO';
    if(real&&!window.confirm(`REAL MONEY: Automated DigitMatch on ${symbol}. Max loss $${maxLoss}. Confirm.`))return;
-   if(!window.confirm(`Start ${acc} cycle? 1-tick DIGITMATCH, one buy per tick. Max loss $${maxLoss}, max ${limit} buys.`))return;
+   if(evidenceGate && (!Number.isInteger(Number(minSamples))||Number(minSamples)<100||!Number.isFinite(Number(minNetReturn))||Number(minNetReturn)<=0)){setErr('Invalid research gate settings');return;}
+    if(!window.confirm(`Start ${acc} cycle? 1-tick DIGITMATCH, one buy per tick. Max loss $${maxLoss}, max ${limit} buys.`))return;
    if(mode==='UNCERTAIN'||uncertainPurchase.current||pendingCount.current>0||outstanding.current.size>0)return;
    paceRef.current={eligible:0,dispatched:0,accepted:0,skipped:0,lastSkip:'—'};tickSequence.current=0;
    lockPurchases.current.clear();setEntryStatus('Waiting for signal');setStopReason('Running');countRef.current=0;setSentCount(0);pnlRef.current=0;reservedStake.current=0;setRiskExposure(0);matchPause.current=false;setMatchPaused(false);confirmedLossesRef.current=0;lockedRef.current=null;lockRef.current=null;setLockPosition(0);setTradeLockView(null);setCount(0);setPnl(0);setLockedDigit(null);setTargetRef.current(null);setLastOutcome(null);winConfirmed.current=false;verifiedWinContract.current=null;setErr('');halt.current=false;active.current=true;setMode('RUNNING');if(sound)tone('buy');
@@ -273,6 +326,17 @@ export function IntegratedBot({ws,accountId,accountType,isConnected,currentTick,
      {strategy==='MOMENTUM_LOCK'&&<span className="text-emerald-400">{tradeLockView?`Lock ${tradeLockView.digit} · tick ${tradeLockView.elapsed}/${lockDuration}`:'Waiting for lock'}</span>}
    </div>
    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">{([['Base $',base,setBase],['Multiplier',factor,setFactor],['Max trades',limit,setLimit],['Loss limit $',maxLoss,setMaxLoss],['Min score',threshold,setThreshold],['Min momentum',minMomentum,setMinMomentum]] as const).map(([name,v,fn])=><label key={name} className="text-[11px] text-slate-300">{name}<input value={v} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} type="number" min={name==='Min momentum'||name==='Min score'?'0':undefined} step={name==='Min momentum'?'0.1':'any'} onChange={e=>fn(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>)}</div>
+   <div className="mt-2 rounded-lg border border-slate-700 bg-[#0a1222] p-2 text-xs">
+     <div className="font-bold text-cyan-300">Walk-forward prediction audit (next observed tick)</div>
+     <div className="mt-1">Top-1 accuracy: {(auditView.rate*100).toFixed(2)}% · {auditView.hits}/{auditView.trials} recent 500 · 95% lower bound {(auditView.lower*100).toFixed(2)}% · Brier {auditView.brier.toFixed(4)}</div>
+     <div className="mt-1 text-amber-300">Observed-tick accuracy is not execution-aligned contract accuracy. Research gate defaults OFF; test on DEMO.</div>
+     <label className="mt-2 flex items-center gap-2"><input type="checkbox" checked={evidenceGate} disabled={active.current} onChange={e=>setEvidenceGate(e.target.checked)}/> Research evidence gate (block weak signals)</label>
+     <div className="mt-1 flex flex-wrap gap-3">
+       <label>Min samples <input className="ml-1 w-20 rounded bg-slate-800 p-1" type="number" min="100" value={minSamples} disabled={active.current} onChange={e=>setMinSamples(e.target.value)}/></label>
+       <label>Net payout / stake <input className="ml-1 w-20 rounded bg-slate-800 p-1" type="number" min="0.01" step="0.01" value={minNetReturn} disabled={active.current} onChange={e=>setMinNetReturn(e.target.value)}/></label>
+     </div>
+     <div className="mt-1">Session realized P/L: <strong className={sessionPnl>=0?'text-emerald-300':'text-rose-300'}>{sessionPnl>=0?'+':''}${sessionPnl.toFixed(2)}</strong> (across cycle resets; resets on reload)</div>
+   </div>
    <div className="mt-3 grid grid-cols-2 gap-1.5 sm:grid-cols-4">{[['Top',scores[0]?.digit??'—'],['Trade',`${count}/${limit}`],['Next stake',`$${next.toFixed(2)}`],['P/L',`${pnl>=0?'+':''}$${pnl.toFixed(2)}`]].map(([k,v])=><div key={String(k)} className="rounded-lg bg-[#0a1222] px-2 py-1.5"><div className="text-[11px] text-slate-400">{k}</div><div className={`font-extrabold ${k==='P/L'?(pnl>0?'text-green-400':pnl<0?'text-red-500':'text-slate-100'):'text-slate-100'}`}>{v}</div></div>)}</div>
    <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
      <span className="text-slate-400">Sent <strong className="text-white">{paceRef.current.dispatched}</strong> · Acc <strong className="text-white">{paceRef.current.accepted}</strong> · Open <strong className="text-white">{outstandingCount}</strong> · Risk <strong className="text-white">${riskExposure.toFixed(2)}</strong> · {cadenceLabel}</span>
