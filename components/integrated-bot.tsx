@@ -821,26 +821,34 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   const pMin=Math.min(...probs),pMax=Math.max(...probs);
   const mMin=Math.min(...momenta),mMax=Math.max(...momenta);
   const normalize=(value:number,lo:number,hi:number)=>hi>lo?(value-lo)/(hi-lo):0.5;
+  // V1's published row order IS the dashboard order (1 = highest score).
+  // DIGITDIFF must never buy the highlighted top digit or any top-half digit.
+  const dashboardRank=new Map(ten.map((row,index)=>[row.digit,index+1]));
   const candidates=ten.map(row=>({
-   digit:row.digit, probability:row.probability, momentum:row.momentum3,
+   digit:row.digit, dashboardRank:dashboardRank.get(row.digit)!, probability:row.probability, momentum:row.momentum3,
    validationRate:validationCounts[row.digit]/validation.length,
    rankScore:0.60*normalize(row.probability,pMin,pMax)
     +0.40*normalize(row.momentum3,mMin,mMax)
   }))
-   .filter(c=>!recentBarriers.current.includes(c.digit)
+   .filter(c=>c.dashboardRank>=6
+    &&!recentBarriers.current.includes(c.digit)
     &&c.validationRate<0.1 &&c.momentum<0)
    .sort((a,b)=>a.rankScore-b.rankScore || a.probability-b.probability
     || a.momentum-b.momentum || a.digit-b.digit);
   const candidate=candidates[0];
   if(!candidate){
    setSelected(null);
-   setSelectionReason('No negative-momentum barrier passed validation and cooldown');
-   setStatus(`Waiting: no negative-momentum validated barrier outside last ${barrierCooldown} traded barriers`);
+   setSelectionReason('No dashboard bottom-five barrier passed negative momentum, validation and cooldown');
+   setStatus(`Waiting: no V1 dashboard rank 6–10 barrier passed negative momentum, validation and last ${barrierCooldown} traded barriers`);
    return;
   }
   const target=candidate.digit;
+  // Fail closed if the dashboard ordering ever diverges from selection.
+  if(forecastRows.findIndex(r=>r.digit===target)<5){
+   setSelected(null);setStatus('Blocked: selected barrier is in dashboard top five');return;
+  }
   setSelected(target);
-  setSelectionReason(`Digit ${target}: V1 probability ${(candidate.probability*100).toFixed(2)}%, momentum ${candidate.momentum.toFixed(2)}, validation ${(candidate.validationRate*100).toFixed(1)}%, combined rank ${candidate.rankScore.toFixed(3)}`);
+  setSelectionReason(`Digit ${target}: dashboard rank ${candidate.dashboardRank}/10, V1 probability ${(candidate.probability*100).toFixed(2)}%, momentum ${candidate.momentum.toFixed(2)}, validation ${(candidate.validationRate*100).toFixed(1)}%, combined rank ${candidate.rankScore.toFixed(3)}`);
   // The score and validation rule are heuristics, NOT a demonstrated edge;
   // even low estimated probability cannot guarantee a Differs win.
   if(isLive&&!liveApproved){stop('Live account requires explicit confirmation');return}
@@ -905,7 +913,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   <label className="flex items-center gap-2 rounded-lg border border-slate-700 p-2"><input type="checkbox" checked={enforceFivePerDay} disabled={enabled||busy.current} onChange={e=>setEnforceFivePerDay(e.target.checked)}/><span>Enforce maximum 5 trades per UTC day</span></label>
   {isLive&&<label className="flex gap-2"><input type="checkbox" checked={liveApproved} disabled={enabled} onChange={e=>setLiveApproved(e.target.checked)}/> I understand these are real-money $50+ trades and authorize live execution.</label>}
   <div className="flex gap-2"><button className="rounded bg-emerald-700 px-4 py-2 text-white disabled:opacity-40" disabled={enabled||busy.current||!isConnected} onClick={start}>Start selective bot</button><button className="rounded bg-slate-600 px-4 py-2 text-white" onClick={()=>stop('Stopped — existing contract will still settle')}>Stop</button></div>
-  <p className="text-xs text-slate-400">Shared V1 engine: barrier ranking = 60% low forecast probability + 40% low momentum (normalized across all 10 digits). Requires negative momentum and the existing validation check. Last 3 submitted barriers are excluded across refreshes. This is a selection heuristic, not a proven edge.</p>
+  <p className="text-xs text-slate-400">Shared V1 dashboard: Only ranks 6–10 qualify; ranks 1–5 are always excluded. Among eligible bottom-five digits, ranking = 60% low forecast probability + 40% low momentum (normalized across all 10 digits). Requires negative momentum and the existing validation check. Last 3 submitted barriers are excluded across refreshes. This is a selection heuristic, not a proven edge.</p>
   <p className="text-xs text-cyan-300" aria-live="polite">Selection: {selectionReason}</p>
   <p>Today: <strong>{ledger?.attempts??0}{enforceFivePerDay?'/5':''}</strong> attempted · Realized P/L <strong className={`font-black tabular-nums ${(ledger?.profit??0)>0?'text-green-400':(ledger?.profit??0)<0?'text-red-400':'text-slate-100'}`}>{(ledger?.profit??0)>0?'PROFIT ': (ledger?.profit??0)<0?'LOSS ':''}{(ledger?.profit??0)>=0?'+':'−'}${Math.abs(ledger?.profit??0).toFixed(2)}</strong> · Candidate digit: {selected??'—'}</p>
   <div className="grid grid-cols-1 gap-2 sm:grid-cols-3" aria-label="Persistent Digit Differs profit and loss">
