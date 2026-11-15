@@ -679,6 +679,10 @@ const digitOf=(tick:Tick,pipSize:number)=>{
  return Number(tick.quote.toFixed(p).slice(-1));
 };
 function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,pipSize,symbol,onBusyChange}:{ws:DerivWS|null;accountId:string|null;accountType:string|null;isConnected:boolean;currentTick:Tick|null;pipSize:number;symbol:string;onBusyChange:(busy:boolean)=>void}){
+ const {publishForecast}=useEngineForecast();
+ const differsForecast=useRef(new NextTickIntelligence());
+ const forecastSequence=useRef(0);
+ const [selectionReason,setSelectionReason]=useState('Awaiting all-ten forecast');
  const [stake,setStake]=useState('50');
  const [dailyLoss,setDailyLoss]=useState('250');
  const [enforceFivePerDay,setEnforceFivePerDay]=useState(true);
@@ -724,7 +728,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
  const stop=useCallback((message:string)=>{enabledRef.current=false;setEnabled(false);setStatus(message)},[]);
  useEffect(()=>{
   setSettlementVerified(false);
-  stop('Stopped — account or market changed');busy.current=false;uncertain.current=false;history.current=[];lastTick.current='';setRecent([]);setSelected(null);setLiveApproved(false);
+  stop('Stopped — account or market changed');busy.current=false;uncertain.current=false;history.current=[];lastTick.current='';differsForecast.current.reset();forecastSequence.current=0;setSelectionReason('Awaiting all-ten forecast');setRecent([]);setSelected(null);setLiveApproved(false);
   if(accountId){const l=readLedger(accountId);latestLedger.current=l;setLedger(l);setPLTotals(readPLTotals(accountId));uncertain.current=l.uncertain}else{latestLedger.current=null;setLedger(null);setPLTotals({lifetime:0,last30Days:0,days:0})}
   recentBarriers.current=accountId?readBarriers(accountId,symbol):[];
   session.current=`${accountId??''}:${symbol}`;
@@ -780,6 +784,17 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   if(!Number.isInteger(digit)||digit<0||digit>9)return;
   history.current=[...history.current.slice(-4999),digit];
   const arr=history.current;setRecent(arr.slice(-50));
+  // Publish the SAME ten-digit V1 probability/score/momentum snapshot used
+  // for Differs barrier ranking to the existing dashboard context. Match mode
+  // is unmounted here, so Differs must maintain and publish its own V1 stream.
+  const forecastRows=differsForecast.current.observe(digit);
+  const sequence=++forecastSequence.current;
+  if(forecastRows.length===10){
+   publishForecast({symbol,sequence,rows:forecastRows.map(r=>({
+    digit:r.digit,score:r.score,probability:r.probability,
+    momentum3:r.momentum3,positiveSteps:r.positiveSteps
+   })),lockedDigit:null});
+  }
   if(!enabledRef.current||busy.current||uncertain.current)return;
   const l=latestLedger.current;
   if(!l||l.account!==accountId||l.day!==dayUTC()){stop('Daily boundary reached — restart to load new UTC day');return}
@@ -788,32 +803,46 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   if(!Number.isFinite(amount)||amount<50||!Number.isFinite(maxLoss)||maxLoss<amount||!Number.isInteger(minimum)||minimum<20){stop('Invalid risk or signal settings');return}
   if(l.profit-amount < -maxLoss){stop('Daily loss exposure limit');return}
   if(arr.length<minimum){setStatus(`Warming up: ${arr.length}/${minimum} ticks`);return}
-  // Use the user-selected sample size, excluding the current tick. Split chronologically
-  // into independent training (60%) and validation (40%) windows.
+  // Keep the existing trailing-window validation check on prior ticks only.
   const past=arr.slice(0,-1);
   if(past.length<minimum){setStatus(`Warming up: ${past.length}/${minimum} completed ticks`);return}
   const sample=past.slice(-minimum);
-  const trainCount=Math.floor(sample.length*0.6);
-  const training=sample.slice(0,trainCount),validation=sample.slice(trainCount);
-  const counts=Array.from({length:10},(_,d)=>training.filter(x=>x===d).length);
+  const validation=sample.slice(Math.floor(sample.length*0.6));
   const validationCounts=Array.from({length:10},(_,d)=>validation.filter(x=>x===d).length);
-  // Consider ALL ten barriers. A submitted barrier remains in a three-trade
-  // cooldown (including through refreshes), rather than being traded repeatedly.
-  // Require the same original validation criterion; do not force a weaker trade.
-  const candidates=Array.from({length:10},(_,digit)=>({
-   digit,trainCount:counts[digit],validationRate:validationCounts[digit]/validation.length
-  })).filter(c=>!recentBarriers.current.includes(c.digit) && c.validationRate<0.1)
-    .sort((a,b)=>a.trainCount-b.trainCount || a.validationRate-b.validationRate || a.digit-b.digit);
+  // Select using the precise V1 forecast currently published to the dashboard.
+  // Low estimated appearance probability is 60% of the ranking; low/negative
+  // three-step score momentum is 40%. Both dimensions are normalized across
+  // the ten digits on this tick, so the weights have comparable scales.
+  // Retain the earlier validation filter and the three-purchase cooldown.
+  const ten=forecastRows.filter(r=>Number.isInteger(r.digit)&&r.digit>=0&&r.digit<=9
+   &&Number.isFinite(r.probability)&&Number.isFinite(r.momentum3));
+  if(ten.length!==10){setSelected(null);setStatus('Waiting for complete V1 forecast');return}
+  const probs=ten.map(r=>r.probability),momenta=ten.map(r=>r.momentum3);
+  const pMin=Math.min(...probs),pMax=Math.max(...probs);
+  const mMin=Math.min(...momenta),mMax=Math.max(...momenta);
+  const normalize=(value:number,lo:number,hi:number)=>hi>lo?(value-lo)/(hi-lo):0.5;
+  const candidates=ten.map(row=>({
+   digit:row.digit, probability:row.probability, momentum:row.momentum3,
+   validationRate:validationCounts[row.digit]/validation.length,
+   rankScore:0.60*normalize(row.probability,pMin,pMax)
+    +0.40*normalize(row.momentum3,mMin,mMax)
+  }))
+   .filter(c=>!recentBarriers.current.includes(c.digit)
+    &&c.validationRate<0.1 &&c.momentum<0)
+   .sort((a,b)=>a.rankScore-b.rankScore || a.probability-b.probability
+    || a.momentum-b.momentum || a.digit-b.digit);
   const candidate=candidates[0];
   if(!candidate){
    setSelected(null);
-   setStatus(`Waiting: no validated barrier outside last ${barrierCooldown} traded barriers`);
+   setSelectionReason('No negative-momentum barrier passed validation and cooldown');
+   setStatus(`Waiting: no negative-momentum validated barrier outside last ${barrierCooldown} traded barriers`);
    return;
   }
   const target=candidate.digit;
   setSelected(target);
-  // Below 10% in a finite validation window is only a selection heuristic;
-  // it is NOT statistically demonstrated next-tick predictability or profit.
+  setSelectionReason(`Digit ${target}: V1 probability ${(candidate.probability*100).toFixed(2)}%, momentum ${candidate.momentum.toFixed(2)}, validation ${(candidate.validationRate*100).toFixed(1)}%, combined rank ${candidate.rankScore.toFixed(3)}`);
+  // The score and validation rule are heuristics, NOT a demonstrated edge;
+  // even low estimated probability cannot guarantee a Differs win.
   if(isLive&&!liveApproved){stop('Live account requires explicit confirmation');return}
   // Reserve barrier + purchase slot synchronously BEFORE sending buy request.
   // A missing acknowledgment must not cause immediate reuse of this barrier.
@@ -845,7 +874,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
     if(session.current===entrySession&&current&&current.account===accountId){update({...current,uncertain:true});uncertain.current=true;stop(current.pendingContractId?'Settlement pending — automatic reconciliation on reconnect':'Purchase acknowledgement unknown — manual reconciliation required');setError(current.pendingContractId?`Contract #${current.pendingContractId} will be checked against Deriv before another trade.`:`Purchase confirmation missing. Check Deriv transaction history before resuming. ${String(e)}`)}
    }finally{busy.current=false}
   })();
- },[accountId,currentTick,dailyLoss,enforceFivePerDay,isConnected,isLive,liveApproved,minObservations,monitor,pipSize,stake,stop,symbol,ws]);
+ },[accountId,currentTick,dailyLoss,enforceFivePerDay,isConnected,isLive,liveApproved,minObservations,monitor,pipSize,publishForecast,stake,stop,symbol,ws]);
  // Explicit demo-only acknowledgement of a broker-verified settlement when no
  // contract ID was received. Do not modify attempts or realized P/L: the
  // unknown settlement cannot be reliably attributed to the local ledger.
@@ -876,7 +905,8 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   <label className="flex items-center gap-2 rounded-lg border border-slate-700 p-2"><input type="checkbox" checked={enforceFivePerDay} disabled={enabled||busy.current} onChange={e=>setEnforceFivePerDay(e.target.checked)}/><span>Enforce maximum 5 trades per UTC day</span></label>
   {isLive&&<label className="flex gap-2"><input type="checkbox" checked={liveApproved} disabled={enabled} onChange={e=>setLiveApproved(e.target.checked)}/> I understand these are real-money $50+ trades and authorize live execution.</label>}
   <div className="flex gap-2"><button className="rounded bg-emerald-700 px-4 py-2 text-white disabled:opacity-40" disabled={enabled||busy.current||!isConnected} onClick={start}>Start selective bot</button><button className="rounded bg-slate-600 px-4 py-2 text-white" onClick={()=>stop('Stopped — existing contract will still settle')}>Stop</button></div>
-  <p className="text-xs text-slate-400">Barrier rotation: excludes the last 3 submitted barriers (saved across refreshes). Only trades when a different barrier passes the existing validation rule. Rotation does not establish an edge.</p>
+  <p className="text-xs text-slate-400">Shared V1 engine: barrier ranking = 60% low forecast probability + 40% low momentum (normalized across all 10 digits). Requires negative momentum and the existing validation check. Last 3 submitted barriers are excluded across refreshes. This is a selection heuristic, not a proven edge.</p>
+  <p className="text-xs text-cyan-300" aria-live="polite">Selection: {selectionReason}</p>
   <p>Today: <strong>{ledger?.attempts??0}{enforceFivePerDay?'/5':''}</strong> attempted · Realized P/L <strong className={`font-black tabular-nums ${(ledger?.profit??0)>0?'text-green-400':(ledger?.profit??0)<0?'text-red-400':'text-slate-100'}`}>{(ledger?.profit??0)>0?'PROFIT ': (ledger?.profit??0)<0?'LOSS ':''}{(ledger?.profit??0)>=0?'+':'−'}${Math.abs(ledger?.profit??0).toFixed(2)}</strong> · Candidate digit: {selected??'—'}</p>
   <div className="grid grid-cols-1 gap-2 sm:grid-cols-3" aria-label="Persistent Digit Differs profit and loss">
    {([['Today (UTC)',ledger?.profit??0],['Last 30 UTC days',plTotals.last30Days],['All recorded days',plTotals.lifetime]] as const).map(([label,value])=><div key={label} className="rounded-lg border border-slate-700 bg-slate-900/70 p-3"><div className="text-xs text-slate-400">{label} realized P/L</div><div className={`text-xl font-black tabular-nums ${value>0?'text-green-400':value<0?'text-red-400':'text-slate-100'}`}>{value>=0?'+':'−'}${Math.abs(value).toFixed(2)}</div></div>)}
