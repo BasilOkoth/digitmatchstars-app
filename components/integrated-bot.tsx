@@ -689,6 +689,13 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
  const [minObservations,setMinObservations]=useState('100');
  const [notice,setNotice]=useState<TradeNotice|null>(null);
  const dismissNotice=useCallback(()=>setNotice(null),[]);
+ // Audible settlement notifications are independent of the Digit Match sounds.
+ const [settlementSound,setSettlementSound]=useState(true);
+ const settlementSoundRef=useRef(true);
+ useEffect(()=>{settlementSoundRef.current=settlementSound},[settlementSound]);
+ const notifySettlementSound=useCallback((profit:number)=>{
+  if(settlementSoundRef.current)tone(profit>0?'win':'loss');
+ },[]);
  const [enabled,setEnabled]=useState(false);
  const [liveApproved,setLiveApproved]=useState(false);
  const [ledger,setLedger]=useState<Ledger|null>(null);
@@ -759,12 +766,13 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
     update(next);uncertain.current=false;setError('');
     setStatus(`Reconciled contract #${saved.pendingContractId}: ${profit>=0?'WIN':'LOSS'} ${profit.toFixed(2)} USD — press Start to resume`);
     setNotice({id:Date.now(),contractId:saved.pendingContractId!,profit,kind:profit>0?'WIN':'LOSS'});
+    notifySettlementSound(profit);
    }catch(e){if(!cancelled)setStatus(`Reconciliation pending for #${saved.pendingContractId} — waiting for Deriv connection`)}
    finally{reconciling.current=false}
   };
   void reconcile();const timer=setInterval(()=>void reconcile(),5000);
   return()=>{cancelled=true;clearInterval(timer)};
- },[accountId,ws,isConnected]);
+ },[accountId,ws,isConnected,notifySettlementSound]);
  const monitor=useCallback(async(id:number,connection:DerivWS):Promise<any>=>new Promise((resolve,reject)=>{
   let done=false;let unsub:(()=>Promise<unknown>|void)|undefined;let poll:ReturnType<typeof setInterval>|undefined;
   const timeout=setTimeout(()=>finish(null,new Error('Settlement not confirmed; manual reconciliation required')),60000);
@@ -875,6 +883,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
      const next={...current,profit:Number((current.profit+profit).toFixed(2)),uncertain:false,pendingContractId:null};update(next);uncertain.current=false;
      setStatus(`Settled: ${profit>=0?'WIN':'LOSS'} ${profit.toFixed(2)} USD · ${next.attempts}${enforceFivePerDay?'/5':''}`);
      setNotice({id:Date.now(),contractId:id,profit,kind:profit>0?'WIN':'LOSS'});
+     notifySettlementSound(profit);
      if((enforceFivePerDay&&next.attempts>=5)||next.profit<=-maxLoss)stop('Daily risk/trade limit reached');
     }
    }catch(e){
@@ -882,7 +891,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
     if(session.current===entrySession&&current&&current.account===accountId){update({...current,uncertain:true});uncertain.current=true;stop(current.pendingContractId?'Settlement pending — automatic reconciliation on reconnect':'Purchase acknowledgement unknown — manual reconciliation required');setError(current.pendingContractId?`Contract #${current.pendingContractId} will be checked against Deriv before another trade.`:`Purchase confirmation missing. Check Deriv transaction history before resuming. ${String(e)}`)}
    }finally{busy.current=false}
   })();
- },[accountId,currentTick,dailyLoss,enforceFivePerDay,isConnected,isLive,liveApproved,minObservations,monitor,pipSize,publishForecast,stake,stop,symbol,ws]);
+ },[accountId,currentTick,dailyLoss,enforceFivePerDay,isConnected,isLive,liveApproved,minObservations,monitor,notifySettlementSound,pipSize,publishForecast,stake,stop,symbol,ws]);
  // Explicit demo-only acknowledgement of a broker-verified settlement when no
  // contract ID was received. Do not modify attempts or realized P/L: the
  // unknown settlement cannot be reliably attributed to the local ledger.
@@ -913,6 +922,11 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   <label className="flex items-center gap-2 rounded-lg border border-slate-700 p-2"><input type="checkbox" checked={enforceFivePerDay} disabled={enabled||busy.current} onChange={e=>setEnforceFivePerDay(e.target.checked)}/><span>Enforce maximum 5 trades per UTC day</span></label>
   {isLive&&<label className="flex gap-2"><input type="checkbox" checked={liveApproved} disabled={enabled} onChange={e=>setLiveApproved(e.target.checked)}/> I understand these are real-money $50+ trades and authorize live execution.</label>}
   <div className="flex gap-2"><button className="rounded bg-emerald-700 px-4 py-2 text-white disabled:opacity-40" disabled={enabled||busy.current||!isConnected} onClick={start}>Start selective bot</button><button className="rounded bg-slate-600 px-4 py-2 text-white" onClick={()=>stop('Stopped — existing contract will still settle')}>Stop</button></div>
+  <div className="flex flex-wrap items-center gap-2 text-xs">
+   <label className="flex items-center gap-2"><input type="checkbox" checked={settlementSound} onChange={e=>setSettlementSound(e.target.checked)}/> Play sounds on WIN and LOSS</label>
+   <button type="button" className="rounded border border-slate-500 px-2 py-1 text-emerald-300" onClick={()=>tone('win')}>Test WIN sound</button>
+   <button type="button" className="rounded border border-slate-500 px-2 py-1 text-rose-300" onClick={()=>tone('loss')}>Test LOSS sound</button>
+  </div>
   <p className="text-xs text-slate-400">Shared V1 dashboard: Only ranks 6–10 qualify; ranks 1–5 are always excluded. Among eligible bottom-five digits, ranking = 60% low forecast probability + 40% low momentum (normalized across all 10 digits). Requires negative momentum and the existing validation check. Last 3 submitted barriers are excluded across refreshes. This is a selection heuristic, not a proven edge.</p>
   <p className="text-xs text-cyan-300" aria-live="polite">Selection: {selectionReason}</p>
   <p>Today: <strong>{ledger?.attempts??0}{enforceFivePerDay?'/5':''}</strong> attempted · Realized P/L <strong className={`font-black tabular-nums ${(ledger?.profit??0)>0?'text-green-400':(ledger?.profit??0)<0?'text-red-400':'text-slate-100'}`}>{(ledger?.profit??0)>0?'PROFIT ': (ledger?.profit??0)<0?'LOSS ':''}{(ledger?.profit??0)>=0?'+':'−'}${Math.abs(ledger?.profit??0).toFixed(2)}</strong> · Candidate digit: {selected??'—'}</p>
