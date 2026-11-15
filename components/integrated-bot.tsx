@@ -25,6 +25,38 @@ const amount=(n:number)=>Math.round((n+Number.EPSILON)*100)/100;
 function tone(kind:'buy'|'win'|'loss'){
  try{const A=window.AudioContext;const ctx=new A();const osc=ctx.createOscillator();const gain=ctx.createGain();osc.type=kind==='win'?'sine':'triangle';osc.frequency.value=kind==='win'?880:kind==='buy'?650:250;gain.gain.value=.065;osc.connect(gain);gain.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+(kind==='win'?.42:.15));osc.onended=()=>{void ctx.close()}}catch{/* audio unsupported */}
 }
+// Digit Differs settlement audio. Prime the context from the Start button's
+// user gesture so later asynchronous Deriv settlement callbacks can play.
+let differsAudioContext: AudioContext | null = null;
+const primeDiffersAudio=()=>{
+ try{
+  const context=differsAudioContext??new window.AudioContext();
+  differsAudioContext=context;
+  if(context.state==='suspended')void context.resume().catch(()=>{});
+ }catch{/* Audio unsupported or blocked by browser settings. */}
+};
+const playDiffersSettlementSound=(kind:'WIN'|'LOSS')=>{
+ try{
+  const context=differsAudioContext;
+  if(!context)return;
+  if(context.state==='suspended')void context.resume().catch(()=>{});
+  const now=context.currentTime;
+  // Two short ascending tones for a win; two descending tones for a loss.
+  const notes=kind==='WIN'?[660,880]:[360,220];
+  notes.forEach((frequency,index)=>{
+   const osc=context.createOscillator();
+   const gain=context.createGain();
+   const start=now+index*.16;
+   osc.type=kind==='WIN'?'sine':'triangle';
+   osc.frequency.setValueAtTime(frequency,start);
+   gain.gain.setValueAtTime(0,start);
+   gain.gain.linearRampToValueAtTime(.09,start+.015);
+   gain.gain.exponentialRampToValueAtTime(.001,start+.15);
+   osc.connect(gain);gain.connect(context.destination);
+   osc.start(start);osc.stop(start+.16);
+  });
+ }catch{/* Audio unsupported. The settlement and ledger still work. */}
+};
 type TradeNotice={id:number;profit:number;contractId:number;kind:'WIN'|'LOSS'};
 function SettlementToast({notice,onDismiss}:{notice:TradeNotice|null;onDismiss:()=>void}){
  useEffect(()=>{if(!notice)return;const timer=window.setTimeout(onDismiss,5500);return()=>window.clearTimeout(timer)},[notice,onDismiss]);
@@ -679,23 +711,12 @@ const digitOf=(tick:Tick,pipSize:number)=>{
  return Number(tick.quote.toFixed(p).slice(-1));
 };
 function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,pipSize,symbol,onBusyChange}:{ws:DerivWS|null;accountId:string|null;accountType:string|null;isConnected:boolean;currentTick:Tick|null;pipSize:number;symbol:string;onBusyChange:(busy:boolean)=>void}){
- const {publishForecast}=useEngineForecast();
- const differsForecast=useRef(new NextTickIntelligence());
- const forecastSequence=useRef(0);
- const [selectionReason,setSelectionReason]=useState('Awaiting all-ten forecast');
  const [stake,setStake]=useState('50');
  const [dailyLoss,setDailyLoss]=useState('250');
  const [enforceFivePerDay,setEnforceFivePerDay]=useState(true);
  const [minObservations,setMinObservations]=useState('100');
  const [notice,setNotice]=useState<TradeNotice|null>(null);
  const dismissNotice=useCallback(()=>setNotice(null),[]);
- // Audible settlement notifications are independent of the Digit Match sounds.
- const [settlementSound,setSettlementSound]=useState(true);
- const settlementSoundRef=useRef(true);
- useEffect(()=>{settlementSoundRef.current=settlementSound},[settlementSound]);
- const notifySettlementSound=useCallback((profit:number)=>{
-  if(settlementSoundRef.current)tone(profit>0?'win':'loss');
- },[]);
  const [enabled,setEnabled]=useState(false);
  const [liveApproved,setLiveApproved]=useState(false);
  const [ledger,setLedger]=useState<Ledger|null>(null);
@@ -705,10 +726,9 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
  const [settlementVerified,setSettlementVerified]=useState(false);
  const [recent,setRecent]=useState<number[]>([]);
  const [selected,setSelected]=useState<number|null>(null);
- // Avoid immediately repeating the same submitted barrier. With selection
- // restricted to only ranks 9 and 10, a three-barrier cooldown would block
- // both options; a one-barrier cooldown permits alternation when eligible.
- const barrierCooldown=1;
+ // Avoid repeatedly purchasing the same barrier. These last three submitted
+ // barriers are persisted separately from the daily P/L ledger across restarts.
+ const barrierCooldown=3;
  const recentBarriers=useRef<number[]>([]);
  const barrierKey=(account:string,market:string)=>`dms-differs-barrier-history:v1:${account}:${market}`;
  const readBarriers=(account:string,market:string):number[]=>{
@@ -736,7 +756,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
  const stop=useCallback((message:string)=>{enabledRef.current=false;setEnabled(false);setStatus(message)},[]);
  useEffect(()=>{
   setSettlementVerified(false);
-  stop('Stopped — account or market changed');busy.current=false;uncertain.current=false;history.current=[];lastTick.current='';differsForecast.current.reset();forecastSequence.current=0;setSelectionReason('Awaiting all-ten forecast');setRecent([]);setSelected(null);setLiveApproved(false);
+  stop('Stopped — account or market changed');busy.current=false;uncertain.current=false;history.current=[];lastTick.current='';setRecent([]);setSelected(null);setLiveApproved(false);
   if(accountId){const l=readLedger(accountId);latestLedger.current=l;setLedger(l);setPLTotals(readPLTotals(accountId));uncertain.current=l.uncertain}else{latestLedger.current=null;setLedger(null);setPLTotals({lifetime:0,last30Days:0,days:0})}
   recentBarriers.current=accountId?readBarriers(accountId,symbol):[];
   session.current=`${accountId??''}:${symbol}`;
@@ -767,13 +787,13 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
     update(next);uncertain.current=false;setError('');
     setStatus(`Reconciled contract #${saved.pendingContractId}: ${profit>=0?'WIN':'LOSS'} ${profit.toFixed(2)} USD — press Start to resume`);
     setNotice({id:Date.now(),contractId:saved.pendingContractId!,profit,kind:profit>0?'WIN':'LOSS'});
-    notifySettlementSound(profit);
+    playDiffersSettlementSound(profit>0?'WIN':'LOSS');
    }catch(e){if(!cancelled)setStatus(`Reconciliation pending for #${saved.pendingContractId} — waiting for Deriv connection`)}
    finally{reconciling.current=false}
   };
   void reconcile();const timer=setInterval(()=>void reconcile(),5000);
   return()=>{cancelled=true;clearInterval(timer)};
- },[accountId,ws,isConnected,notifySettlementSound]);
+ },[accountId,ws,isConnected]);
  const monitor=useCallback(async(id:number,connection:DerivWS):Promise<any>=>new Promise((resolve,reject)=>{
   let done=false;let unsub:(()=>Promise<unknown>|void)|undefined;let poll:ReturnType<typeof setInterval>|undefined;
   const timeout=setTimeout(()=>finish(null,new Error('Settlement not confirmed; manual reconciliation required')),60000);
@@ -793,17 +813,6 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   if(!Number.isInteger(digit)||digit<0||digit>9)return;
   history.current=[...history.current.slice(-4999),digit];
   const arr=history.current;setRecent(arr.slice(-50));
-  // Publish the SAME ten-digit V1 probability/score/momentum snapshot used
-  // for Differs barrier ranking to the existing dashboard context. Match mode
-  // is unmounted here, so Differs must maintain and publish its own V1 stream.
-  const forecastRows=differsForecast.current.observe(digit);
-  const sequence=++forecastSequence.current;
-  if(forecastRows.length===10){
-   publishForecast({symbol,sequence,rows:forecastRows.map(r=>({
-    digit:r.digit,score:r.score,probability:r.probability,
-    momentum3:r.momentum3,positiveSteps:r.positiveSteps
-   })),lockedDigit:null});
-  }
   if(!enabledRef.current||busy.current||uncertain.current)return;
   const l=latestLedger.current;
   if(!l||l.account!==accountId||l.day!==dayUTC()){stop('Daily boundary reached — restart to load new UTC day');return}
@@ -812,54 +821,32 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   if(!Number.isFinite(amount)||amount<50||!Number.isFinite(maxLoss)||maxLoss<amount||!Number.isInteger(minimum)||minimum<20){stop('Invalid risk or signal settings');return}
   if(l.profit-amount < -maxLoss){stop('Daily loss exposure limit');return}
   if(arr.length<minimum){setStatus(`Warming up: ${arr.length}/${minimum} ticks`);return}
-  // Keep the existing trailing-window validation check on prior ticks only.
+  // Use the user-selected sample size, excluding the current tick. Split chronologically
+  // into independent training (60%) and validation (40%) windows.
   const past=arr.slice(0,-1);
   if(past.length<minimum){setStatus(`Warming up: ${past.length}/${minimum} completed ticks`);return}
   const sample=past.slice(-minimum);
-  const validation=sample.slice(Math.floor(sample.length*0.6));
+  const trainCount=Math.floor(sample.length*0.6);
+  const training=sample.slice(0,trainCount),validation=sample.slice(trainCount);
+  const counts=Array.from({length:10},(_,d)=>training.filter(x=>x===d).length);
   const validationCounts=Array.from({length:10},(_,d)=>validation.filter(x=>x===d).length);
-  // Select using the precise V1 forecast currently published to the dashboard.
-  // Low estimated appearance probability is 60% of the ranking; low/negative
-  // three-step score momentum is 40%. Both dimensions are normalized across
-  // the ten digits on this tick, so the weights have comparable scales.
-  // Retain the earlier validation filter and the three-purchase cooldown.
-  const ten=forecastRows.filter(r=>Number.isInteger(r.digit)&&r.digit>=0&&r.digit<=9
-   &&Number.isFinite(r.probability)&&Number.isFinite(r.momentum3));
-  if(ten.length!==10){setSelected(null);setStatus('Waiting for complete V1 forecast');return}
-  const probs=ten.map(r=>r.probability),momenta=ten.map(r=>r.momentum3);
-  const pMin=Math.min(...probs),pMax=Math.max(...probs);
-  const mMin=Math.min(...momenta),mMax=Math.max(...momenta);
-  const normalize=(value:number,lo:number,hi:number)=>hi>lo?(value-lo)/(hi-lo):0.5;
-  // V1's published row order IS the dashboard order (1 = highest score).
-  // DIGITDIFF may buy ONLY the two bottom-ranked dashboard digits.
-  const dashboardRank=new Map(ten.map((row,index)=>[row.digit,index+1]));
-  const candidates=ten.map(row=>({
-   digit:row.digit, dashboardRank:dashboardRank.get(row.digit)!, probability:row.probability, momentum:row.momentum3,
-   validationRate:validationCounts[row.digit]/validation.length,
-   rankScore:0.60*normalize(row.probability,pMin,pMax)
-    +0.40*normalize(row.momentum3,mMin,mMax)
-  }))
-   .filter(c=>c.dashboardRank>=9
-    &&!recentBarriers.current.includes(c.digit)
-    &&c.validationRate<0.1 &&c.momentum<0)
-   .sort((a,b)=>a.rankScore-b.rankScore || a.probability-b.probability
-    || a.momentum-b.momentum || a.digit-b.digit);
+  // Consider ALL ten barriers. A submitted barrier remains in a three-trade
+  // cooldown (including through refreshes), rather than being traded repeatedly.
+  // Require the same original validation criterion; do not force a weaker trade.
+  const candidates=Array.from({length:10},(_,digit)=>({
+   digit,trainCount:counts[digit],validationRate:validationCounts[digit]/validation.length
+  })).filter(c=>!recentBarriers.current.includes(c.digit) && c.validationRate<0.1)
+    .sort((a,b)=>a.trainCount-b.trainCount || a.validationRate-b.validationRate || a.digit-b.digit);
   const candidate=candidates[0];
   if(!candidate){
    setSelected(null);
-   setSelectionReason('No dashboard rank 9–10 barrier passed negative momentum, validation and cooldown');
-   setStatus(`Waiting: no V1 dashboard rank 9–10 barrier passed negative momentum, validation and last ${barrierCooldown} traded barriers`);
+   setStatus(`Waiting: no validated barrier outside last ${barrierCooldown} traded barriers`);
    return;
   }
   const target=candidate.digit;
-  // Fail closed if the dashboard ordering ever diverges from selection.
-  if(forecastRows.findIndex(r=>r.digit===target)<8){
-   setSelected(null);setStatus('Blocked: selected barrier is not dashboard rank 9 or 10');return;
-  }
   setSelected(target);
-  setSelectionReason(`Digit ${target}: dashboard rank ${candidate.dashboardRank}/10, V1 probability ${(candidate.probability*100).toFixed(2)}%, momentum ${candidate.momentum.toFixed(2)}, validation ${(candidate.validationRate*100).toFixed(1)}%, combined rank ${candidate.rankScore.toFixed(3)}`);
-  // The score and validation rule are heuristics, NOT a demonstrated edge;
-  // even low estimated probability cannot guarantee a Differs win.
+  // Below 10% in a finite validation window is only a selection heuristic;
+  // it is NOT statistically demonstrated next-tick predictability or profit.
   if(isLive&&!liveApproved){stop('Live account requires explicit confirmation');return}
   // Reserve barrier + purchase slot synchronously BEFORE sending buy request.
   // A missing acknowledgment must not cause immediate reuse of this barrier.
@@ -884,7 +871,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
      const next={...current,profit:Number((current.profit+profit).toFixed(2)),uncertain:false,pendingContractId:null};update(next);uncertain.current=false;
      setStatus(`Settled: ${profit>=0?'WIN':'LOSS'} ${profit.toFixed(2)} USD · ${next.attempts}${enforceFivePerDay?'/5':''}`);
      setNotice({id:Date.now(),contractId:id,profit,kind:profit>0?'WIN':'LOSS'});
-     notifySettlementSound(profit);
+     playDiffersSettlementSound(profit>0?'WIN':'LOSS');
      if((enforceFivePerDay&&next.attempts>=5)||next.profit<=-maxLoss)stop('Daily risk/trade limit reached');
     }
    }catch(e){
@@ -892,7 +879,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
     if(session.current===entrySession&&current&&current.account===accountId){update({...current,uncertain:true});uncertain.current=true;stop(current.pendingContractId?'Settlement pending — automatic reconciliation on reconnect':'Purchase acknowledgement unknown — manual reconciliation required');setError(current.pendingContractId?`Contract #${current.pendingContractId} will be checked against Deriv before another trade.`:`Purchase confirmation missing. Check Deriv transaction history before resuming. ${String(e)}`)}
    }finally{busy.current=false}
   })();
- },[accountId,currentTick,dailyLoss,enforceFivePerDay,isConnected,isLive,liveApproved,minObservations,monitor,notifySettlementSound,pipSize,publishForecast,stake,stop,symbol,ws]);
+ },[accountId,currentTick,dailyLoss,enforceFivePerDay,isConnected,isLive,liveApproved,minObservations,monitor,pipSize,stake,stop,symbol,ws]);
  // Explicit demo-only acknowledgement of a broker-verified settlement when no
  // contract ID was received. Do not modify attempts or realized P/L: the
  // unknown settlement cannot be reliably attributed to the local ledger.
@@ -911,6 +898,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   if(enforceFivePerDay&&l.attempts>=5){setError('Five trades already attempted today (UTC). Disable the five-trade limit to continue, subject to the loss cap.');return}
   if(isLive&&!liveApproved){setError('Confirm live trading first.');return}
   if(Number(stake)<50||!Number.isFinite(Number(stake))||Number(dailyLoss)<Number(stake)||(!Number.isInteger(Number(minObservations))||Number(minObservations)<20)){setError('Invalid settings: stake ≥ $50, loss cap ≥ stake, minimum ticks ≥ 20.');return}
+  primeDiffersAudio();
   enabledRef.current=true;setEnabled(true);setStatus('Monitoring ticks for qualifying signal');
  };
  return <section className="rounded-xl border border-slate-600 p-4 space-y-3 text-sm">
@@ -923,13 +911,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   <label className="flex items-center gap-2 rounded-lg border border-slate-700 p-2"><input type="checkbox" checked={enforceFivePerDay} disabled={enabled||busy.current} onChange={e=>setEnforceFivePerDay(e.target.checked)}/><span>Enforce maximum 5 trades per UTC day</span></label>
   {isLive&&<label className="flex gap-2"><input type="checkbox" checked={liveApproved} disabled={enabled} onChange={e=>setLiveApproved(e.target.checked)}/> I understand these are real-money $50+ trades and authorize live execution.</label>}
   <div className="flex gap-2"><button className="rounded bg-emerald-700 px-4 py-2 text-white disabled:opacity-40" disabled={enabled||busy.current||!isConnected} onClick={start}>Start selective bot</button><button className="rounded bg-slate-600 px-4 py-2 text-white" onClick={()=>stop('Stopped — existing contract will still settle')}>Stop</button></div>
-  <div className="flex flex-wrap items-center gap-2 text-xs">
-   <label className="flex items-center gap-2"><input type="checkbox" checked={settlementSound} onChange={e=>setSettlementSound(e.target.checked)}/> Play sounds on WIN and LOSS</label>
-   <button type="button" className="rounded border border-slate-500 px-2 py-1 text-emerald-300" onClick={()=>tone('win')}>Test WIN sound</button>
-   <button type="button" className="rounded border border-slate-500 px-2 py-1 text-rose-300" onClick={()=>tone('loss')}>Test LOSS sound</button>
-  </div>
-  <p className="text-xs text-slate-400">Shared V1 dashboard: Only ranks 9 and 10 qualify; ranks 1–8 are always excluded. Among the eligible last two digits, ranking = 60% low forecast probability + 40% low momentum (normalized across all 10 digits). Requires negative momentum and the existing validation check. The most recently submitted barrier is excluded across refreshes, allowing alternation between ranks 9 and 10. This is a selection heuristic, not a proven edge.</p>
-  <p className="text-xs text-cyan-300" aria-live="polite">Selection: {selectionReason}</p>
+  <p className="text-xs text-slate-400">Barrier rotation: excludes the last 3 submitted barriers (saved across refreshes). Only trades when a different barrier passes the existing validation rule. Rotation does not establish an edge.</p>
   <p>Today: <strong>{ledger?.attempts??0}{enforceFivePerDay?'/5':''}</strong> attempted · Realized P/L <strong className={`font-black tabular-nums ${(ledger?.profit??0)>0?'text-green-400':(ledger?.profit??0)<0?'text-red-400':'text-slate-100'}`}>{(ledger?.profit??0)>0?'PROFIT ': (ledger?.profit??0)<0?'LOSS ':''}{(ledger?.profit??0)>=0?'+':'−'}${Math.abs(ledger?.profit??0).toFixed(2)}</strong> · Candidate digit: {selected??'—'}</p>
   <div className="grid grid-cols-1 gap-2 sm:grid-cols-3" aria-label="Persistent Digit Differs profit and loss">
    {([['Today (UTC)',ledger?.profit??0],['Last 30 UTC days',plTotals.last30Days],['All recorded days',plTotals.lifetime]] as const).map(([label,value])=><div key={label} className="rounded-lg border border-slate-700 bg-slate-900/70 p-3"><div className="text-xs text-slate-400">{label} realized P/L</div><div className={`text-xl font-black tabular-nums ${value>0?'text-green-400':value<0?'text-red-400':'text-slate-100'}`}>{value>=0?'+':'−'}${Math.abs(value).toFixed(2)}</div></div>)}
