@@ -694,6 +694,21 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
  const [settlementVerified,setSettlementVerified]=useState(false);
  const [recent,setRecent]=useState<number[]>([]);
  const [selected,setSelected]=useState<number|null>(null);
+ // Avoid repeatedly purchasing the same barrier. These last three submitted
+ // barriers are persisted separately from the daily P/L ledger across restarts.
+ const barrierCooldown=3;
+ const recentBarriers=useRef<number[]>([]);
+ const barrierKey=(account:string,market:string)=>`dms-differs-barrier-history:v1:${account}:${market}`;
+ const readBarriers=(account:string,market:string):number[]=>{
+  try{const saved=JSON.parse(localStorage.getItem(barrierKey(account,market))||'[]');
+   return Array.isArray(saved)?saved.filter((d:unknown)=>Number.isInteger(d)&&Number(d)>=0&&Number(d)<=9).slice(-barrierCooldown):[];
+  }catch{return []}
+ };
+ const reserveBarrier=(account:string,market:string,digit:number)=>{
+  const updated=[...recentBarriers.current,digit].slice(-barrierCooldown);
+  recentBarriers.current=updated;
+  try{localStorage.setItem(barrierKey(account,market),JSON.stringify(updated))}catch{}
+ };
  const busy=useRef(false);
  useEffect(()=>{onBusyChange(enabled||busy.current||uncertain.current)},[enabled,status,onBusyChange]);
  const enabledRef=useRef(false);
@@ -711,6 +726,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   setSettlementVerified(false);
   stop('Stopped — account or market changed');busy.current=false;uncertain.current=false;history.current=[];lastTick.current='';setRecent([]);setSelected(null);setLiveApproved(false);
   if(accountId){const l=readLedger(accountId);latestLedger.current=l;setLedger(l);setPLTotals(readPLTotals(accountId));uncertain.current=l.uncertain}else{latestLedger.current=null;setLedger(null);setPLTotals({lifetime:0,last30Days:0,days:0})}
+  recentBarriers.current=accountId?readBarriers(accountId,symbol):[];
   session.current=`${accountId??''}:${symbol}`;
  },[accountId,symbol,stop]);
  // Reconcile only a broker-acknowledged contract ID. Never repeat a buy.
@@ -780,16 +796,29 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   const trainCount=Math.floor(sample.length*0.6);
   const training=sample.slice(0,trainCount),validation=sample.slice(trainCount);
   const counts=Array.from({length:10},(_,d)=>training.filter(x=>x===d).length);
-  const target=counts.indexOf(Math.min(...counts));
-  const valHits=validation.filter(d=>d===target).length;
+  const validationCounts=Array.from({length:10},(_,d)=>validation.filter(x=>x===d).length);
+  // Consider ALL ten barriers. A submitted barrier remains in a three-trade
+  // cooldown (including through refreshes), rather than being traded repeatedly.
+  // Require the same original validation criterion; do not force a weaker trade.
+  const candidates=Array.from({length:10},(_,digit)=>({
+   digit,trainCount:counts[digit],validationRate:validationCounts[digit]/validation.length
+  })).filter(c=>!recentBarriers.current.includes(c.digit) && c.validationRate<0.1)
+    .sort((a,b)=>a.trainCount-b.trainCount || a.validationRate-b.validationRate || a.digit-b.digit);
+  const candidate=candidates[0];
+  if(!candidate){
+   setSelected(null);
+   setStatus(`Waiting: no validated barrier outside last ${barrierCooldown} traded barriers`);
+   return;
+  }
+  const target=candidate.digit;
   setSelected(target);
-  // Simple selective check: require the chosen digit to occur less often than
-  // the uniform 10% baseline in a separate validation window. This is not
-  // statistically verified predictive power or a guarantee of profitability.
-  if(valHits/validation.length>=0.1){setStatus(`Waiting: digit ${target} validation frequency ${(100*valHits/validation.length).toFixed(1)}% is not below 10%`);return}
+  // Below 10% in a finite validation window is only a selection heuristic;
+  // it is NOT statistically demonstrated next-tick predictability or profit.
   if(isLive&&!liveApproved){stop('Live account requires explicit confirmation');return}
-  // Reserve a purchase slot synchronously BEFORE sending the buy request.
+  // Reserve barrier + purchase slot synchronously BEFORE sending buy request.
+  // A missing acknowledgment must not cause immediate reuse of this barrier.
   busy.current=true;
+  reserveBarrier(accountId,symbol,target);
   const reserved={...l,attempts:l.attempts+1};update(reserved);
   setStatus(`Submitting DIGITDIFF barrier ${target} (${reserved.attempts}${enforceFivePerDay?'/5':''})`);
   const entrySession=session.current;
@@ -847,6 +876,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   <label className="flex items-center gap-2 rounded-lg border border-slate-700 p-2"><input type="checkbox" checked={enforceFivePerDay} disabled={enabled||busy.current} onChange={e=>setEnforceFivePerDay(e.target.checked)}/><span>Enforce maximum 5 trades per UTC day</span></label>
   {isLive&&<label className="flex gap-2"><input type="checkbox" checked={liveApproved} disabled={enabled} onChange={e=>setLiveApproved(e.target.checked)}/> I understand these are real-money $50+ trades and authorize live execution.</label>}
   <div className="flex gap-2"><button className="rounded bg-emerald-700 px-4 py-2 text-white disabled:opacity-40" disabled={enabled||busy.current||!isConnected} onClick={start}>Start selective bot</button><button className="rounded bg-slate-600 px-4 py-2 text-white" onClick={()=>stop('Stopped — existing contract will still settle')}>Stop</button></div>
+  <p className="text-xs text-slate-400">Barrier rotation: excludes the last 3 submitted barriers (saved across refreshes). Only trades when a different barrier passes the existing validation rule. Rotation does not establish an edge.</p>
   <p>Today: <strong>{ledger?.attempts??0}{enforceFivePerDay?'/5':''}</strong> attempted · Realized P/L <strong className={`font-black tabular-nums ${(ledger?.profit??0)>0?'text-green-400':(ledger?.profit??0)<0?'text-red-400':'text-slate-100'}`}>{(ledger?.profit??0)>0?'PROFIT ': (ledger?.profit??0)<0?'LOSS ':''}{(ledger?.profit??0)>=0?'+':'−'}${Math.abs(ledger?.profit??0).toFixed(2)}</strong> · Candidate digit: {selected??'—'}</p>
   <div className="grid grid-cols-1 gap-2 sm:grid-cols-3" aria-label="Persistent Digit Differs profit and loss">
    {([['Today (UTC)',ledger?.profit??0],['Last 30 UTC days',plTotals.last30Days],['All recorded days',plTotals.lifetime]] as const).map(([label,value])=><div key={label} className="rounded-lg border border-slate-700 bg-slate-900/70 p-3"><div className="text-xs text-slate-400">{label} realized P/L</div><div className={`text-xl font-black tabular-nums ${value>0?'text-green-400':value<0?'text-red-400':'text-slate-100'}`}>{value>=0?'+':'−'}${Math.abs(value).toFixed(2)}</div></div>)}
