@@ -639,13 +639,41 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
 
 type Ledger={day:string;account:string;attempts:number;profit:number;uncertain:boolean;pendingContractId?:number|null};
 const dayUTC=()=>new Date().toISOString().slice(0,10);
-const storageKey=(account:string)=>`dms-differs-v1:${account}:${dayUTC()}`;
+const storageKey=(account:string,day:string=dayUTC())=>`dms-differs-v1:${account}:${day}`;
 const readLedger=(account:string):Ledger=>{
  const fresh={day:dayUTC(),account,attempts:0,profit:0,uncertain:false,pendingContractId:null};
  try{const raw=localStorage.getItem(storageKey(account));if(!raw)return fresh;const v=JSON.parse(raw);if(v.day===fresh.day&&v.account===account&&Number.isInteger(v.attempts)&&v.attempts>=0&&Number.isFinite(v.profit))return {...fresh,...v}}catch{}
  return fresh;
 };
-const persist=(ledger:Ledger)=>{try{localStorage.setItem(storageKey(ledger.account),JSON.stringify(ledger))}catch{}};
+// Daily realized P/L is stored under one per-account, per-UTC-day key.
+// Rebuild cumulative totals from those ledgers so the display survives a
+// browser refresh and UTC day rollover without resetting older profits.
+type PLTotals={lifetime:number;last30Days:number;days:number};
+const readPLTotals=(account:string):PLTotals=>{
+ const result:PLTotals={lifetime:0,last30Days:0,days:0};
+ const prefix=`dms-differs-v1:${account}:`;
+ const today=new Date();
+ const todayUTC=Date.UTC(today.getUTCFullYear(),today.getUTCMonth(),today.getUTCDate());
+ try{
+  for(let i=0;i<localStorage.length;i++){
+   const key=localStorage.key(i);
+   if(!key?.startsWith(prefix))continue;
+   const day=key.slice(prefix.length);
+   if(!/^\d{4}-\d{2}-\d{2}$/.test(day))continue;
+   const v=JSON.parse(localStorage.getItem(key)||'null') as Ledger|null;
+   if(!v||v.account!==account||v.day!==day||!Number.isFinite(v.profit))continue;
+   result.days++;
+   result.lifetime+=v.profit;
+   const dayMs=Date.parse(`${day}T00:00:00Z`);
+   const ageDays=(todayUTC-dayMs)/86400000;
+   if(Number.isInteger(ageDays)&&ageDays>=0&&ageDays<30)result.last30Days+=v.profit;
+  }
+ }catch{/* Browser storage unavailable: numbers can be incomplete. */}
+ result.lifetime=amount(result.lifetime);
+ result.last30Days=amount(result.last30Days);
+ return result;
+};
+const persist=(ledger:Ledger)=>{try{localStorage.setItem(storageKey(ledger.account,ledger.day),JSON.stringify(ledger))}catch{}};
 const digitOf=(tick:Tick,pipSize:number)=>{
  const p=Number.isInteger(pipSize)&&pipSize>=0&&pipSize<=12?pipSize:2;
  return Number(tick.quote.toFixed(p).slice(-1));
@@ -660,6 +688,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
  const [enabled,setEnabled]=useState(false);
  const [liveApproved,setLiveApproved]=useState(false);
  const [ledger,setLedger]=useState<Ledger|null>(null);
+ const [plTotals,setPLTotals]=useState<PLTotals>({lifetime:0,last30Days:0,days:0});
  const [status,setStatus]=useState('Stopped');
  const [error,setError]=useState('');
  const [settlementVerified,setSettlementVerified]=useState(false);
@@ -676,12 +705,12 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
  const reconciling=useRef(false);
  const demo=Boolean(accountId)&&(/demo|virtual/i.test(accountType??'')||/^VRT/i.test(accountId??''));
  const isLive=Boolean(accountId)&&!demo;
- const update=(v:Ledger)=>{latestLedger.current=v;setLedger(v);persist(v)};
+ const update=(v:Ledger)=>{latestLedger.current=v;setLedger(v);persist(v);setPLTotals(readPLTotals(v.account))};
  const stop=useCallback((message:string)=>{enabledRef.current=false;setEnabled(false);setStatus(message)},[]);
  useEffect(()=>{
   setSettlementVerified(false);
   stop('Stopped — account or market changed');busy.current=false;uncertain.current=false;history.current=[];lastTick.current='';setRecent([]);setSelected(null);setLiveApproved(false);
-  if(accountId){const l=readLedger(accountId);latestLedger.current=l;setLedger(l);uncertain.current=l.uncertain}else{latestLedger.current=null;setLedger(null)}
+  if(accountId){const l=readLedger(accountId);latestLedger.current=l;setLedger(l);setPLTotals(readPLTotals(accountId));uncertain.current=l.uncertain}else{latestLedger.current=null;setLedger(null);setPLTotals({lifetime:0,last30Days:0,days:0})}
   session.current=`${accountId??''}:${symbol}`;
  },[accountId,symbol,stop]);
  // Reconcile only a broker-acknowledged contract ID. Never repeat a buy.
@@ -819,6 +848,10 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   {isLive&&<label className="flex gap-2"><input type="checkbox" checked={liveApproved} disabled={enabled} onChange={e=>setLiveApproved(e.target.checked)}/> I understand these are real-money $50+ trades and authorize live execution.</label>}
   <div className="flex gap-2"><button className="rounded bg-emerald-700 px-4 py-2 text-white disabled:opacity-40" disabled={enabled||busy.current||!isConnected} onClick={start}>Start selective bot</button><button className="rounded bg-slate-600 px-4 py-2 text-white" onClick={()=>stop('Stopped — existing contract will still settle')}>Stop</button></div>
   <p>Today: <strong>{ledger?.attempts??0}{enforceFivePerDay?'/5':''}</strong> attempted · Realized P/L <strong className={`font-black tabular-nums ${(ledger?.profit??0)>0?'text-green-400':(ledger?.profit??0)<0?'text-red-400':'text-slate-100'}`}>{(ledger?.profit??0)>0?'PROFIT ': (ledger?.profit??0)<0?'LOSS ':''}{(ledger?.profit??0)>=0?'+':'−'}${Math.abs(ledger?.profit??0).toFixed(2)}</strong> · Candidate digit: {selected??'—'}</p>
+  <div className="grid grid-cols-1 gap-2 sm:grid-cols-3" aria-label="Persistent Digit Differs profit and loss">
+   {([['Today (UTC)',ledger?.profit??0],['Last 30 UTC days',plTotals.last30Days],['All recorded days',plTotals.lifetime]] as const).map(([label,value])=><div key={label} className="rounded-lg border border-slate-700 bg-slate-900/70 p-3"><div className="text-xs text-slate-400">{label} realized P/L</div><div className={`text-xl font-black tabular-nums ${value>0?'text-green-400':value<0?'text-red-400':'text-slate-100'}`}>{value>=0?'+':'−'}${Math.abs(value).toFixed(2)}</div></div>)}
+  </div>
+  <p className="text-xs text-slate-400">P/L is restored from this browser's saved daily ledgers for the connected account ({plTotals.days} recorded UTC days). Day-to-day totals do not reset when a new day begins. Browser storage is not a cross-device or broker-backed record; reconcile with Deriv statements.</p>
   {demo&&ledger?.uncertain&&!ledger.pendingContractId&&<div className="space-y-2 rounded-xl border border-amber-500/50 bg-amber-500/10 p-3 text-amber-100">
    <div className="font-extrabold text-amber-300">Purchase confirmation missing</div>
    <p className="text-xs">Only use this recovery after checking Deriv demo transaction history and confirming the last purchase has settled and no related contract remains open. This does not change recorded profit or trade attempts.</p>
