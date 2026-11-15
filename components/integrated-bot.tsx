@@ -705,9 +705,10 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
  const [settlementVerified,setSettlementVerified]=useState(false);
  const [recent,setRecent]=useState<number[]>([]);
  const [selected,setSelected]=useState<number|null>(null);
- // Avoid repeatedly purchasing the same barrier. These last three submitted
- // barriers are persisted separately from the daily P/L ledger across restarts.
- const barrierCooldown=3;
+ // Avoid immediately repeating the same submitted barrier. With selection
+ // restricted to only ranks 9 and 10, a three-barrier cooldown would block
+ // both options; a one-barrier cooldown permits alternation when eligible.
+ const barrierCooldown=1;
  const recentBarriers=useRef<number[]>([]);
  const barrierKey=(account:string,market:string)=>`dms-differs-barrier-history:v1:${account}:${market}`;
  const readBarriers=(account:string,market:string):number[]=>{
@@ -830,7 +831,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   const mMin=Math.min(...momenta),mMax=Math.max(...momenta);
   const normalize=(value:number,lo:number,hi:number)=>hi>lo?(value-lo)/(hi-lo):0.5;
   // V1's published row order IS the dashboard order (1 = highest score).
-  // DIGITDIFF must never buy the highlighted top digit or any top-half digit.
+  // DIGITDIFF may buy ONLY the two bottom-ranked dashboard digits.
   const dashboardRank=new Map(ten.map((row,index)=>[row.digit,index+1]));
   const candidates=ten.map(row=>({
    digit:row.digit, dashboardRank:dashboardRank.get(row.digit)!, probability:row.probability, momentum:row.momentum3,
@@ -838,7 +839,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
    rankScore:0.60*normalize(row.probability,pMin,pMax)
     +0.40*normalize(row.momentum3,mMin,mMax)
   }))
-   .filter(c=>c.dashboardRank>=6
+   .filter(c=>c.dashboardRank>=9
     &&!recentBarriers.current.includes(c.digit)
     &&c.validationRate<0.1 &&c.momentum<0)
    .sort((a,b)=>a.rankScore-b.rankScore || a.probability-b.probability
@@ -846,14 +847,14 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   const candidate=candidates[0];
   if(!candidate){
    setSelected(null);
-   setSelectionReason('No dashboard bottom-five barrier passed negative momentum, validation and cooldown');
-   setStatus(`Waiting: no V1 dashboard rank 6–10 barrier passed negative momentum, validation and last ${barrierCooldown} traded barriers`);
+   setSelectionReason('No dashboard rank 9–10 barrier passed negative momentum, validation and cooldown');
+   setStatus(`Waiting: no V1 dashboard rank 9–10 barrier passed negative momentum, validation and last ${barrierCooldown} traded barriers`);
    return;
   }
   const target=candidate.digit;
   // Fail closed if the dashboard ordering ever diverges from selection.
-  if(forecastRows.findIndex(r=>r.digit===target)<5){
-   setSelected(null);setStatus('Blocked: selected barrier is in dashboard top five');return;
+  if(forecastRows.findIndex(r=>r.digit===target)<8){
+   setSelected(null);setStatus('Blocked: selected barrier is not dashboard rank 9 or 10');return;
   }
   setSelected(target);
   setSelectionReason(`Digit ${target}: dashboard rank ${candidate.dashboardRank}/10, V1 probability ${(candidate.probability*100).toFixed(2)}%, momentum ${candidate.momentum.toFixed(2)}, validation ${(candidate.validationRate*100).toFixed(1)}%, combined rank ${candidate.rankScore.toFixed(3)}`);
@@ -927,7 +928,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
    <button type="button" className="rounded border border-slate-500 px-2 py-1 text-emerald-300" onClick={()=>tone('win')}>Test WIN sound</button>
    <button type="button" className="rounded border border-slate-500 px-2 py-1 text-rose-300" onClick={()=>tone('loss')}>Test LOSS sound</button>
   </div>
-  <p className="text-xs text-slate-400">Shared V1 dashboard: Only ranks 6–10 qualify; ranks 1–5 are always excluded. Among eligible bottom-five digits, ranking = 60% low forecast probability + 40% low momentum (normalized across all 10 digits). Requires negative momentum and the existing validation check. Last 3 submitted barriers are excluded across refreshes. This is a selection heuristic, not a proven edge.</p>
+  <p className="text-xs text-slate-400">Shared V1 dashboard: Only ranks 9 and 10 qualify; ranks 1–8 are always excluded. Among the eligible last two digits, ranking = 60% low forecast probability + 40% low momentum (normalized across all 10 digits). Requires negative momentum and the existing validation check. The most recently submitted barrier is excluded across refreshes, allowing alternation between ranks 9 and 10. This is a selection heuristic, not a proven edge.</p>
   <p className="text-xs text-cyan-300" aria-live="polite">Selection: {selectionReason}</p>
   <p>Today: <strong>{ledger?.attempts??0}{enforceFivePerDay?'/5':''}</strong> attempted · Realized P/L <strong className={`font-black tabular-nums ${(ledger?.profit??0)>0?'text-green-400':(ledger?.profit??0)<0?'text-red-400':'text-slate-100'}`}>{(ledger?.profit??0)>0?'PROFIT ': (ledger?.profit??0)<0?'LOSS ':''}{(ledger?.profit??0)>=0?'+':'−'}${Math.abs(ledger?.profit??0).toFixed(2)}</strong> · Candidate digit: {selected??'—'}</p>
   <div className="grid grid-cols-1 gap-2 sm:grid-cols-3" aria-label="Persistent Digit Differs profit and loss">
