@@ -9,7 +9,7 @@ import type {Tick,DerivWS} from '@deriv/core';
 
 type Mode='IDLE'|'RUNNING'|'BUYING'|'SETTLING'|'WIN'|'MAX_TRADES'|'MAX_LOSS'|'UNCERTAIN'|'STOPPED';
 type Outcome={id:number;digit:number;stake:number;payout:number;profit:number;outcome:'WIN'|'LOSS';expiryDigit:number|null;expiryEpoch:number|null;signalEpoch:number;purchaseEpoch:number|null};
-type Strategy='DYNAMIC'|'MOMENTUM_LOCK';
+type Strategy='MOMENTUM_LOCK';
 type MomentumTrade = {strategy?:Strategy;lockTick?:number;lockDuration?:number;signalEpoch?:number;purchaseEpoch?:number|null;expiryEpoch?:number|null;expiryDigit?:number|null;signalSequence?:number;signalToSubmitMs?:number;buyAcknowledgmentMs?:number;ticksDuringAcknowledgment?:number;signalAgeBudgetMs?:number;entryEpoch?:number|null;entryDigit?:number|null;entrySpot?:string|null;exitSpot?:string|null;recordType:'TRADE';contractId:number;accountId:string;symbol:string;timestamp:string;targetDigit:number;score:number;momentum3:number;positiveSteps:number;momentumRising:boolean;threshold:number;stake:number;payout:number;profit:number;outcome:'WIN'|'LOSS'};
 // Prefer the current Deriv spot fields. When Deriv returns a numeric spot,
 // the symbol's pip precision restores trailing zeroes consistently.
@@ -488,16 +488,14 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
        sequence,
        rows:ranking.map(row=>({digit:row.digit,score:row.score,
          probability:row.probability,momentum3:row.momentum3,positiveSteps:row.positiveSteps})),
-       lockedDigit:settings.strategy==='MOMENTUM_LOCK' ? lockRef.current?.digit??null : null,
+       lockedDigit:lockRef.current?.digit??null,
      });
    });
    if(!active.current||halt.current||uncertainPurchase.current||!settings.accountId||!settings.isConnected)return;
-   if(!ranking.length){setEntryStatus('V1 warming up');return}
+   if(!ranking.length){setEntryStatus('Building momentum signal');return}
    if(countRef.current>=Number(settings.limit)){halt.current=true;active.current=false;setMode('MAX_TRADES');setEntryStatus('Max trades reached');return}
-   // V1 is authoritative for the candidate, score threshold and momentum.
-   // The execution-horizon research is kept for audit only; a lag estimate
-   // is NOT a verified expiry forecast and may not change the chosen digit.
-   if(!top){setEntryStatus('V1 warming up');return}
+   // Momentum Lock selects and holds one qualifying digit for the chosen forecast window.
+   if(!top){setEntryStatus('Building momentum signal');return}
    if(!selected){
      const h=Number(settings.horizon);
      const ticks=streamTicks.current;
@@ -528,35 +526,19 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
      lockRef.current=selected;lockArmedAfterSequence.current=sequence;setLockPosition(1);
      setTargetMomentum(hot.momentum3);setTargetProbability(hot.probability);setTargetScore(hot.score);setTargetRises(hot.positiveSteps);
    }
-   if(settings.strategy==='DYNAMIC'){
-     if(!Number.isFinite(top.score) || top.score<Number(settings.threshold)){setEntryStatus(`V1 score ${Number.isFinite(top.score)?top.score.toFixed(2):'—'} below minimum ${settings.threshold}`);return}
-     if(!rising){setEntryStatus(`V1 momentum ${momentum?.toFixed(2)??'—'} (rising steps ${rises}/3) below eligibility`);return}
-   }
-   // Optional gate tests the actual V1 next-tick candidate, rather than a
-   // different, horizon-optimized digit. The contract break-even rate may be
-   // much higher than the 10% uniform random-digit baseline.
-   if(settings.strategy==='DYNAMIC' && requireEvidence && (eligibleResults.current.length<150 ||
-       wilsonLower(eligibleResults.current.reduce((a,b)=>a+b,0),eligibleResults.current.length)<=0.1)){
-     setEntryStatus(`V1 evidence gate: ${eligibleResults.current.length}/150; lower bound must exceed 10%`);
-     return;
-   }
-   const target=settings.strategy==='MOMENTUM_LOCK'?selected!.digit:top.digit;
+   // Momentum Lock is the only strategy: retain the selected digit until its forecast window expires or it appears.
+   const target=selected!.digit;
    const chosenForecast=ranking.find(row=>row.digit===target);
    if(!chosenForecast){setEntryStatus('V1 target unavailable');return}
    const ownMomentum=chosenForecast.momentum3;
    const ownRises=chosenForecast.positiveSteps;
    const ownRising=ownMomentum>0 && ownMomentum>=Number(settings.minMomentum) && ownRises>=2;
-   if(settings.strategy==='DYNAMIC' && (chosenForecast.score<Number(settings.threshold) || !ownRising)){
-
-     setEntryStatus(`Locked ${target}: score ${chosenForecast.score.toFixed(2)}/${settings.threshold} · momentum ${ownMomentum.toFixed(2)}/${settings.minMomentum} · rises ${ownRises}/3; awaiting qualification`);
-     return;
-   }
    // Deliberately do not reject V1 purely for an uncalibrated 10% probability
    // estimate. Such thresholds are evaluated offline against actual outcomes.
    const signal={score:chosenForecast.score,momentum3:ownMomentum,positiveSteps:ownRises,threshold:Number(settings.threshold)};
    const lockTick=settings.strategy==='MOMENTUM_LOCK'?selected!.elapsed:0;
    // The observed digit may equal the predicted digit; the contract expires on the next tick.
-   // Send on every fresh qualifying V1 tick. Settlement is
+   // Send on every fresh tick while the Momentum Lock remains valid. Settlement is
    // exclusively determined by Deriv, asynchronously after the BUY acknowledgment.
    const firstLockMatch=false;
    // Do NOT wait for ACK/settlement: each fresh tick has its own dispatch.
@@ -613,7 +595,7 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
     <span className="text-slate-300">Momentum Lock · long-tail filter on</span>
     {lockRef.current&&<span className="font-semibold text-emerald-400">Locked {lockRef.current.digit} · {lockPosition}/{horizon}</span>}
   </div>
-  <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">{([['Base $',base,setBase],['Multiplier',factor,setFactor],['Max trades',limit,setLimit],['Loss limit $',maxLoss,setMaxLoss]] as const).map(([name,v,fn])=><label key={name} className="text-[11px] text-slate-300">{name}<input value={v} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} type="number" min={name==='Min momentum'||name==='Min score'?'0':undefined} step={name==='Min momentum'?'0.1':'any'} onChange={e=>fn(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>)}</div>
+  <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">{([['Base $',base,setBase],['Multiplier',factor,setFactor],['Max trades',limit,setLimit],['Loss limit $',maxLoss,setMaxLoss]] as const).map(([name,v,fn])=><label key={name} className="text-[11px] text-slate-300">{name}<input value={v} disabled={active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN'} type="number" onChange={e=>fn(e.target.value)} className="mt-1 w-full rounded-md border border-slate-600 bg-[#0b1425] px-2 py-1.5 text-sm text-white"/></label>)}</div>
   <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4">{[['Top digit',scores[0]?.digit??'—'],['Trade',`${count}/${limit}`],['Next stake',`$${next.toFixed(2)}`],['Cycle P/L',`${pnl>=0?'+':''}$${pnl.toFixed(2)}`]].map(([k,v])=><div key={String(k)} className="rounded-lg bg-[#0a1222] px-2 py-1.5"><div className="text-[11px] text-slate-400">{k}</div><div className={`font-extrabold ${k==='Cycle P/L' ? (pnl>0 ? 'text-green-400' : pnl<0 ? 'text-red-500' : 'text-slate-100') : 'text-slate-100'}`}>{v}</div></div>)}</div>
   <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs" aria-live="polite">
     <span className="text-slate-300">Locked digit: <strong className="text-emerald-400">{winConfirmed.current?'—':lockRef.current?.digit??'Searching'}</strong></span>
