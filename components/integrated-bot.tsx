@@ -25,38 +25,6 @@ const amount=(n:number)=>Math.round((n+Number.EPSILON)*100)/100;
 function tone(kind:'buy'|'win'|'loss'){
  try{const A=window.AudioContext;const ctx=new A();const osc=ctx.createOscillator();const gain=ctx.createGain();osc.type=kind==='win'?'sine':'triangle';osc.frequency.value=kind==='win'?880:kind==='buy'?650:250;gain.gain.value=.065;osc.connect(gain);gain.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+(kind==='win'?.42:.15));osc.onended=()=>{void ctx.close()}}catch{/* audio unsupported */}
 }
-// Digit Differs settlement audio. Prime the context from the Start button's
-// user gesture so later asynchronous Deriv settlement callbacks can play.
-let differsAudioContext: AudioContext | null = null;
-const primeDiffersAudio=()=>{
- try{
-  const context=differsAudioContext??new window.AudioContext();
-  differsAudioContext=context;
-  if(context.state==='suspended')void context.resume().catch(()=>{});
- }catch{/* Audio unsupported or blocked by browser settings. */}
-};
-const playDiffersSettlementSound=(kind:'WIN'|'LOSS')=>{
- try{
-  const context=differsAudioContext;
-  if(!context)return;
-  if(context.state==='suspended')void context.resume().catch(()=>{});
-  const now=context.currentTime;
-  // Two short ascending tones for a win; two descending tones for a loss.
-  const notes=kind==='WIN'?[660,880]:[360,220];
-  notes.forEach((frequency,index)=>{
-   const osc=context.createOscillator();
-   const gain=context.createGain();
-   const start=now+index*.16;
-   osc.type=kind==='WIN'?'sine':'triangle';
-   osc.frequency.setValueAtTime(frequency,start);
-   gain.gain.setValueAtTime(0,start);
-   gain.gain.linearRampToValueAtTime(.09,start+.015);
-   gain.gain.exponentialRampToValueAtTime(.001,start+.15);
-   osc.connect(gain);gain.connect(context.destination);
-   osc.start(start);osc.stop(start+.16);
-  });
- }catch{/* Audio unsupported. The settlement and ledger still work. */}
-};
 type TradeNotice={id:number;profit:number;contractId:number;kind:'WIN'|'LOSS'};
 function SettlementToast({notice,onDismiss}:{notice:TradeNotice|null;onDismiss:()=>void}){
  useEffect(()=>{if(!notice)return;const timer=window.setTimeout(onDismiss,5500);return()=>window.clearTimeout(timer)},[notice,onDismiss]);
@@ -80,7 +48,7 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
  const [strategy,setStrategy]=useState<Strategy>('DYNAMIC');const [lockDuration,setLockDuration]=useState('5');
  const lockRef=useRef<{digit:number;elapsed:number;signal:{score:number;momentum3:number;positiveSteps:number;threshold:number}}|null>(null);
  const [lockPosition,setLockPosition]=useState(0);
- const [base,setBase]=useState('1');const [factor,setFactor]=useState('1.15');const [limit,setLimit]=useState('20');const [maxLoss,setMaxLoss]=useState('40');const [threshold,setThreshold]=useState('6');const [minMomentum,setMinMomentum]=useState('0');
+ const [base,setBase]=useState('1');const [factor,setFactor]=useState('1');const [limit,setLimit]=useState('20');const [maxLoss,setMaxLoss]=useState('40');const [threshold,setThreshold]=useState('6');const [minMomentum,setMinMomentum]=useState('0');
  const [mode,setMode]=useState<Mode>('IDLE');const [count,setCount]=useState(0);const [pnl,setPnl]=useState(0);const [lastOutcome,setLastOutcome]=useState<Outcome|null>(null);const [err,setErr]=useState('');const [sound,setSound]=useState(true);
  const [notice,setNotice]=useState<TradeNotice|null>(null);
  const dismissNotice=useCallback(()=>setNotice(null),[]);
@@ -98,29 +66,16 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
  // Outstanding requests have their own acknowledgement and contract monitors.
  const pendingCount=useRef(0);
  const inFlight=useRef(new Map<number,{digit:number;stake:number}>());
- const matchPause=useRef(false);
  const [inFlightCount,setInFlightCount]=useState(0);
- const [matchPaused,setMatchPaused]=useState(false);
  const [riskExposure,setRiskExposure]=useState(0);
  const [sentCount,setSentCount]=useState(0);
  const [lastTiming,setLastTiming]=useState<{contractId:number;target:number;signalSequence:number;ackTicks:number;submitMs:number;buyMs:number;entryDigit:number|null;expiryDigit:number|null;result:'WIN'|'LOSS'}|null>(null);
  const refreshExposure=()=>{setRiskExposure(reservedStake.current);setInFlightCount(pendingCount.current)};
- const releaseMatchPause=()=>{
-   if(matchPause.current && pendingCount.current===0 && outstanding.current.size===0 && !uncertainPurchase.current && !winConfirmed.current){
-     matchPause.current=false;setMatchPaused(false);
-     if(active.current && !halt.current && !winConfirmed.current){setMode('RUNNING');setEntryStatus('All contracts settled without WIN · awaiting fresh tick')}
-   }
- };
  // Uncertain purchase outcomes stop further purchases until reconciliation.
  const uncertainPurchase=useRef(false);
- // Legacy match-hold counter; dedicated matchPause controls new purchases.
- const matchHoldIds=useRef(new Set<number>());
- const [matchHoldCount,setMatchHoldCount]=useState(0);
  const [entryStatus,setEntryStatus]=useState('Waiting for signal');
  // Multi-contract executor: market ticks never substitute for Deriv settlement.
  const lastSignalDispatchMs=useRef<number|null>(null);
- // Track unsettled targets from both pending ACKs and purchased contracts.
- const pendingMatchObserved=useRef(false);
  // Hold the stop-after-win state while other already-purchased contracts settle.
  const winConfirmed=useRef(false);
  // Record the stream at ingress, independently of React rendering and settlement.
@@ -138,8 +93,7 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
  const tickCadence=useRef<{lastArrival:number|null;intervalMs:number|null}>({lastArrival:null,intervalMs:null});
  const [cadenceLabel,setCadenceLabel]=useState('Measuring tick interval');
  const [streamStatus,setStreamStatus]=useState('Tick stream warming up');
- // A matched observed digit pauses all NEW buys until outstanding orders settle.
- // A matching market digit is NOT a verified contract win.
+ // Market digits never pause execution or settle contracts. Only Deriv settlement can confirm WIN.
  const [outstandingCount,setOutstandingCount]=useState(0);
  useEffect(()=>{onBusyChange(active.current||pendingCount.current>0||outstandingCount>0||mode==='UNCERTAIN')},[mode,outstandingCount,inFlightCount,onBusyChange]);
  const confirmedLosses=useRef(0);
@@ -173,9 +127,9 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
  const soundRef=useRef(sound);useEffect(()=>{soundRef.current=sound},[sound]);
  const play=useCallback((kind:'buy'|'win'|'loss')=>{if(soundRef.current)tone(kind)},[]);
  const stop=useCallback(()=>{halt.current=true;active.current=false;setTarget(null);setLockedDigit(null);lockedRef.current=null;lockRef.current=null;setLockPosition(0);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);setMode(m=>m==='RUNNING'?'STOPPED':m)},[setTarget]);
- useEffect(()=>{if(scope.current!==scopeKey){const unsettled=outstanding.current.size>0||pendingCount.current>0||uncertainPurchase.current;scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];intelligenceRef.current.reset();executionForecastRef.current.reset();setLastTiming(null);setExecutionAudit(null);setHorizonTarget(null);setHorizonProbability(null);setIntelligenceAudit(null);nextTickPending.current=null;eligibleResults.current=[];setAccuracyAudit({trials:0,hits:0,lower95:0});if(!unsettled)confirmedLosses.current=0;lockRef.current=null;setLockPosition(0);setTopMomentum(null);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);lockedRef.current=null;if(!unsettled){countRef.current=0;setSentCount(0);lossBlockRef.current=0;pnlRef.current=0;}if(!unsettled){pending.current=false;pendingCount.current=0;inFlight.current.clear();matchPause.current=false;setMatchPaused(false);setInFlightCount(0);reservedStake.current=0;setRiskExposure(0);uncertainPurchase.current=false;}lastTickKey.current='';if(!unsettled)matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(unsettled?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(unsettled)setErr('Account/symbol changed with a pending or unsettled order. Reconcile on Deriv before restarting.');else setErr('')}},[scopeKey,setTarget]);
+ useEffect(()=>{if(scope.current!==scopeKey){const unsettled=outstanding.current.size>0||pendingCount.current>0||uncertainPurchase.current;scope.current=scopeKey;halt.current=true;active.current=false;histRef.current=[];scoreRef.current=[];scoreHistoryRef.current=[];intelligenceRef.current.reset();executionForecastRef.current.reset();setLastTiming(null);setExecutionAudit(null);setHorizonTarget(null);setHorizonProbability(null);setIntelligenceAudit(null);nextTickPending.current=null;eligibleResults.current=[];setAccuracyAudit({trials:0,hits:0,lower95:0});if(!unsettled)confirmedLosses.current=0;lockRef.current=null;setLockPosition(0);setTopMomentum(null);setTargetMomentum(null);setTargetProbability(null);setTargetScore(null);setTargetRises(null);lockedRef.current=null;if(!unsettled){countRef.current=0;setSentCount(0);lossBlockRef.current=0;pnlRef.current=0;}if(!unsettled){pending.current=false;pendingCount.current=0;inFlight.current.clear();setInFlightCount(0);reservedStake.current=0;setRiskExposure(0);uncertainPurchase.current=false;}lastTickKey.current='';setEntryStatus('Waiting for signal');tickSequence.current=0;lastBuySignalSequence.current=0;lastBuyAcknowledgedAtSequence.current=0;seenTickKeys.current.clear();seenTickOrder.current=[];tickCadence.current={lastArrival:null,intervalMs:null};setCadenceLabel('Measuring tick interval');streamTicks.current=[];tickStats.current={received:0,outOfOrder:0,duplicates:0,staleQuotes:0};setStreamStatus('Tick stream reset');setHistory([]);setScores([]);setLockedDigit(null);setTarget(null);setCount(0);setPnl(0);setLossBlock(0);setMode(unsettled?'UNCERTAIN':'IDLE');setLastOutcome(null);winConfirmed.current=false;if(unsettled)setErr('Account/symbol changed with a pending or unsettled order. Reconcile on Deriv before restarting.');else setErr('')}},[scopeKey,setTarget]);
  const execute=useCallback(async(predicted:number,stake:number,signal:{score:number;momentum3:number;positiveSteps:number;threshold:number},tickEpoch:number,signalSequence:number,signalReceivedAt:number,entryStrategy:Strategy,lockTick:number,lockWindow:number,firstLockMatch:boolean)=>{
-  if(!ws||!accountId||halt.current||!active.current||winConfirmed.current||uncertainPurchase.current||matchPause.current||countRef.current>=Number(limit))return;
+  if(!ws||!accountId||halt.current||!active.current||winConfirmed.current||uncertainPurchase.current||countRef.current>=Number(limit))return;
   // Never replay ticks skipped while a previous buy was in flight.
   if(signalSequence<=lastBuySignalSequence.current)return;
   // Reserve a distinct slot for this tick. No waiting for previous settlement.
@@ -192,20 +146,11 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
    // Both Demo and Real use the same one-request Deriv buy. One tick can
    // trigger at most one irreversible purchase; the WS acknowledgement is
    // never interpreted as an already-settled WIN.
-   if(tickSequence.current!==signalSequence || signalSequence<=lastBuySignalSequence.current || halt.current || matchPause.current){
+   if(tickSequence.current!==signalSequence || signalSequence<=lastBuySignalSequence.current || halt.current){
      tickStats.current.staleQuotes++;
      reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
      setMode(outstanding.current.size?'SETTLING':'RUNNING');
      return;
-   }
-   // Re-check the most recent observed market digit immediately before BUY.
-   // A newer tick may have arrived after the signal was selected.
-   const latestMarketTick=streamTicks.current[streamTicks.current.length-1];
-   if(latestMarketTick?.digit===predicted){
-    reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
-    setEntryStatus(`Latest digit ${predicted} matches target · no buy`);
-    setMode('RUNNING');
-    return;
    }
    const elapsedMs=performance.now()-signalReceivedAt;
    const freshnessBudgetMs=Math.max(120,Math.min(1000,(tickCadence.current.intervalMs??1000)*0.65));
@@ -264,7 +209,7 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
    // Only Deriv's proposal_open_contract response can settle this contract.
    setSyncStatus(`Bought #${contractId} · target ${predicted} · signal ${tickEpoch} · ${acknowledgedEpoch===null?'purchase time unavailable':`buy ${acknowledgedEpoch}`}`);
    setOutstandingCount(outstanding.current.size);
-   if(!matchPause.current && active.current && !halt.current && !winConfirmed.current && !uncertainPurchase.current)setMode('RUNNING');
+   if(active.current && !halt.current && !winConfirmed.current && !uncertainPurchase.current)setMode('RUNNING');
    const id=contractId;
    // Background settlement monitor; later ticks can dispatch overlapping contracts.
    void (async()=>{
@@ -328,19 +273,17 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
      const journalRow:MomentumTrade={signalSequence,signalToSubmitMs,ticksDuringAcknowledgment,signalAgeBudgetMs:Math.max(120,Math.min(1000,(tickCadence.current.intervalMs??1000)*0.65)),buyAcknowledgmentMs:Math.round(acknowledgedAt-buyStart),entryEpoch,entryDigit,entrySpot:entrySpot===null?null:String(entrySpot),exitSpot:settle.exit_spot===undefined?null:String(settle.exit_spot),strategy:entryStrategy,lockTick,lockDuration:lockWindow,signalEpoch:tickEpoch,purchaseEpoch:acknowledgedEpoch,expiryEpoch,expiryDigit,recordType:'TRADE',contractId:id,accountId,symbol,timestamp:new Date().toISOString(),targetDigit:predicted,score:signal.score,momentum3:signal.momentum3,positiveSteps:signal.positiveSteps,momentumRising:signal.momentum3>0&&signal.positiveSteps>=2,threshold:signal.threshold,stake:buyPrice,payout,profit,outcome:win?'WIN':'LOSS'};
      try{const key=`dms-momentum-trades:v1:${symbol}`;const prev=JSON.parse(localStorage.getItem(key)||'[]');const rows=Array.isArray(prev)?prev:[];if(!rows.some((x:MomentumTrade)=>x.contractId===id&&x.accountId===accountId))localStorage.setItem(key,JSON.stringify([...rows.slice(-4999),journalRow]))}catch{}
      // Settlement runs in the background; only confirmed settlement frees the slot.
-     if(matchPause.current)setEntryStatus('Matched tick observed · verifying all unsettled contracts');
      outstanding.current.delete(id);reservedStake.current=Math.max(0,amount(reservedStake.current-ask));setOutstandingCount(outstanding.current.size);refreshExposure();
-     if(win){winConfirmed.current=true;halt.current=true;active.current=false;matchPause.current=false;setMatchPaused(false);lockedRef.current=null;lockRef.current=null;setLockedDigit(null);setLockPosition(0);setTarget(null);setTargetScore(null);setTargetMomentum(null);setTargetProbability(null);setTargetRises(null);setMode('WIN')}
+     if(win){winConfirmed.current=true;halt.current=true;active.current=false;lockedRef.current=null;lockRef.current=null;setLockedDigit(null);setLockPosition(0);setTarget(null);setTargetScore(null);setTargetMomentum(null);setTargetProbability(null);setTargetRises(null);setMode('WIN')}
      else {
       confirmedLosses.current++;
       if(winConfirmed.current){setMode('WIN')}
       else if(countRef.current>=Number(limit)){halt.current=true;active.current=false;setMode('MAX_TRADES')}
       else if(-pnlRef.current+reservedStake.current>=Number(maxLoss)){halt.current=true;active.current=false;setMode('MAX_LOSS')}
-      else if(active.current&&!halt.current&&!matchPause.current&&!uncertainPurchase.current){setMode('RUNNING');setEntryStatus('Settled · next eligible tick may submit a buy');}
+      else if(active.current&&!halt.current&&!uncertainPurchase.current){setMode('RUNNING');setEntryStatus('Settled · next eligible tick may submit a buy');}
      }
-     releaseMatchPause();
     }catch(e){halt.current=true;active.current=false;setMode('UNCERTAIN');setErr(`Contract ${id}: ${String(e)}. Reconcile in Deriv before restarting.`)}
-    finally{if(unsubscribe)void unsubscribe();setOutstandingCount(outstanding.current.size);releaseMatchPause()}
+    finally{if(unsubscribe)void unsubscribe();setOutstandingCount(outstanding.current.size);refreshExposure()}
    })();
   }catch(e){halt.current=true;active.current=false;
    // Uncertain buy: retain reservation. Do not retry or initiate more purchases.
@@ -351,7 +294,6 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
     pendingCount.current=Math.max(0,pendingCount.current-1);
     pending.current=pendingCount.current>0;
     refreshExposure();
-    releaseMatchPause();
   }
  },[ws,accountId,symbol,limit,maxLoss,play,setTarget,pipSize]);
  const execRef=useRef(execute);execRef.current=execute; // Keep callback current without waiting for a post-render effect.
@@ -410,14 +352,6 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
    // A market match while BUY is pending or contracts are open may correspond
    // to an outstanding order, but does not establish which expiry wins.
    // Deriv's authoritative contract settlement is the only source of WIN/LOSS.
-   const matchingPending=[...inFlight.current.values()].some(c=>c.digit===digit);
-   const matchingUnsettled=[...outstanding.current.values()].some(c=>c.digit===digit);
-   if(active.current && !matchPause.current && (matchingPending || matchingUnsettled)){
-     matchPause.current=true;
-     setMatchPaused(true);
-     setMode('SETTLING');
-     setEntryStatus(`Market digit ${digit} matches a purchased/pending target · PAUSED for Deriv verification (not a confirmed win)`);
-   }
    if(tickStats.current.received%5===0){
      const ms=tickCadence.current.intervalMs;
      setCadenceLabel(ms===null?'Measuring tick interval':`${(ms/1000).toFixed(2)}s/tick · ${(1000/ms).toFixed(2)} ticks/s`);
@@ -434,8 +368,7 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
    }
    nextTickPending.current=null;
    histRef.current=[...histRef.current.slice(-99),digit];
-   // Market observations update forecasting; a matching digit blocks a NEW BUY
-   // only at the entry gates below, never settles an existing Deriv contract.
+   // Market observations update forecasting; a matching digit neither blocks a buy nor settles a Deriv contract.
    // Causal all-ten-digit evaluation: grade the prior frozen forecast, then
    // produce the next forecast from history that ends at this observed tick.
    const ranking=intelligenceRef.current.observe(digit);scoreRef.current=ranking;
@@ -520,7 +453,6 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
      });
    });
    if(!active.current||halt.current||uncertainPurchase.current||!settings.accountId||!settings.isConnected)return;
-   if(matchPause.current){setEntryStatus(`MATCH HOLD · ${outstanding.current.size} confirmed + ${pendingCount.current} pending contracts; await Deriv settlement`);return;}
    if(!ranking.length){setEntryStatus('V1 warming up');return}
    if(countRef.current>=Number(settings.limit)){halt.current=true;active.current=false;setMode('MAX_TRADES');setEntryStatus('Max trades reached');return}
    // V1 is authoritative for the candidate, score threshold and momentum.
@@ -560,17 +492,12 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
    // estimate. Such thresholds are evaluated offline against actual outcomes.
    const signal={score:chosenForecast.score,momentum3:ownMomentum,positiveSteps:ownRises,threshold:Number(settings.threshold)};
    const lockTick=settings.strategy==='MOMENTUM_LOCK'?selected!.elapsed:0;
-   // Never enter on a market tick whose observed last digit equals the target.
-   // This is an ENTRY rule, not an assumption about a Deriv contract outcome.
-   if(digit===target){
-     setEntryStatus(`Observed ${digit} = target ${target} · skip this tick`);
-     return;
-   }
-   // Send only from a fresh, nonmatching observed tick. Settlement is
+   // The observed digit may equal the predicted digit; the contract expires on the next tick.
+   // Send on every fresh qualifying V1 tick. Settlement is
    // exclusively determined by Deriv, asynchronously after the BUY acknowledgment.
    const firstLockMatch=false;
    // Do NOT wait for ACK/settlement: each fresh tick has its own dispatch.
-   // Execute at most one purchase on a fresh signal; require settlement and then a new tick.
+   // Execute at most one purchase per unique qualifying tick; do not wait for settlement.
    if(sequence<=lastBuySignalSequence.current){setEntryStatus('Awaiting new tick');return}
    const stake=amount(Number(settings.base)*Math.pow(Number(settings.factor),countRef.current));
    if(!Number.isFinite(stake)||stake<=0||stake+reservedStake.current+Math.max(0,-pnlRef.current)>Number(settings.maxLoss)){
@@ -607,10 +534,10 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
   if(!valid||!accountId||!isConnected||!ws||pendingCount.current>0||active.current||uncertainPurchase.current||outstanding.current.size)return;
   const acc=real?'REAL MONEY':'DEMO';
   if(real&&!window.confirm(`REAL MONEY: Automated DigitMatch on ${symbol}, with potentially MULTIPLE simultaneous contracts. Up to ${limit} purchases, progression ${factor}×, maximum cycle loss $${maxLoss}. Confirm you accept this risk.`))return;
-  if(!window.confirm(`Start ${acc} automatic cycle? Contract: 1-tick DigitMatch, one submission per eligible tick, overlapping contracts possible. Maximum loss: $${maxLoss}; up to ${limit} purchases. No guaranteed returns.`))return;
+  if(!window.confirm(`Start ${acc} automatic cycle? Contract: 1-tick DigitMatch, one submission per qualifying V1 tick, overlapping contracts possible; market matches do not pause new purchases. Maximum loss: $${maxLoss}; up to ${limit} purchases. No guaranteed returns.`))return;
   // Must begin a fresh cycle. Uncertain purchases cannot be reset with this control.
   if(mode==='UNCERTAIN'||uncertainPurchase.current||pendingCount.current>0||outstanding.current.size>0)return;
-  matchHoldIds.current.clear();pendingMatchObserved.current=false;setMatchHoldCount(0);setEntryStatus('Waiting for signal');countRef.current=0;setSentCount(0);pnlRef.current=0;reservedStake.current=0;setRiskExposure(0);matchPause.current=false;setMatchPaused(false);confirmedLosses.current=0;lossBlockRef.current=0;lockedRef.current=null;lockRef.current=null;setLockPosition(0);setCount(0);setPnl(0);setLossBlock(0);setLockedDigit(null);setTarget(null);setLastOutcome(null);setTargetScore(null);setTargetRises(null);setTargetMomentum(null);setTargetProbability(null);winConfirmed.current=false;setErr('');halt.current=false;active.current=true;setLastTiming(null);setMode('RUNNING');if(sound)tone('buy');
+  setEntryStatus('Waiting for signal');countRef.current=0;setSentCount(0);pnlRef.current=0;reservedStake.current=0;setRiskExposure(0);confirmedLosses.current=0;lossBlockRef.current=0;lockedRef.current=null;lockRef.current=null;setLockPosition(0);setCount(0);setPnl(0);setLossBlock(0);setLockedDigit(null);setTarget(null);setLastOutcome(null);setTargetScore(null);setTargetRises(null);setTargetMomentum(null);setTargetProbability(null);winConfirmed.current=false;setErr('');halt.current=false;active.current=true;setLastTiming(null);setMode('RUNNING');if(sound)tone('buy');
  }
  return <section className="w-full min-w-0 px-0 pb-2 text-slate-100"><div className="rounded-xl border border-cyan-500/30 bg-[#101a2e] p-2.5 shadow-lg shadow-black/30">
   <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><h2 className="font-bold text-cyan-300">⚡ DigitMatchStars Tick-Synchronized Rapid Engine</h2><span className={`rounded-full px-2 py-1 text-xs font-bold ${real?'bg-rose-900 text-rose-200':'bg-sky-900 text-sky-200'}`}>{real?'REAL MONEY':demo?'DEMO':'LOG IN'} · {mode}</span></div>
@@ -634,7 +561,6 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
     <span className="text-cyan-300">Target momentum {targetMomentum===null?'—':`${targetMomentum>=0?'+':''}${targetMomentum.toFixed(2)}`} · rises {targetRises??'—'}/3</span>
     <span className="text-slate-300">Target forecast {targetProbability===null?'—':`${(targetProbability*100).toFixed(2)}%`}</span>
     <span className="text-slate-400">Open {outstandingCount} · ACK pending {inFlightCount} · At risk ${riskExposure.toFixed(2)}</span>
-    {matchPaused && <strong className="text-yellow-300">MATCH HOLD · awaiting verified settlement</strong>}
     {lastTiming && <span className="text-slate-300" title="Derived from the Deriv purchase acknowledgment and contract settlement; observed market ticks do not themselves prove contract expiry">Last contract #{lastTiming.contractId} · target {lastTiming.target} · signal #{lastTiming.signalSequence} · dispatch {lastTiming.submitMs} ms · ACK {lastTiming.buyMs} ms / {lastTiming.ackTicks} ticks · Deriv entry {lastTiming.entryDigit??'unknown'} · expiry {lastTiming.expiryDigit??'unknown'} · {lastTiming.result}</span>}
     {active.current && <span className={/awaiting settlement/i.test(entryStatus) ? "font-semibold text-yellow-400" : "text-slate-400"}>{entryStatus}</span>}
 
@@ -707,14 +633,20 @@ const readPLTotals=(account:string):PLTotals=>{
 };
 const persist=(ledger:Ledger)=>{try{localStorage.setItem(storageKey(ledger.account,ledger.day),JSON.stringify(ledger))}catch{}};
 const digitOf=(tick:Tick,pipSize:number)=>{
- const p=Number.isInteger(pipSize)&&pipSize>=0&&pipSize<=12?pipSize:2;
- return Number(tick.quote.toFixed(p).slice(-1));
+ const p=Number.isInteger((tick as any).pip_size)&&(tick as any).pip_size>=0&&(tick as any).pip_size<=12?(tick as any).pip_size:pipSize;
+ return getLastDigit(Number(tick.quote),Number.isInteger(p)&&p>=0&&p<=12?p:2);
+};
+const wilsonUpperBound=(hits:number,n:number)=>{
+ if(n<=0)return 1;
+ const z=1.96,p=hits/n,z2=z*z,den=1+z2/n;
+ const centre=p+z2/(2*n),spread=z*Math.sqrt((p*(1-p)+z2/(4*n))/n);
+ return Math.min(1,(centre+spread)/den);
 };
 function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,pipSize,symbol,onBusyChange}:{ws:DerivWS|null;accountId:string|null;accountType:string|null;isConnected:boolean;currentTick:Tick|null;pipSize:number;symbol:string;onBusyChange:(busy:boolean)=>void}){
  const [stake,setStake]=useState('50');
  const [dailyLoss,setDailyLoss]=useState('250');
  const [enforceFivePerDay,setEnforceFivePerDay]=useState(true);
- const [minObservations,setMinObservations]=useState('100');
+ const [minObservations,setMinObservations]=useState('1000');
  const [notice,setNotice]=useState<TradeNotice|null>(null);
  const dismissNotice=useCallback(()=>setNotice(null),[]);
  const [enabled,setEnabled]=useState(false);
@@ -726,21 +658,6 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
  const [settlementVerified,setSettlementVerified]=useState(false);
  const [recent,setRecent]=useState<number[]>([]);
  const [selected,setSelected]=useState<number|null>(null);
- // Avoid repeatedly purchasing the same barrier. These last three submitted
- // barriers are persisted separately from the daily P/L ledger across restarts.
- const barrierCooldown=3;
- const recentBarriers=useRef<number[]>([]);
- const barrierKey=(account:string,market:string)=>`dms-differs-barrier-history:v1:${account}:${market}`;
- const readBarriers=(account:string,market:string):number[]=>{
-  try{const saved=JSON.parse(localStorage.getItem(barrierKey(account,market))||'[]');
-   return Array.isArray(saved)?saved.filter((d:unknown)=>Number.isInteger(d)&&Number(d)>=0&&Number(d)<=9).slice(-barrierCooldown):[];
-  }catch{return []}
- };
- const reserveBarrier=(account:string,market:string,digit:number)=>{
-  const updated=[...recentBarriers.current,digit].slice(-barrierCooldown);
-  recentBarriers.current=updated;
-  try{localStorage.setItem(barrierKey(account,market),JSON.stringify(updated))}catch{}
- };
  const busy=useRef(false);
  useEffect(()=>{onBusyChange(enabled||busy.current||uncertain.current)},[enabled,status,onBusyChange]);
  const enabledRef=useRef(false);
@@ -758,7 +675,6 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   setSettlementVerified(false);
   stop('Stopped — account or market changed');busy.current=false;uncertain.current=false;history.current=[];lastTick.current='';setRecent([]);setSelected(null);setLiveApproved(false);
   if(accountId){const l=readLedger(accountId);latestLedger.current=l;setLedger(l);setPLTotals(readPLTotals(accountId));uncertain.current=l.uncertain}else{latestLedger.current=null;setLedger(null);setPLTotals({lifetime:0,last30Days:0,days:0})}
-  recentBarriers.current=accountId?readBarriers(accountId,symbol):[];
   session.current=`${accountId??''}:${symbol}`;
  },[accountId,symbol,stop]);
  // Reconcile only a broker-acknowledged contract ID. Never repeat a buy.
@@ -787,7 +703,6 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
     update(next);uncertain.current=false;setError('');
     setStatus(`Reconciled contract #${saved.pendingContractId}: ${profit>=0?'WIN':'LOSS'} ${profit.toFixed(2)} USD — press Start to resume`);
     setNotice({id:Date.now(),contractId:saved.pendingContractId!,profit,kind:profit>0?'WIN':'LOSS'});
-    playDiffersSettlementSound(profit>0?'WIN':'LOSS');
    }catch(e){if(!cancelled)setStatus(`Reconciliation pending for #${saved.pendingContractId} — waiting for Deriv connection`)}
    finally{reconciling.current=false}
   };
@@ -818,9 +733,9 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   if(!l||l.account!==accountId||l.day!==dayUTC()){stop('Daily boundary reached — restart to load new UTC day');return}
   if(enforceFivePerDay&&l.attempts>=5){stop('Daily limit: 5 purchases');return}
   const amount=Number(stake),maxLoss=Number(dailyLoss),minimum=Number(minObservations);
-  if(!Number.isFinite(amount)||amount<50||!Number.isFinite(maxLoss)||maxLoss<amount||!Number.isInteger(minimum)||minimum<20){stop('Invalid risk or signal settings');return}
+  if(!Number.isFinite(amount)||amount<50||!Number.isFinite(maxLoss)||maxLoss<amount||!Number.isInteger(minimum)||minimum<1000){stop('Invalid risk or signal settings');return}
   if(l.profit-amount < -maxLoss){stop('Daily loss exposure limit');return}
-  if(arr.length<minimum){setStatus(`Warming up: ${arr.length}/${minimum} ticks`);return}
+  if(arr.length<minimum+1){setStatus(`Warming up: ${arr.length}/${minimum+1} ticks`);return}
   // Use the user-selected sample size, excluding the current tick. Split chronologically
   // into independent training (60%) and validation (40%) windows.
   const past=arr.slice(0,-1);
@@ -829,54 +744,59 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   const trainCount=Math.floor(sample.length*0.6);
   const training=sample.slice(0,trainCount),validation=sample.slice(trainCount);
   const counts=Array.from({length:10},(_,d)=>training.filter(x=>x===d).length);
-  const validationCounts=Array.from({length:10},(_,d)=>validation.filter(x=>x===d).length);
-  // Consider ALL ten barriers. A submitted barrier remains in a three-trade
-  // cooldown (including through refreshes), rather than being traded repeatedly.
-  // Require the same original validation criterion; do not force a weaker trade.
-  const candidates=Array.from({length:10},(_,digit)=>({
-   digit,trainCount:counts[digit],validationRate:validationCounts[digit]/validation.length
-  })).filter(c=>!recentBarriers.current.includes(c.digit) && c.validationRate<0.1)
-    .sort((a,b)=>a.trainCount-b.trainCount || a.validationRate-b.validationRate || a.digit-b.digit);
-  const candidate=candidates[0];
-  if(!candidate){
-   setSelected(null);
-   setStatus(`Waiting: no validated barrier outside last ${barrierCooldown} traded barriers`);
-   return;
-  }
-  const target=candidate.digit;
+  const target=counts.indexOf(Math.min(...counts));
+  const valHits=validation.filter(d=>d===target).length;
   setSelected(target);
-  // Below 10% in a finite validation window is only a selection heuristic;
-  // it is NOT statistically demonstrated next-tick predictability or profit.
+  // Conservative holdout gate: require the 95% Wilson upper bound for the
+  // barrier's occurrence rate to be below 10%. This is stronger than comparing
+  // a tiny validation percentage with 10%, but it still does not prove future edge.
+  const barrierUpper95=wilsonUpperBound(valHits,validation.length);
+  const winProbabilityLower95=1-barrierUpper95;
+  if(barrierUpper95>=0.10){setStatus(`No trade: barrier ${target} upper 95% occurrence bound ${(barrierUpper95*100).toFixed(2)}% is not below 10%`);return}
   if(isLive&&!liveApproved){stop('Live account requires explicit confirmation');return}
-  // Reserve barrier + purchase slot synchronously BEFORE sending buy request.
-  // A missing acknowledgment must not cause immediate reuse of this barrier.
+  // Obtain the broker's current quote first. Do not count a proposal request as a trade.
   busy.current=true;
-  reserveBarrier(accountId,symbol,target);
-  const reserved={...l,attempts:l.attempts+1};update(reserved);
-  setStatus(`Submitting DIGITDIFF barrier ${target} (${reserved.attempts}${enforceFivePerDay?'/5':''})`);
+  setStatus(`Checking live DIGITDIFF quote for barrier ${target}`);
   const entrySession=session.current;
   void (async()=>{
+   let purchaseAttempted=false;
+   let reserved:Ledger|null=null;
    try{
-    const result=await ws.send<any>({buy:'1',price:Number((amount*1.05).toFixed(2)),parameters:{amount,basis:'stake',contract_type:'DIGITDIFF',currency:'USD',duration:1,duration_unit:'t',underlying_symbol:symbol,barrier:String(target)}});
+    const quoteFrame=await ws.send<any>({proposal:1,amount,basis:'stake',contract_type:'DIGITDIFF',currency:'USD',duration:1,duration_unit:'t',symbol,barrier:String(target)});
+    const proposal=quoteFrame?.proposal;
+    const proposalId=String(proposal?.id??'');
+    const askPrice=Number(proposal?.ask_price);
+    const totalPayout=Number(proposal?.payout);
+    if(!proposalId||!Number.isFinite(askPrice)||askPrice<=0||!Number.isFinite(totalPayout)||totalPayout<=askPrice){setStatus('No trade: Deriv did not return a valid positive-profit proposal');return}
+    const winProfit=totalPayout-askPrice;
+    const conservativeEV=winProbabilityLower95*winProfit-(1-winProbabilityLower95)*askPrice;
+    if(!(conservativeEV>0)){setStatus(`No trade: conservative payout-adjusted EV is ${conservativeEV.toFixed(3)} USD at ${ (winProbabilityLower95*100).toFixed(2)}% lower-bound win probability`);return}
+    // Reserve a purchase slot synchronously immediately before the irreversible buy.
+    const latest=latestLedger.current;
+    if(!latest||latest.account!==accountId||latest.day!==dayUTC())return;
+    reserved={...latest,attempts:latest.attempts+1};update(reserved);
+    setStatus(`Buying DIGITDIFF barrier ${target} · conservative EV +$${conservativeEV.toFixed(3)} · ${reserved.attempts}${enforceFivePerDay?'/5':''}`);
+    purchaseAttempted=true;
+    const result=await ws.send<any>({buy:proposalId,price:askPrice});
     const id=Number(result?.buy?.contract_id);
     if(!Number.isSafeInteger(id)||id<=0)throw new Error('Purchase acknowledgment missing contract ID');
-    update({...reserved,uncertain:true,pendingContractId:id});
+    update({...reserved!,uncertain:true,pendingContractId:id});
     setStatus(`Contract ${id}: waiting for broker settlement`);
     const c=await monitor(id,ws);
     const profit=Number(c?.profit);
     if(!Number.isFinite(profit))throw new Error('Settlement has no valid profit value');
     // Avoid applying an old account's outcome to a new account's ledger.
     const current=latestLedger.current;
-    if(session.current===entrySession&&current&&current.account===accountId&&current.day===reserved.day){
+    if(session.current===entrySession&&current&&current.account===accountId&&current.day===reserved!.day){
      const next={...current,profit:Number((current.profit+profit).toFixed(2)),uncertain:false,pendingContractId:null};update(next);uncertain.current=false;
      setStatus(`Settled: ${profit>=0?'WIN':'LOSS'} ${profit.toFixed(2)} USD · ${next.attempts}${enforceFivePerDay?'/5':''}`);
      setNotice({id:Date.now(),contractId:id,profit,kind:profit>0?'WIN':'LOSS'});
-     playDiffersSettlementSound(profit>0?'WIN':'LOSS');
      if((enforceFivePerDay&&next.attempts>=5)||next.profit<=-maxLoss)stop('Daily risk/trade limit reached');
     }
    }catch(e){
     const current=latestLedger.current;
-    if(session.current===entrySession&&current&&current.account===accountId){update({...current,uncertain:true});uncertain.current=true;stop(current.pendingContractId?'Settlement pending — automatic reconciliation on reconnect':'Purchase acknowledgement unknown — manual reconciliation required');setError(current.pendingContractId?`Contract #${current.pendingContractId} will be checked against Deriv before another trade.`:`Purchase confirmation missing. Check Deriv transaction history before resuming. ${String(e)}`)}
+    if(purchaseAttempted&&session.current===entrySession&&current&&current.account===accountId){update({...current,uncertain:true});uncertain.current=true;stop(current.pendingContractId?'Settlement pending — automatic reconciliation on reconnect':'Purchase acknowledgement unknown — manual reconciliation required');setError(current.pendingContractId?`Contract #${current.pendingContractId} will be checked against Deriv before another trade.`:`Purchase confirmation missing. Check Deriv transaction history before resuming. ${String(e)}`)}
+    else if(session.current===entrySession){setStatus(`No purchase sent: proposal/quote failed (${String(e)})`)}
    }finally{busy.current=false}
   })();
  },[accountId,currentTick,dailyLoss,enforceFivePerDay,isConnected,isLive,liveApproved,minObservations,monitor,pipSize,stake,stop,symbol,ws]);
@@ -897,8 +817,7 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   if(l.uncertain){setError(l.pendingContractId?`Contract #${l.pendingContractId} is awaiting automatic reconciliation with Deriv.`:'Purchase acknowledgement is missing. Check Deriv transaction history before continuing.');return}
   if(enforceFivePerDay&&l.attempts>=5){setError('Five trades already attempted today (UTC). Disable the five-trade limit to continue, subject to the loss cap.');return}
   if(isLive&&!liveApproved){setError('Confirm live trading first.');return}
-  if(Number(stake)<50||!Number.isFinite(Number(stake))||Number(dailyLoss)<Number(stake)||(!Number.isInteger(Number(minObservations))||Number(minObservations)<20)){setError('Invalid settings: stake ≥ $50, loss cap ≥ stake, minimum ticks ≥ 20.');return}
-  primeDiffersAudio();
+  if(Number(stake)<50||!Number.isFinite(Number(stake))||Number(dailyLoss)<Number(stake)||(!Number.isInteger(Number(minObservations))||Number(minObservations)<1000)){setError('Invalid settings: stake ≥ $50, loss cap ≥ stake, minimum completed ticks ≥ 1000.');return}
   enabledRef.current=true;setEnabled(true);setStatus('Monitoring ticks for qualifying signal');
  };
  return <section className="rounded-xl border border-slate-600 p-4 space-y-3 text-sm">
@@ -906,17 +825,16 @@ function DigitDiffersStrategy({ws,accountId,accountType,isConnected,currentTick,
   <div className="grid grid-cols-2 gap-2">
    <label>Stake USD<input className="block w-full rounded border bg-transparent p-2" type="number" min="50" step="0.01" value={stake} disabled={enabled} onChange={e=>setStake(e.target.value)}/></label>
    <label>Daily loss cap USD<input className="block w-full rounded border bg-transparent p-2" type="number" min="50" step="0.01" value={dailyLoss} disabled={enabled} onChange={e=>setDailyLoss(e.target.value)}/></label>
-   <label>Minimum ticks<input className="block w-full rounded border bg-transparent p-2" type="number" min="20" step="1" value={minObservations} disabled={enabled} onChange={e=>setMinObservations(e.target.value)}/></label>
+   <label>Minimum completed ticks<input className="block w-full rounded border bg-transparent p-2" type="number" min="1000" step="1" value={minObservations} disabled={enabled} onChange={e=>setMinObservations(e.target.value)}/></label>
   </div>
   <label className="flex items-center gap-2 rounded-lg border border-slate-700 p-2"><input type="checkbox" checked={enforceFivePerDay} disabled={enabled||busy.current} onChange={e=>setEnforceFivePerDay(e.target.checked)}/><span>Enforce maximum 5 trades per UTC day</span></label>
   {isLive&&<label className="flex gap-2"><input type="checkbox" checked={liveApproved} disabled={enabled} onChange={e=>setLiveApproved(e.target.checked)}/> I understand these are real-money $50+ trades and authorize live execution.</label>}
   <div className="flex gap-2"><button className="rounded bg-emerald-700 px-4 py-2 text-white disabled:opacity-40" disabled={enabled||busy.current||!isConnected} onClick={start}>Start selective bot</button><button className="rounded bg-slate-600 px-4 py-2 text-white" onClick={()=>stop('Stopped — existing contract will still settle')}>Stop</button></div>
-  <p className="text-xs text-slate-400">Barrier rotation: excludes the last 3 submitted barriers (saved across refreshes). Only trades when a different barrier passes the existing validation rule. Rotation does not establish an edge.</p>
   <p>Today: <strong>{ledger?.attempts??0}{enforceFivePerDay?'/5':''}</strong> attempted · Realized P/L <strong className={`font-black tabular-nums ${(ledger?.profit??0)>0?'text-green-400':(ledger?.profit??0)<0?'text-red-400':'text-slate-100'}`}>{(ledger?.profit??0)>0?'PROFIT ': (ledger?.profit??0)<0?'LOSS ':''}{(ledger?.profit??0)>=0?'+':'−'}${Math.abs(ledger?.profit??0).toFixed(2)}</strong> · Candidate digit: {selected??'—'}</p>
   <div className="grid grid-cols-1 gap-2 sm:grid-cols-3" aria-label="Persistent Digit Differs profit and loss">
    {([['Today (UTC)',ledger?.profit??0],['Last 30 UTC days',plTotals.last30Days],['All recorded days',plTotals.lifetime]] as const).map(([label,value])=><div key={label} className="rounded-lg border border-slate-700 bg-slate-900/70 p-3"><div className="text-xs text-slate-400">{label} realized P/L</div><div className={`text-xl font-black tabular-nums ${value>0?'text-green-400':value<0?'text-red-400':'text-slate-100'}`}>{value>=0?'+':'−'}${Math.abs(value).toFixed(2)}</div></div>)}
   </div>
-  <p className="text-xs text-slate-400">P/L is restored from this browser's saved daily ledgers for the connected account ({plTotals.days} recorded UTC days). Day-to-day totals do not reset when a new day begins. Browser storage is not a cross-device or broker-backed record; reconcile with Deriv statements.</p>
+  <p className="text-xs text-slate-400">DigitDiffers only buys when the holdout confidence gate passes and the live Deriv quote has positive conservative expected value. This is still historical evidence, not a guarantee. P/L is restored from this browser's saved daily ledgers for the connected account ({plTotals.days} recorded UTC days). Day-to-day totals do not reset when a new day begins. Browser storage is not a cross-device or broker-backed record; reconcile with Deriv statements.</p>
   {demo&&ledger?.uncertain&&!ledger.pendingContractId&&<div className="space-y-2 rounded-xl border border-amber-500/50 bg-amber-500/10 p-3 text-amber-100">
    <div className="font-extrabold text-amber-300">Purchase confirmation missing</div>
    <p className="text-xs">Only use this recovery after checking Deriv demo transaction history and confirming the last purchase has settled and no related contract remains open. This does not change recorded profit or trade attempts.</p>
