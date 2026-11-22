@@ -166,6 +166,20 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
     setMode('RUNNING');
     return;
    }
+   // Final synchronous kill-switch at the irreversible dispatch boundary.
+   // A matching locked digit may have arrived while this signal was being prepared;
+   // never let a queued/stale callback reach ws.send after that observation.
+   if(matchHoldTriggered.current || halt.current || !active.current ||
+      tickSequence.current!==signalSequence ||
+      (entryStrategy==='MOMENTUM_LOCK' && lockRef.current &&
+       signalSequence<=lockArmedAfterSequence.current)){
+     tickStats.current.staleQuotes++;
+     reservedStake.current=Math.max(0,amount(reservedStake.current-stake));
+     setEntryStatus(matchHoldTriggered.current
+       ? `MATCH HOLD · locked digit ${lockRef.current?.digit??'—'} appeared · no new buys`
+       : 'Signal blocked at dispatch · awaiting a fresh eligible tick');
+     return;
+   }
    // Reserve this tick before an irreversible buy request.
    // The next request must be driven by a *later tick*, not a queued signal.
    lastBuySignalSequence.current=signalSequence;
@@ -361,7 +375,7 @@ function DigitMatchStrategy({ws,accountId,accountType,isConnected,currentTick,pi
    // CRITICAL STOP: as soon as a post-lock market tick prints the locked digit,
    // stop dispatching on this very callback. Already-sent buys cannot be cancelled;
    // they remain monitored until Deriv provides authoritative settlement.
-   if(settings.strategy==='MOMENTUM_LOCK' && active.current && !matchHoldTriggered.current &&
+   if(settings.strategy==='MOMENTUM_LOCK' && !matchHoldTriggered.current &&
       lockRef.current && sequence>lockArmedAfterSequence.current && digit===lockRef.current.digit){
      matchHoldTriggered.current=true;
      matchHoldSequence.current=sequence;
